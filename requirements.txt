@@ -6,3 +6,6 @@ pillow==11.3.0
 scikit-learn==1.6.1
 torch==2.8.0
 torchvision==0.23.0
+
+# Used only by test_loader.py to fetch the Kaggle smoke-test dataset.
+kagglehub==0.3.13
