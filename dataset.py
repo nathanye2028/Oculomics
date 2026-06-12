@@ -339,10 +339,16 @@ class MBRSETDataset(Dataset):
             raise KeyError(f"file column {file_col!r} not in CSV columns: {list(df.columns)}")
 
         # --- resolve label spec -------------------------------------------- #
-        self.spec, label_values = self._resolve_labels(df, task, label_col, label_map)
+        # NB: keep ``spec`` local. Its ``fn`` is a lambda/closure that cannot be
+        # pickled; retaining it on ``self`` would break DataLoader workers under
+        # the ``spawn`` start method (macOS / Windows), where the dataset is
+        # pickled into each worker. Labels are fully vectorised below, so the
+        # spec's callable is not needed past ``__init__``.
+        spec, label_values = self._resolve_labels(df, task, label_col, label_map)
         self.task = label_col or task
-        self.num_classes = self.spec.num_classes
-        self.multilabel = self.spec.multilabel
+        self.num_classes = spec.num_classes
+        self.multilabel = spec.multilabel
+        self._label_dtype = spec.dtype
 
         files = df[file_col].astype(str).to_numpy()
 
@@ -363,7 +369,7 @@ class MBRSETDataset(Dataset):
         labels = label_values[keep]
 
         # --- vectorise labels once (no DataFrame retained) ------------------ #
-        self.labels = torch.as_tensor(labels, dtype=self.spec.dtype)
+        self.labels = torch.as_tensor(labels, dtype=self._label_dtype)
 
         # Optional metadata snapshot kept as plain dict-of-arrays (cheap).
         self._meta: Dict[str, np.ndarray] = {}

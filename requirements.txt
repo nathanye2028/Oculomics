@@ -1,0 +1,8 @@
+# Runtime dependencies for dataset.py (mBRSET PyTorch Dataset).
+# Install into a virtualenv:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+numpy==2.0.2
+pandas==2.3.3
+pillow==11.3.0
+scikit-learn==1.6.1
+torch==2.8.0
+torchvision==0.23.0
