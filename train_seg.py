@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import build_model           # noqa: E402
+from model_seg import build_model       # noqa: E402
 from seg_dataset import RFMiDSegDataset  # noqa: E402
 
 KAGGLE_SLUG = "andrewmvd/retinal-disease-classification"
