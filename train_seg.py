@@ -82,7 +82,10 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--no-gcg", action="store_true", help="Disable GCG blocks (ablation).")
+    p.add_argument("--arch", default="baseline", choices=["baseline", "gcg_unet"],
+                   help="'baseline' = plain U-Net benchmark; 'gcg_unet' = MobileNetV3+GCG.")
+    p.add_argument("--base", type=int, default=32, help="Baseline U-Net base channel width.")
+    p.add_argument("--no-gcg", action="store_true", help="Disable GCG blocks (gcg_unet ablation).")
     p.add_argument("--pretrained", action="store_true")
     args = p.parse_args()
 
@@ -105,13 +108,19 @@ def main() -> int:
         drop_last=True,
     )
 
-    model = build_model(
-        arch="gcg_unet", num_classes=1,
-        pretrained=args.pretrained, use_gcg=not args.no_gcg,
-    ).to(device)
+    if args.arch == "baseline":
+        from unet_baseline import build_baseline
+        model = build_baseline(num_classes=1, base=args.base).to(device)
+        desc = f"baseline U-Net (base={args.base}, no gating)"
+    else:
+        model = build_model(
+            arch="gcg_unet", num_classes=1,
+            pretrained=args.pretrained, use_gcg=not args.no_gcg,
+        ).to(device)
+        desc = (f"GCG-U-Net (MobileNetV3 enc) "
+                f"{'WITH' if not args.no_gcg else 'NO'} GCG")
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[info] model      : GCG-U-Net (MobileNetV3 enc) "
-          f"{'WITH' if not args.no_gcg else 'NO'} GCG, {n_params/1e6:.2f}M params")
+    print(f"[info] model      : {desc}, {n_params/1e6:.2f}M params")
 
     # --- inspect exactly one batch ---
     images, masks = next(iter(loader))
