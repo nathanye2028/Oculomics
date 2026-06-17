@@ -39,6 +39,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from fundus_utils import crop_to_fov, make_rng
+
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -68,6 +70,7 @@ class RFMiDSegDataset(Dataset):
         masks_dir: Optional[str] = None,
         mask_mode: str = "fov",
         augment: bool = False,
+        fov_crop: bool = True,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -78,6 +81,8 @@ class RFMiDSegDataset(Dataset):
         self.masks_dir = masks_dir
         self.mask_mode = mask_mode
         self.augment = augment
+        self.fov_crop = fov_crop
+        self.seed = seed
 
         files = sorted(
             f for f in os.listdir(images_dir)
@@ -93,7 +98,6 @@ class RFMiDSegDataset(Dataset):
             keep = max(1, int(round(len(files) * fraction)))
             files = files[:keep]
         self.files: List[str] = files
-        self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -108,25 +112,36 @@ class RFMiDSegDataset(Dataset):
         m = (gray > thr).astype(np.uint8) * 255
         return Image.fromarray(m, mode="L")
 
-    def _load_mask(self, fname: str, img: Image.Image) -> Image.Image:
+    def _load_mask(self, fname: str, img: Image.Image, bbox=None) -> Image.Image:
         if self.masks_dir:
             stem = os.path.splitext(fname)[0]
             for ext in _IMG_EXTS:
                 p = os.path.join(self.masks_dir, stem + ext)
                 if os.path.exists(p):
-                    return Image.open(p).convert("L")
-        return self._placeholder_mask(img)
+                    m = Image.open(p).convert("L")
+                    if bbox is not None:                  # keep aligned with FOV crop
+                        r0, r1, c0, c1 = bbox
+                        m = Image.fromarray(np.asarray(m)[r0:r1, c0:c1])
+                    return m
+        return self._placeholder_mask(img)                # generated from cropped img -> aligned
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        rng = make_rng(self.seed, idx)        # per-call: diverse across workers, reproducible
         fname = self.files[idx]
         img = Image.open(os.path.join(self.images_dir, fname)).convert("RGB")
-        mask = self._load_mask(fname, img)
+
+        bbox = None
+        if self.fov_crop:
+            arr, bbox = crop_to_fov(np.asarray(img))
+            img = Image.fromarray(arr)
+
+        mask = self._load_mask(fname, img, bbox)
 
         size = (self.image_size, self.image_size)
         img = img.resize(size, Image.BILINEAR)
         mask = mask.resize(size, Image.NEAREST)
 
-        if self.augment and bool(self._rng.integers(0, 2)):
+        if self.augment and bool(rng.integers(0, 2)):
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
 

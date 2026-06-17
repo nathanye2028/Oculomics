@@ -321,6 +321,7 @@ class MBRSETDataset(Dataset):
         return_metadata: bool = False,
         cache_size: int = 0,
         draft_decode: bool = True,
+        fov_crop: bool = True,
     ) -> None:
         super().__init__()
 
@@ -331,6 +332,7 @@ class MBRSETDataset(Dataset):
         self.file_col = file_col
         self.return_metadata = return_metadata
         self.draft_decode = draft_decode
+        self.fov_crop = fov_crop
         self.image_size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
 
         # --- load frame ----------------------------------------------------- #
@@ -454,6 +456,13 @@ class MBRSETDataset(Dataset):
                 # Decode JPEG at the smallest scale >= target -> faster/cheaper.
                 img.draft("RGB", self.image_size)
             img = img.convert("RGB")
+
+        if self.fov_crop:
+            # Strip the black border so the resize spends resolution on retina,
+            # not background. Standard fundus preprocessing.
+            from fundus_utils import crop_to_fov
+            arr, _ = crop_to_fov(np.asarray(img))
+            img = Image.fromarray(arr)
 
         if self._cache_size:
             self._cache[idx] = img

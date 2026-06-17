@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_seg import build_model       # noqa: E402
 from seg_dataset import RFMiDSegDataset  # noqa: E402
+from fundus_utils import seed_everything, seed_worker, focal_tversky_loss  # noqa: E402
 
 KAGGLE_SLUG = "andrewmvd/retinal-disease-classification"
 RFMID_TRAIN_REL = os.path.join(
@@ -56,12 +57,9 @@ def resolve_images_dir(explicit: str | None) -> str:
 
 
 def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    bce = F.binary_cross_entropy_with_logits(logits, target)
-    probs = torch.sigmoid(logits)
-    num = 2 * (probs * target).sum(dim=(1, 2, 3)) + 1.0
-    den = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + 1.0
-    dice = 1.0 - (num / den).mean()
-    return bce + dice
+    # Focal Tversky: recall-favouring, robust to the extreme lesion/background
+    # imbalance where plain BCE/Dice collapses to all-background.
+    return focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75)
 
 
 @torch.no_grad()
@@ -87,8 +85,10 @@ def main() -> int:
     p.add_argument("--base", type=int, default=32, help="Baseline U-Net base channel width.")
     p.add_argument("--no-gcg", action="store_true", help="Disable GCG blocks (gcg_unet ablation).")
     p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
+    seed_everything(args.seed)
     device = pick_device()
     images_dir = resolve_images_dir(args.images_dir)
     print(f"[info] device     : {device}")
@@ -102,10 +102,11 @@ def main() -> int:
     print(f"[info] dataset    : {len(ds)} images (fraction={args.fraction:.4f})"
           f"{' [placeholder masks]' if not args.masks_dir else ''}")
 
+    g = torch.Generator(); g.manual_seed(args.seed)
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=True,
+        drop_last=True, worker_init_fn=seed_worker, generator=g,
     )
 
     if args.arch == "baseline":

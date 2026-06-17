@@ -23,11 +23,12 @@ import sys
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset import MBRSETDataset      # noqa: E402
 from model import MBRSETClassifier     # noqa: E402
+from fundus_utils import seed_everything, seed_worker  # noqa: E402
 
 KAGGLE_SLUG = "mohamedabdalkader/retinal-disease-detection"
 COLUMN_MAP = {
@@ -52,9 +53,11 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--pretrained", action="store_true", default=True)
     args = p.parse_args()
 
+    seed_everything(args.seed)
     device = pick_device()
     import kagglehub
     root = kagglehub.dataset_download(KAGGLE_SLUG)
@@ -68,9 +71,16 @@ def main() -> int:
     )
     print(f"[info] device : {device}")
     print(f"[info] dataset: {ds}")
+    print(f"[info] class counts: {ds.class_counts().tolist()}  (imbalanced -> WeightedRandomSampler)")
 
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+    # Class-imbalance fix: sample inversely to class frequency so minority
+    # grades (e.g. severe DR) are not drowned out. shuffle is implied by the sampler.
+    g = torch.Generator(); g.manual_seed(args.seed)
+    sample_w = ds.sample_weights()
+    sampler = WeightedRandomSampler(sample_w, num_samples=len(ds), replacement=True, generator=g)
+    loader = DataLoader(ds, batch_size=args.batch_size, sampler=sampler,
+                        num_workers=args.num_workers, worker_init_fn=seed_worker,
+                        generator=g, pin_memory=(device.type == "cuda"))
 
     model = MBRSETClassifier.from_dataset(ds, pretrained=args.pretrained).to(device)
     n_params = sum(p.numel() for p in model.parameters())

@@ -4,26 +4,30 @@ idrid_dataset.py
 Real lesion-segmentation dataset for **IDRiD** (Indian Diabetic Retinopathy
 Image Dataset), Segmentation subset.
 
-Unlike the placeholder masks in :mod:`seg_dataset`, this yields *genuine*
-per-pixel lesion ground truth: each fundus image is paired with a
-**multi-label mask tensor** ``[C, H, W]`` where each channel is a binary mask
-for one lesion type. This is the supervision the GCG blocks need — one output
-channel per distinct lesion, so gating can be tied to (and measured against)
-specific pathologies.
+Yields genuine per-pixel lesion ground truth as a **multi-label mask tensor**
+``[C, H, W]`` (one binary channel per lesion type) paired with the fundus
+image — the supervision the GCG blocks need (one channel per distinct lesion).
 
 IDRiD lesion classes (binary .tif masks, named ``IDRiD_NN_<suffix>.tif``):
-    MA  microaneurysms      (1. Microaneurysms)
-    HE  haemorrhages        (2. Haemorrhages)
-    EX  hard exudates       (3. Hard Exudates)
-    SE  soft exudates       (4. Soft Exudates)   -- present in only ~half
-    OD  optic disc          (5. Optic Disc)      -- anatomical, not a lesion
+    MA  microaneurysms      MA   |  HE  haemorrhages   HE
+    EX  hard exudates       EX   |  SE  soft exudates  SE   (present in ~half)
+    OD  optic disc          OD   (anatomical, not a lesion)
 
-A missing mask file for an image means that lesion is absent -> an all-zero
-channel (correct supervision, not missing data).
+A missing mask file for an image means that lesion is absent -> all-zero
+channel (correct supervision).
 
-Images are 4288x2848; lesions (esp. microaneurysms ~0.05% of pixels) are tiny,
-so segmentation at low resolution is lossy. ``fov_crop`` removes the black
-border first; ``image_size`` controls the working resolution.
+Resolution & tiny lesions
+-------------------------
+Images are 4288x2848; microaneurysms are ~0.05% of pixels and vanish under a
+global downscale. Two modes:
+  * ``patch_size`` set  -> random crop at NATIVE resolution (lesion-biased),
+    preserving small lesions. Use this for training.
+  * ``patch_size=None`` -> FOV-crop then resize to ``image_size`` (whole image).
+    Use this for visualisation / global eval; for held-out scoring prefer
+    ``fundus_utils.tiled_predict`` at native resolution.
+
+``fov_crop`` strips the black border first (shared with the rest of the
+pipeline via :mod:`fundus_utils`).
 """
 from __future__ import annotations
 
@@ -35,6 +39,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+
+from fundus_utils import fov_bbox, make_rng, random_patch
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -72,12 +78,16 @@ class IDRiDSegDataset(Dataset):
 
     Parameters
     ----------
-    root_or_base : either the IDRiD download root or the 'A. Segmentation' dir.
+    root_or_base : IDRiD download root or the 'A. Segmentation' dir.
     split : 'train' | 'test'.
-    image_size : square working resolution.
+    image_size : square resolution used in whole-image mode (patch_size=None).
     lesions : ordered lesion codes -> output channels (default 4 DR lesions).
     fov_crop : crop the black border to the retinal field of view first.
+    patch_size : if set, return a native-resolution random crop of this size
+                 (training); else resize the whole FOV image to image_size.
+    fg_bias : prob. a training patch is centred on a lesion pixel (vs uniform).
     augment : light joint geometric augmentation (flips).
+    seed : base seed for reproducible-yet-diverse per-sample augmentation.
     """
 
     def __init__(
@@ -87,6 +97,8 @@ class IDRiDSegDataset(Dataset):
         image_size: int = 512,
         lesions: Sequence[str] = DEFAULT_LESIONS,
         fov_crop: bool = True,
+        patch_size: Optional[int] = None,
+        fg_bias: float = 0.7,
         augment: bool = False,
         seed: int = 42,
     ) -> None:
@@ -105,7 +117,10 @@ class IDRiDSegDataset(Dataset):
             if code not in LESION_FOLDERS:
                 raise KeyError(f"Unknown lesion code {code!r}; choices: {list(LESION_FOLDERS)}")
         self.fov_crop = fov_crop
+        self.patch_size = patch_size
+        self.fg_bias = fg_bias
         self.augment = augment
+        self.seed = seed
 
         self.img_dir = os.path.join(self.base, "1. Original Images", _SPLIT_DIR[split])
         self.gt_dir = os.path.join(self.base, "2. All Segmentation Groundtruths", _SPLIT_DIR[split])
@@ -113,7 +128,6 @@ class IDRiDSegDataset(Dataset):
         self.files: List[str] = sorted(
             f for f in os.listdir(self.img_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))
         )
-        self._rng = np.random.default_rng(seed)
 
     @property
     def num_classes(self) -> int:
@@ -131,51 +145,47 @@ class IDRiDSegDataset(Dataset):
                 return p
         return None
 
-    @staticmethod
-    def _fov_bbox(rgb: np.ndarray, tol: int = 12) -> Tuple[int, int, int, int]:
-        """Bounding box of the non-black field of view (row0,row1,col0,col1)."""
-        gray = rgb.max(axis=2)
-        rows = np.where(gray.max(axis=1) > tol)[0]
-        cols = np.where(gray.max(axis=0) > tol)[0]
-        if len(rows) == 0 or len(cols) == 0:
-            return 0, rgb.shape[0], 0, rgb.shape[1]
-        return rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def load_full(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Load FOV-cropped native-resolution (image[H,W,3], masks[C,H,W])."""
         fname = self.files[idx]
         stem = os.path.splitext(fname)[0]
-        img = Image.open(os.path.join(self.img_dir, fname)).convert("RGB")
-        W, H = img.size
-        img_np = np.asarray(img)
-
-        # Build full-res mask stack [C, H, W] from the per-lesion tifs.
+        img = np.asarray(Image.open(os.path.join(self.img_dir, fname)).convert("RGB"))
+        H, W = img.shape[:2]
         masks = np.zeros((len(self.lesions), H, W), dtype=np.uint8)
         for c, code in enumerate(self.lesions):
             p = self._mask_path(stem, code)
             if p is not None:
                 m = np.asarray(Image.open(p).convert("L"))
                 masks[c] = (m > 0).astype(np.uint8)
-
-        # FOV crop (identical box for image + every mask).
         if self.fov_crop:
-            r0, r1, c0, c1 = self._fov_bbox(img_np)
-            img_np = img_np[r0:r1, c0:c1]
+            r0, r1, c0, c1 = fov_bbox(img)
+            img = img[r0:r1, c0:c1]
             masks = masks[:, r0:r1, c0:c1]
+        return img, masks
 
-        # Resize: image bilinear, masks nearest (preserve binary lesion pixels).
-        size = (self.image_size, self.image_size)
-        img = Image.fromarray(img_np).resize(size, Image.BILINEAR)
-        mask_resized = np.stack([
-            np.asarray(Image.fromarray(masks[c]).resize(size, Image.NEAREST))
-            for c in range(masks.shape[0])
-        ], axis=0).astype(np.float32)
-
-        # Joint augmentation.
-        if self.augment and bool(self._rng.integers(0, 2)):
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            mask_resized = mask_resized[:, :, ::-1].copy()
-
-        img_t = torch.from_numpy(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+    def _to_tensors(self, img_np: np.ndarray, masks: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_t = torch.from_numpy(img_np.astype(np.float32).transpose(2, 0, 1) / 255.0)
         img_t = (img_t - IMAGENET_MEAN) / IMAGENET_STD
-        mask_t = torch.from_numpy(mask_resized)
+        mask_t = torch.from_numpy(masks.astype(np.float32))
         return img_t, mask_t
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        rng = make_rng(self.seed, idx)                 # diverse per worker+epoch, reproducible
+        img_np, masks = self.load_full(idx)
+
+        if self.patch_size:
+            # Native-resolution lesion-biased crop -> preserves tiny lesions.
+            img_np, masks = random_patch(img_np, masks, self.patch_size, rng, self.fg_bias)
+        else:
+            size = (self.image_size, self.image_size)
+            img_np = np.asarray(Image.fromarray(img_np).resize(size, Image.BILINEAR))
+            masks = np.stack([
+                np.asarray(Image.fromarray(masks[c]).resize(size, Image.NEAREST))
+                for c in range(masks.shape[0])
+            ], axis=0)
+
+        if self.augment and bool(rng.integers(0, 2)):
+            img_np = img_np[:, ::-1, :].copy()
+            masks = masks[:, :, ::-1].copy()
+
+        return self._to_tensors(img_np, masks)

@@ -1,0 +1,178 @@
+"""
+fundus_utils.py
+===============
+Shared utilities for the fundus pipeline:
+
+* **Reproducibility** — ``seed_everything``, a DataLoader ``seed_worker`` hook,
+  and ``make_rng`` for per-sample augmentation RNG that is *both* reproducible
+  and actually diverse across workers (fixes the "all workers share one seed"
+  bug).
+* **Fundus preprocessing** — ``fov_bbox`` / ``crop_to_fov`` to strip the black
+  border, and ``circular_fov_mask``.
+* **Imbalance-aware losses** — ``tversky_loss`` / ``focal_tversky_loss`` for
+  tiny-lesion segmentation, where plain BCE/Dice collapses to background.
+* **High-resolution patching** — ``random_patch`` (lesion-biased crops at native
+  resolution) and ``tiled_predict`` (stitch full-image inference from tiles) so
+  microaneurysms aren't destroyed by downscaling.
+"""
+from __future__ import annotations
+
+import os
+import random
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+# --------------------------------------------------------------------------- #
+# Reproducibility
+# --------------------------------------------------------------------------- #
+def seed_everything(seed: int = 42) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn``: derive numpy/random seeds from torch's
+    per-worker base seed so each worker is seeded differently yet deterministically."""
+    base = torch.initial_seed() % (2 ** 32)
+    np.random.seed(base)
+    random.seed(base)
+
+
+def make_rng(base_seed: int, index: int) -> np.random.Generator:
+    """Per-call RNG keyed on (worker base seed, dataset base seed, sample index).
+
+    In a worker process ``torch.initial_seed()`` differs per worker *and* per
+    epoch, so augmentation is diverse across workers and epochs while staying
+    reproducible for a fixed global seed. In the main process it falls back to
+    the dataset's base seed + index.
+    """
+    info = torch.utils.data.get_worker_info()
+    worker_seed = int(torch.initial_seed()) if info is not None else int(base_seed)
+    ss = np.random.SeedSequence([worker_seed % (2 ** 32), int(base_seed), int(index)])
+    return np.random.default_rng(ss)
+
+
+# --------------------------------------------------------------------------- #
+# Fundus preprocessing
+# --------------------------------------------------------------------------- #
+def fov_bbox(rgb: np.ndarray, tol: int = 12) -> Tuple[int, int, int, int]:
+    """Bounding box (r0, r1, c0, c1) of the non-black field of view."""
+    gray = rgb.max(axis=2) if rgb.ndim == 3 else rgb
+    rows = np.where(gray.max(axis=1) > tol)[0]
+    cols = np.where(gray.max(axis=0) > tol)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return 0, gray.shape[0], 0, gray.shape[1]
+    return int(rows[0]), int(rows[-1] + 1), int(cols[0]), int(cols[-1] + 1)
+
+
+def crop_to_fov(rgb: np.ndarray, tol: int = 12) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    r0, r1, c0, c1 = fov_bbox(rgb, tol)
+    return rgb[r0:r1, c0:c1], (r0, r1, c0, c1)
+
+
+def circular_fov_mask(h: int, w: int) -> np.ndarray:
+    """Boolean circular mask inscribed in an h x w frame (retinal disc proxy)."""
+    yy, xx = np.ogrid[:h, :w]
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    r = min(cy, cx)
+    return (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+
+
+# --------------------------------------------------------------------------- #
+# Imbalance-aware segmentation losses
+# --------------------------------------------------------------------------- #
+def tversky_loss(logits, target, alpha=0.7, beta=0.3, smooth=1.0):
+    """Tversky loss. alpha weights false negatives (>beta -> recall-favouring,
+    good for tiny lesions). Per-channel, averaged."""
+    probs = torch.sigmoid(logits)
+    dims = (0, 2, 3)
+    tp = (probs * target).sum(dims)
+    fp = (probs * (1 - target)).sum(dims)
+    fn = ((1 - probs) * target).sum(dims)
+    t = (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
+    return (1.0 - t).mean()
+
+
+def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75, smooth=1.0):
+    """Focal Tversky: focuses learning on hard/rare structures (gamma<1)."""
+    probs = torch.sigmoid(logits)
+    dims = (0, 2, 3)
+    tp = (probs * target).sum(dims)
+    fp = (probs * (1 - target)).sum(dims)
+    fn = ((1 - probs) * target).sum(dims)
+    t = (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
+    return ((1.0 - t).clamp(min=1e-6) ** gamma).mean()
+
+
+# --------------------------------------------------------------------------- #
+# High-resolution patching
+# --------------------------------------------------------------------------- #
+def random_patch(
+    img: np.ndarray,
+    masks: np.ndarray,
+    patch: int,
+    rng: np.random.Generator,
+    fg_bias: float = 0.7,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Random ``patch x patch`` crop at NATIVE resolution (no downscale).
+
+    With prob ``fg_bias`` the crop is centred on a random lesion pixel so tiny
+    lesions aren't perpetually cropped out; otherwise it's uniform random.
+    ``img`` is [H,W,3], ``masks`` is [C,H,W].
+    """
+    H, W = img.shape[:2]
+    ph = min(patch, H)
+    pw = min(patch, W)
+    fg = masks.any(axis=0)
+    if fg_bias > 0 and fg.sum() > 0 and rng.random() < fg_bias:
+        ys, xs = np.where(fg)
+        k = int(rng.integers(len(ys)))
+        top = int(np.clip(ys[k] - ph // 2, 0, H - ph))
+        left = int(np.clip(xs[k] - pw // 2, 0, W - pw))
+    else:
+        top = int(rng.integers(0, H - ph + 1))
+        left = int(rng.integers(0, W - pw + 1))
+    return img[top:top + ph, left:left + pw], masks[:, top:top + ph, left:left + pw]
+
+
+def _tile_starts(length: int, tile: int, overlap: int) -> List[int]:
+    if length <= tile:
+        return [0]
+    step = max(1, tile - overlap)
+    starts = list(range(0, length - tile + 1, step))
+    if starts[-1] != length - tile:
+        starts.append(length - tile)
+    return starts
+
+
+@torch.no_grad()
+def tiled_predict(model, image: torch.Tensor, tile: int, overlap: int, device) -> torch.Tensor:
+    """Full-resolution inference by stitching overlapping tiles (averaged).
+
+    ``image`` is [3,H,W] (single image, native resolution). Returns sigmoid
+    probabilities [C,H,W]. Preserves small lesions that a global downscale
+    would erase.
+    """
+    model.eval()
+    _, H, W = image.shape
+    ys = _tile_starts(H, tile, overlap)
+    xs = _tile_starts(W, tile, overlap)
+    acc = None
+    cnt = torch.zeros(1, H, W, device=device)
+    for y in ys:
+        for x in xs:
+            patch = image[:, y:y + tile, x:x + tile].unsqueeze(0).to(device)
+            prob = torch.sigmoid(model(patch))[0]            # [C,th,tw]
+            if acc is None:
+                acc = torch.zeros(prob.shape[0], H, W, device=device)
+            acc[:, y:y + tile, x:x + tile] += prob
+            cnt[:, y:y + tile, x:x + tile] += 1
+    return acc / cnt.clamp(min=1e-6)
