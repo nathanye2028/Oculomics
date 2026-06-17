@@ -1,22 +1,26 @@
 """
 unet_baseline.py
 ================
-A clean, **gating-free** 2D U-Net for segmenting abnormalities on mBRSET
-fundus images. This is the *baseline benchmark* — the canonical
-Ronneberger-style encoder/decoder with plain double-conv blocks and skip
-connections, and **no attention / Context Gating of any kind**.
+A clean, **gating-free** 2D U-Net for segmenting abnormalities on fundus
+images — the canonical Ronneberger-style encoder/decoder with plain
+double-conv blocks and skip connections, and **no attention of any kind**.
 
-Why a separate baseline
------------------------
-The Context Gating (GCG) work lives in :mod:`model_seg` (MobileNetV3 encoder +
-GCG-gated skips). To measure what GCG actually buys, you need an honest control
-trained under identical conditions. This module is that control: a vanilla
-U-Net with the same input/output contract (image ``[B,3,H,W]`` ->
-per-pixel logits ``[B,num_classes,H,W]``) so future GCG blocks can be dropped
-into an otherwise-equivalent network and compared apples-to-apples.
+What this is (and is NOT)
+-------------------------
+This is a **standard-architecture reference point**: "how does a textbook
+U-Net do on this task?". It is image-only (no metadata fusion) and shares the
+input/output contract (image ``[B,3,H,W]`` -> logits ``[B,num_classes,H,W]``).
 
-It is image-only (no systemic/metadata fusion) and has no learned attention,
-so any future improvement from gating is attributable to the gating itself.
+It is **NOT the control for measuring Guided Context Gating.** This U-Net
+differs from the GCG model in backbone, depth and pretraining, so a Dice gap
+between them confounds "gating" with "architecture". The apples-to-apples GCG
+ablation is the *same* network with gating toggled:
+
+    model_seg.build_model(use_gcg=True)   vs   build_model(use_gcg=False)
+    # i.e.  train_idrid.py --arch gcg_unet   vs   --arch gcg_unet --no-gcg
+
+Use *that* pair to attribute an effect to gating; use this module only as an
+independent literature baseline alongside both.
 """
 from __future__ import annotations
 
