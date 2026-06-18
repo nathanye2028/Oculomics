@@ -153,26 +153,59 @@ def _tile_starts(length: int, tile: int, overlap: int) -> List[int]:
     return starts
 
 
-@torch.no_grad()
-def tiled_predict(model, image: torch.Tensor, tile: int, overlap: int, device) -> torch.Tensor:
-    """Full-resolution inference by stitching overlapping tiles (averaged).
+@torch.inference_mode()
+def tiled_predict(
+    model,
+    image: torch.Tensor,
+    tile: int,
+    overlap: int,
+    device,
+    tile_batch: int = 8,
+    fg_map: Optional[torch.Tensor] = None,
+    autocast: bool = True,
+) -> torch.Tensor:
+    """Full-resolution inference by stitching tiles. Built for scale.
 
     ``image`` is [3,H,W] (single image, native resolution). Returns sigmoid
-    probabilities [C,H,W]. Preserves small lesions that a global downscale
-    would erase.
+    probabilities [C,H,W] on ``device``. Preserves small lesions a global
+    downscale would erase.
+
+    Efficiency levers (most-to-least impactful on this task):
+      * **FOV tile skipping** — if ``fg_map`` ([H,W] bool) is given, tiles with
+        no field-of-view pixel are skipped entirely (left as background). A
+        fundus image is a circle in a black frame, so a large fraction of
+        corner tiles cost nothing. This is the dominant, hardware-independent
+        win (the work is compute-bound, so fewer forwards == less time).
+      * **batched forwards** (``tile_batch``) — helps a lot on CUDA; modest on
+        MPS. Kept small by default to avoid the MPS large-batch memory cliff.
+      * on-device accumulation + ``inference_mode`` + optional CUDA autocast.
     """
     model.eval()
     _, H, W = image.shape
+    tile = min(tile, H, W)                       # keep all tiles equal-sized
     ys = _tile_starts(H, tile, overlap)
     xs = _tile_starts(W, tile, overlap)
-    acc = None
-    cnt = torch.zeros(1, H, W, device=device)
-    for y in ys:
-        for x in xs:
-            patch = image[:, y:y + tile, x:x + tile].unsqueeze(0).to(device)
-            prob = torch.sigmoid(model(patch))[0]            # [C,th,tw]
-            if acc is None:
-                acc = torch.zeros(prob.shape[0], H, W, device=device)
-            acc[:, y:y + tile, x:x + tile] += prob
-            cnt[:, y:y + tile, x:x + tile] += 1
-    return acc / cnt.clamp(min=1e-6)
+    coords = [(y, x) for y in ys for x in xs]
+    if fg_map is not None:
+        coords = [(y, x) for (y, x) in coords if bool(fg_map[y:y + tile, x:x + tile].any())]
+
+    image = image.to(device, non_blocking=True)
+    n_lesions = None
+    prob_sum = None
+    weight = torch.zeros(1, H, W, device=device)
+    use_ac = autocast and device.type == "cuda"
+
+    for i in range(0, len(coords), tile_batch):
+        chunk = coords[i:i + tile_batch]
+        batch = torch.stack([image[:, y:y + tile, x:x + tile] for (y, x) in chunk], dim=0)
+        with torch.autocast(device_type="cuda", enabled=use_ac):
+            probs = torch.sigmoid(model(batch)).float()         # [b,C,tile,tile]
+        if prob_sum is None:
+            n_lesions = probs.shape[1]
+            prob_sum = torch.zeros(n_lesions, H, W, device=device)
+        for j, (y, x) in enumerate(chunk):
+            prob_sum[:, y:y + tile, x:x + tile] += probs[j]
+            weight[:, y:y + tile, x:x + tile] += 1
+    if prob_sum is None:                          # whole image was background
+        return torch.zeros(1, H, W, device=device)
+    return prob_sum / weight.clamp(min=1e-6)

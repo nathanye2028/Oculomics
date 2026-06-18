@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS  # noqa: E402
+from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS, IMAGENET_MEAN, IMAGENET_STD  # noqa: E402
 from fundus_utils import (  # noqa: E402
     seed_everything, seed_worker, focal_tversky_loss, tversky_loss, tiled_predict,
 )
@@ -99,19 +99,53 @@ def evaluate_whole(model, loader, lesions, device):
     return _dice_from_counts(inter, denom, lesions)
 
 
-@torch.no_grad()
-def evaluate_tiled(model, dataset, lesions, device, tile, overlap):
-    """Per-lesion Dice at NATIVE resolution via tiled inference. Accurate; for final test."""
+class _NativeFull(torch.utils.data.Dataset):
+    """Yields native-resolution (uint8 image [3,H,W], uint8 masks [C,H,W]).
+
+    Returning uint8 (not normalised float) halves the worker->main transfer;
+    normalisation happens once on-device in :func:`evaluate_tiled`.
+    """
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        img_np, masks = self.ds.load_full(i)                     # [H,W,3], [C,H,W] uint8
+        img = torch.from_numpy(np.ascontiguousarray(img_np.transpose(2, 0, 1)))
+        return img, torch.from_numpy(np.ascontiguousarray(masks))
+
+
+def _take_one(batch):              # module-level collate (picklable for spawn workers)
+    return batch[0]
+
+
+@torch.inference_mode()
+def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16, num_workers=2):
+    """Per-lesion Dice at NATIVE resolution via tiled inference. Accurate; for final test.
+
+    Efficient at scale: image/mask decode runs in parallel DataLoader workers
+    (overlapping GPU compute), tiles are batched through the model, and Dice
+    counts accumulate on-device (no per-image CPU sync).
+    """
     model.eval()
     C = len(lesions)
-    inter = torch.zeros(C)
-    denom = torch.zeros(C)
-    for i in range(len(dataset)):
-        img_np, masks = dataset.load_full(i)
-        img_t = dataset._to_tensors(img_np, masks)[0]            # native [3,H,W]
-        prob = tiled_predict(model, img_t, tile, overlap, device).cpu()
+    inter = torch.zeros(C, device=device)
+    denom = torch.zeros(C, device=device)
+    mean, std = IMAGENET_MEAN.to(device), IMAGENET_STD.to(device)
+    loader = DataLoader(_NativeFull(dataset), batch_size=1, num_workers=num_workers,
+                        collate_fn=_take_one, worker_init_fn=seed_worker,
+                        pin_memory=(device.type == "cuda"))
+    for img_u8, masks_u8 in loader:
+        img_u8 = img_u8.to(device, non_blocking=True)
+        fg_map = img_u8.amax(dim=0) > 12               # field-of-view pixels (skip black tiles)
+        img = (img_u8.float().div_(255.0) - mean) / std
+        prob = tiled_predict(model, img, tile, overlap, device,
+                             tile_batch=tile_batch, fg_map=fg_map)
         pred = (prob > 0.5).float()
-        target = torch.from_numpy(masks.astype(np.float32))
+        target = masks_u8.to(device, non_blocking=True).float()
         inter += 2 * (pred * target).sum(dim=(1, 2))
         denom += pred.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
     return _dice_from_counts(inter, denom, lesions)
@@ -145,6 +179,7 @@ def main() -> int:
     p.add_argument("--fg-bias", type=float, default=0.7, help="Prob a train patch is lesion-centred.")
     p.add_argument("--eval-tiled", action="store_true", help="Score test at native res via tiling.")
     p.add_argument("--tile-overlap", type=int, default=64)
+    p.add_argument("--tile-batch", type=int, default=16, help="Tiles per forward pass (throughput).")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--lr", type=float, default=2e-3)
@@ -243,7 +278,8 @@ def main() -> int:
     model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
     if args.eval_tiled:
         tile = patch or args.image_size
-        test_dice = evaluate_tiled(model, test_ds, args.lesions, device, tile, args.tile_overlap)
+        test_dice = evaluate_tiled(model, test_ds, args.lesions, device, tile, args.tile_overlap,
+                                   tile_batch=args.tile_batch, num_workers=args.num_workers)
     else:
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                                  num_workers=args.num_workers, worker_init_fn=seed_worker)
