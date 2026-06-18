@@ -178,8 +178,10 @@ def main() -> int:
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
     p.add_argument("--fg-bias", type=float, default=0.7, help="Prob a train patch is lesion-centred.")
     p.add_argument("--eval-tiled", action="store_true", help="Score test at native res via tiling.")
-    p.add_argument("--tile-overlap", type=int, default=64)
-    p.add_argument("--tile-batch", type=int, default=16, help="Tiles per forward pass (throughput).")
+    p.add_argument("--tile-overlap", type=int, default=0,
+                   help="Tile overlap. 0 = fewest tiles / fastest (measured 1.3x vs 64); "
+                        ">0 smooths seams at the cost of extra forwards.")
+    p.add_argument("--tile-batch", type=int, default=8, help="Tiles per forward pass (CUDA win; modest on MPS).")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--lr", type=float, default=2e-3)
