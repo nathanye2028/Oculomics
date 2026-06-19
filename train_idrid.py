@@ -34,6 +34,20 @@ gating off**:
 
 ``--arch baseline`` (vanilla U-Net) is a SEPARATE standard-architecture
 reference, NOT the GCG ablation (different backbone/depth/pretraining).
+
+Scaling to large batches / multiple GPUs
+----------------------------------------
+Effective batch = ``batch_size * accum_steps * num_gpus``.
+
+  * One GPU, big effective batch via accumulation + fp16:
+        python train_idrid.py --amp --batch-size 8 --accum-steps 4
+  * Multi-GPU (DistributedDataParallel) via torchrun — batch shards across GPUs:
+        torchrun --nproc_per_node=4 train_idrid.py --amp \
+            --batch-size 16 --patch-size 512 --epochs 100 --eval-tiled
+
+Under torchrun the script auto-detects RANK/WORLD_SIZE, wraps the model in DDP
+(NCCL on CUDA), shards train/val/test with DistributedSampler, uses no_sync
+during accumulation, all-reduces metrics, and checkpoints from rank 0.
 """
 from __future__ import annotations
 
@@ -41,10 +55,14 @@ import argparse
 import os
 import sys
 
+from contextlib import nullcontext
+
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS, IMAGENET_MEAN, IMAGENET_STD  # noqa: E402
@@ -55,11 +73,31 @@ from fundus_utils import (  # noqa: E402
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
 
 
-def pick_device() -> torch.device:
+# --------------------------------------------------------------------------- #
+# Distributed (multi-GPU) helpers — active only under torchrun.
+# --------------------------------------------------------------------------- #
+def ddp_info():
+    """(rank, world_size, local_rank) from torchrun env; (0,1,0) if single-process."""
+    return (int(os.environ.get("RANK", 0)),
+            int(os.environ.get("WORLD_SIZE", 1)),
+            int(os.environ.get("LOCAL_RANK", 0)))
+
+
+def is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def all_reduce_sum(*tensors):
+    if is_dist():
+        for t in tensors:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+
+def pick_device(local_rank: int, ddp: bool) -> torch.device:
     if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+        return torch.device(f"cuda:{local_rank}" if ddp else "cuda")
+    if torch.backends.mps.is_available() and not ddp:
+        return torch.device("mps")        # MPS has no DDP backend -> CPU under torchrun
     return torch.device("cpu")
 
 
@@ -86,7 +124,11 @@ def _dice_from_counts(inter, denom, lesions):
 
 @torch.no_grad()
 def evaluate_whole(model, loader, lesions, device):
-    """Per-lesion Dice over a loader (whole-image, resized). Fast; for val selection."""
+    """Per-lesion Dice over a loader (whole-image, resized). Fast; for val selection.
+
+    Under DDP the loader is sharded per rank; counts are summed across ranks so
+    every rank computes the same global Dice (and thus agrees on the best epoch).
+    """
     model.eval()
     C = len(lesions)
     inter = torch.zeros(C, device=device)
@@ -96,6 +138,7 @@ def evaluate_whole(model, loader, lesions, device):
         pred = (torch.sigmoid(model(imgs)) > 0.5).float()
         inter += 2 * (pred * masks).sum(dim=(0, 2, 3))
         denom += pred.sum(dim=(0, 2, 3)) + masks.sum(dim=(0, 2, 3))
+    all_reduce_sum(inter, denom)
     return _dice_from_counts(inter, denom, lesions)
 
 
@@ -135,7 +178,10 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
     inter = torch.zeros(C, device=device)
     denom = torch.zeros(C, device=device)
     mean, std = IMAGENET_MEAN.to(device), IMAGENET_STD.to(device)
-    loader = DataLoader(_NativeFull(dataset), batch_size=1, num_workers=num_workers,
+    nf = _NativeFull(dataset)
+    # Under DDP, shard images across ranks (each GPU tiles a subset) then sum counts.
+    sampler = DistributedSampler(nf, shuffle=False) if is_dist() else None
+    loader = DataLoader(nf, batch_size=1, sampler=sampler, num_workers=num_workers,
                         collate_fn=_take_one, worker_init_fn=seed_worker,
                         pin_memory=(device.type == "cuda"))
     for img_u8, masks_u8 in loader:
@@ -148,6 +194,7 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
         target = masks_u8.to(device, non_blocking=True).float()
         inter += 2 * (pred * target).sum(dim=(1, 2))
         denom += pred.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
+    all_reduce_sum(inter, denom)
     return _dice_from_counts(inter, denom, lesions)
 
 
@@ -182,7 +229,11 @@ def main() -> int:
                    help="Tile overlap. 0 = fewest tiles / fastest (measured 1.3x vs 64); "
                         ">0 smooths seams at the cost of extra forwards.")
     p.add_argument("--tile-batch", type=int, default=8, help="Tiles per forward pass (CUDA win; modest on MPS).")
-    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=2, help="PHYSICAL micro-batch held in memory.")
+    p.add_argument("--accum-steps", type=int, default=1,
+                   help="Gradient accumulation: effective batch = batch-size * accum-steps.")
+    p.add_argument("--amp", action="store_true",
+                   help="Mixed precision (fp16) -> less memory, faster matmuls.")
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--loss", default="focal_tversky", choices=["focal_tversky", "tversky", "dice_bce"])
@@ -197,17 +248,35 @@ def main() -> int:
     p.add_argument("--run-name", default=None)
     args = p.parse_args()
 
-    seed_everything(args.seed)
-    device = pick_device()
+    # --- distributed init (no-op unless launched with torchrun) ---
+    rank, world, local_rank = ddp_info()
+    ddp = world > 1
+    if ddp:
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+    is_main = (rank == 0)
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k)
+
+    seed_everything(args.seed)             # same on every rank -> identical init & data split
+    device = pick_device(local_rank, ddp)
     run_name = args.run_name or default_run_name(args)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(args.ckpt_dir, f"{run_name}.pt")
     patch = args.patch_size if args.patch_size > 0 else None
 
+    # Download once on rank 0; other ranks wait then read the shared cache.
     root = args.root
     if root is None:
         import kagglehub
+        if ddp and not is_main:
+            dist.barrier()
         root = kagglehub.dataset_download(KAGGLE_SLUG)
+        if ddp and is_main:
+            dist.barrier()
 
     # Train view: augmented + (optionally) native-res patches. Val/test: whole image (clean).
     train_full = IDRiDSegDataset(root, split="train", image_size=args.image_size,
@@ -221,75 +290,121 @@ def main() -> int:
                               augment=False, seed=args.seed)
 
     n = len(train_full)
-    perm = np.random.default_rng(args.seed).permutation(n)
+    perm = np.random.default_rng(args.seed).permutation(n)   # identical split on all ranks
     n_val = max(1, int(round(n * args.val_frac)))
     val_idx, train_idx = perm[:n_val].tolist(), perm[n_val:].tolist()
     train_ds = Subset(train_full, train_idx)
     val_ds = Subset(val_full, val_idx)
 
     C = train_full.num_classes
-    print(f"[info] device : {device}")
-    print(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
-    print(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-    print(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
-          f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
-    print(f"[info] ckpt   : {ckpt_path}")
+    log(f"[info] dist   : {'DDP world='+str(world)+' backend='+dist.get_backend() if ddp else 'single-process'}")
+    log(f"[info] device : {device}")
+    log(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
+    log(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
+    log(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
+        f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
+    log(f"[info] ckpt   : {ckpt_path}")
 
+    # Under DDP, shard the data across ranks so each GPU sees a different subset.
     g = torch.Generator(); g.manual_seed(args.seed)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+    train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed, drop_last=True) if ddp else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if ddp else None
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=(train_sampler is None), sampler=train_sampler,
                               num_workers=args.num_workers, drop_last=True,
                               worker_init_fn=seed_worker, generator=g,
                               pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, sampler=val_sampler,
                             num_workers=args.num_workers, worker_init_fn=seed_worker,
                             pin_memory=(device.type == "cuda"))
 
     model, desc = build(args, C, device)
-    print(f"[info] model  : {desc}, {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
+    if ddp:
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    module = model.module if ddp else model        # unwrapped, for eval/checkpoint
+    log(f"[info] model  : {desc}, {sum(p.numel() for p in module.parameters())/1e6:.2f}M params")
 
     loss_fn = make_loss(args.loss)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # --- large-effective-batch training ---
+    # Effective batch = batch_size * accum_steps * world_size. Gradient
+    # accumulation fits a small micro-batch in memory; DDP shards across GPUs.
+    accum = max(1, args.accum_steps)
+    eff_batch = args.batch_size * accum * world
+    amp_on = args.amp and device.type in ("cuda", "mps")
+    amp_dtype = torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and device.type == "cuda"))
+    log(f"[info] batch  : physical={args.batch_size} x accum={accum} x gpus={world} "
+        f"-> effective={eff_batch}   amp={'on(fp16)' if amp_on else 'off'}")
+
+    def optimizer_step():
+        if scaler.is_enabled():
+            scaler.step(opt); scaler.update()
+        else:
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
     best_val, best_epoch = -1.0, -1
-    print(f"\n=== training {args.epochs} epochs (val for selection) ===")
+    log(f"\n=== training {args.epochs} epochs (val for selection) ===")
     for epoch in range(1, args.epochs + 1):
+        if ddp:
+            train_sampler.set_epoch(epoch)          # reshuffle shards each epoch
         model.train()
         running, nb = 0.0, 0
-        for imgs, masks in train_loader:
+        steps = len(train_loader)
+        opt.zero_grad(set_to_none=True)
+        for i, (imgs, masks) in enumerate(train_loader):
             imgs, masks = imgs.to(device), masks.to(device)
-            opt.zero_grad(set_to_none=True)
-            loss = loss_fn(model(imgs), masks)
-            loss.backward(); opt.step()
-            running += loss.item(); nb += 1
+            is_step = ((i + 1) % accum == 0) or (i + 1 == steps)
+            # During accumulation, skip DDP's gradient all-reduce except on the
+            # step that actually updates -> avoids redundant cross-GPU traffic.
+            sync_ctx = model.no_sync() if (ddp and not is_step) else nullcontext()
+            with sync_ctx:
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_on):
+                    loss = loss_fn(model(imgs), masks) / accum
+                scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
+            nb += 1
+            running += loss.item() * accum
+            if is_step:
+                optimizer_step()
 
-        val_dice = evaluate_whole(model, val_loader, args.lesions, device)
+        val_dice = evaluate_whole(module, val_loader, args.lesions, device)   # counts all-reduced inside
         mean_val = sum(val_dice.values()) / len(val_dice)
         per = "  ".join(f"{k}={v:.3f}" for k, v in val_dice.items())
         flag = ""
-        if mean_val > best_val:
+        if mean_val > best_val:                     # identical on all ranks (reduced metric)
             best_val, best_epoch = mean_val, epoch
-            torch.save({"model": model.state_dict(), "epoch": epoch, "val_mean_dice": mean_val,
-                        "val_dice": val_dice, "lesions": args.lesions, "arch": desc,
-                        "args": vars(args)}, ckpt_path)
+            if is_main:                             # only rank 0 writes the checkpoint
+                torch.save({"model": module.state_dict(), "epoch": epoch, "val_mean_dice": mean_val,
+                            "val_dice": val_dice, "lesions": args.lesions, "arch": desc,
+                            "args": vars(args)}, ckpt_path)
             flag = "  <- best (saved)"
-        print(f"  epoch {epoch:2d}/{args.epochs}  loss={running/max(nb,1):.4f}  "
-              f"val[mean={mean_val:.3f}]  {per}{flag}")
+        log(f"  epoch {epoch:2d}/{args.epochs}  loss={running/max(nb,1):.4f}  "
+            f"val[mean={mean_val:.3f}]  {per}{flag}")
 
     # ---- final honest eval: best checkpoint on held-out TEST ----
-    print(f"\n[info] best val mean-Dice {best_val:.3f} @ epoch {best_epoch}; loading {ckpt_path}")
-    model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
+    if ddp:
+        dist.barrier()                              # ensure rank 0 finished writing the ckpt
+    log(f"\n[info] best val mean-Dice {best_val:.3f} @ epoch {best_epoch}; loading {ckpt_path}")
+    module.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
     if args.eval_tiled:
         tile = patch or args.image_size
-        test_dice = evaluate_tiled(model, test_ds, args.lesions, device, tile, args.tile_overlap,
+        test_dice = evaluate_tiled(module, test_ds, args.lesions, device, tile, args.tile_overlap,
                                    tile_batch=args.tile_batch, num_workers=args.num_workers)
     else:
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+        test_sampler = DistributedSampler(test_ds, shuffle=False) if ddp else None
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, sampler=test_sampler,
                                  num_workers=args.num_workers, worker_init_fn=seed_worker)
-        test_dice = evaluate_whole(model, test_loader, args.lesions, device)
+        test_dice = evaluate_whole(module, test_loader, args.lesions, device)
     mean_test = sum(test_dice.values()) / len(test_dice)
     per = "  ".join(f"{k}={v:.3f}" for k, v in test_dice.items())
-    print(f"\n=== TEST (held-out, best checkpoint) ===\n  mean Dice = {mean_test:.3f}   {per}")
-    print("\nOK: train/val/test separated; focal-tversky loss; best checkpoint scored on test.")
+    log(f"\n=== TEST (held-out, best checkpoint) ===\n  mean Dice = {mean_test:.3f}   {per}")
+    log("\nOK: train/val/test separated; focal-tversky loss; best checkpoint scored on test.")
+
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
     return 0
 
 

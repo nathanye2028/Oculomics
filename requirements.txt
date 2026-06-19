@@ -9,3 +9,6 @@ torchvision==0.23.0
 
 # Used only by test_loader.py to fetch the Kaggle smoke-test dataset.
 kagglehub==0.3.13
+
+# Required by torchrun (multi-GPU DDP launcher) on Python 3.9.
+importlib_metadata
