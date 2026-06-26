@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "comment": "Run/debug configs. On a remote server via VS Code Remote-SSH, these run on the server. They use the workspace .venv interpreter; build it with setup_remote.sh first.",
+  "configurations": [
+    {
+      "name": "check_env (GPU sanity)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/check_env.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "train.py (classifier)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/train.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--task", "dr_grade", "--epochs", "50", "--batch-size", "32"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "train_idrid.py (segmentation, 1 GPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/train_idrid.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--arch", "gcg_unet", "--amp", "--patch-size", "512",
+               "--epochs", "200", "--eval-tiled", "--batch-size", "8"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "run_experiment.py (GCG vs control, 1 GPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_experiment.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--seeds", "0", "1", "2", "--epochs", "200",
+               "--patch-size", "512", "--eval-tiled", "--amp"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "train_idrid.py (DDP multi-GPU, torchrun)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "torch.distributed.run",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--nproc_per_node=4", "${workspaceFolder}/train_idrid.py",
+               "--arch", "gcg_unet", "--amp", "--patch-size", "512",
+               "--epochs", "200", "--eval-tiled", "--batch-size", "16"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
