@@ -236,6 +236,8 @@ def main() -> int:
                    help="Mixed precision (fp16) -> less memory, faster matmuls.")
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine"])
+    p.add_argument("--warmup-epochs", type=int, default=0)
     p.add_argument("--loss", default="focal_tversky", choices=["focal_tversky", "tversky", "dice_bce"])
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
@@ -246,6 +248,8 @@ def main() -> int:
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--run-name", default=None)
+    p.add_argument("--results-json", default=None,
+                   help="If set, rank 0 writes test metrics + config as JSON here.")
     args = p.parse_args()
 
     # --- distributed init (no-op unless launched with torchrun) ---
@@ -327,6 +331,17 @@ def main() -> int:
     loss_fn = make_loss(args.loss)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Cosine LR schedule (optional linear warmup) — stepped once per epoch.
+    sched = None
+    if args.lr_schedule == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        if args.warmup_epochs > 0:
+            warm = LinearLR(opt, start_factor=0.1, total_iters=args.warmup_epochs)
+            cos = CosineAnnealingLR(opt, T_max=max(1, args.epochs - args.warmup_epochs))
+            sched = SequentialLR(opt, [warm, cos], milestones=[args.warmup_epochs])
+        else:
+            sched = CosineAnnealingLR(opt, T_max=max(1, args.epochs))
+
     # --- large-effective-batch training ---
     # Effective batch = batch_size * accum_steps * world_size. Gradient
     # accumulation fits a small micro-batch in memory; DDP shards across GPUs.
@@ -382,6 +397,8 @@ def main() -> int:
             flag = "  <- best (saved)"
         log(f"  epoch {epoch:2d}/{args.epochs}  loss={running/max(nb,1):.4f}  "
             f"val[mean={mean_val:.3f}]  {per}{flag}")
+        if sched is not None:
+            sched.step()
 
     # ---- final honest eval: best checkpoint on held-out TEST ----
     if ddp:
@@ -401,6 +418,20 @@ def main() -> int:
     per = "  ".join(f"{k}={v:.3f}" for k, v in test_dice.items())
     log(f"\n=== TEST (held-out, best checkpoint) ===\n  mean Dice = {mean_test:.3f}   {per}")
     log("\nOK: train/val/test separated; focal-tversky loss; best checkpoint scored on test.")
+
+    if is_main and args.results_json:
+        import json
+        with open(args.results_json, "w") as f:
+            json.dump({
+                "arch": args.arch,
+                "use_gcg": (args.arch == "gcg_unet" and not args.no_gcg),
+                "seed": args.seed, "epochs": args.epochs,
+                "image_size": args.image_size, "patch_size": patch,
+                "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
+                "test_dice": test_dice, "test_mean": mean_test,
+                "best_val": best_val, "best_epoch": best_epoch,
+            }, f, indent=2)
+        log(f"[info] wrote results -> {args.results_json}")
 
     if ddp:
         dist.barrier()
