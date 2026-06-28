@@ -58,6 +58,7 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         "--ckpt-dir", args.ckpt_dir,
         "--run-name", run_name,
         "--results-json", results_json,
+        "--gcg-variant", args.gcg_variant,
     ]
     if args.patch_size > 0:
         cmd += ["--patch-size", str(args.patch_size)]
@@ -97,6 +98,9 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--warmup-epochs", type=int, default=0)
     p.add_argument("--loss", default="focal_tversky")
+    p.add_argument("--gcg-variant", default="baseline",
+                   choices=["baseline", "attention", "cbam", "se", "none"],
+                   help="GCG block for the 'gcg' condition (vs the --no-gcg control).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--out-dir", default="experiments")

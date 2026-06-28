@@ -12,3 +12,9 @@ kagglehub==0.3.13
 
 # Required by torchrun (multi-GPU DDP launcher) on Python 3.9.
 importlib_metadata
+
+# Test suite.
+pytest>=7.0
+
+# Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
+# tensorboard

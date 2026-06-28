@@ -69,6 +69,7 @@ from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS, IMAGENET_MEAN, IMAGE
 from fundus_utils import (  # noqa: E402
     seed_everything, seed_worker, focal_tversky_loss, tversky_loss, tiled_predict,
 )
+from metrics import dice_iou_from_counts, CSVLogger  # noqa: E402
 
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
 
@@ -117,29 +118,27 @@ def make_loss(name: str):
     raise ValueError(f"unknown loss {name!r}")
 
 
-def _dice_from_counts(inter, denom, lesions):
-    dice = (inter / denom.clamp(min=1e-6)).cpu()
-    return {code: dice[i].item() for i, code in enumerate(lesions)}
-
-
 @torch.no_grad()
 def evaluate_whole(model, loader, lesions, device):
-    """Per-lesion Dice over a loader (whole-image, resized). Fast; for val selection.
+    """Per-lesion Dice + IoU over a loader (whole-image, resized). Fast; for val selection.
 
     Under DDP the loader is sharded per rank; counts are summed across ranks so
-    every rank computes the same global Dice (and thus agrees on the best epoch).
+    every rank computes the same global metrics (and agrees on the best epoch).
+    Returns (dice_dict, iou_dict).
     """
     model.eval()
     C = len(lesions)
     inter = torch.zeros(C, device=device)
-    denom = torch.zeros(C, device=device)
+    psum = torch.zeros(C, device=device)
+    tsum = torch.zeros(C, device=device)
     for imgs, masks in loader:
         imgs, masks = imgs.to(device), masks.to(device)
         pred = (torch.sigmoid(model(imgs)) > 0.5).float()
-        inter += 2 * (pred * masks).sum(dim=(0, 2, 3))
-        denom += pred.sum(dim=(0, 2, 3)) + masks.sum(dim=(0, 2, 3))
-    all_reduce_sum(inter, denom)
-    return _dice_from_counts(inter, denom, lesions)
+        inter += (pred * masks).sum(dim=(0, 2, 3))
+        psum += pred.sum(dim=(0, 2, 3))
+        tsum += masks.sum(dim=(0, 2, 3))
+    all_reduce_sum(inter, psum, tsum)
+    return dice_iou_from_counts(inter, psum, tsum, lesions)
 
 
 class _NativeFull(torch.utils.data.Dataset):
@@ -176,7 +175,8 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
     model.eval()
     C = len(lesions)
     inter = torch.zeros(C, device=device)
-    denom = torch.zeros(C, device=device)
+    psum = torch.zeros(C, device=device)
+    tsum = torch.zeros(C, device=device)
     mean, std = IMAGENET_MEAN.to(device), IMAGENET_STD.to(device)
     nf = _NativeFull(dataset)
     # Under DDP, shard images across ranks (each GPU tiles a subset) then sum counts.
@@ -192,10 +192,11 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
                              tile_batch=tile_batch, fg_map=fg_map)
         pred = (prob > 0.5).float()
         target = masks_u8.to(device, non_blocking=True).float()
-        inter += 2 * (pred * target).sum(dim=(1, 2))
-        denom += pred.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
-    all_reduce_sum(inter, denom)
-    return _dice_from_counts(inter, denom, lesions)
+        inter += (pred * target).sum(dim=(1, 2))
+        psum += pred.sum(dim=(1, 2))
+        tsum += target.sum(dim=(1, 2))
+    all_reduce_sum(inter, psum, tsum)
+    return dice_iou_from_counts(inter, psum, tsum, lesions)
 
 
 def build(args, num_classes, device):
@@ -205,9 +206,15 @@ def build(args, num_classes, device):
         desc = f"baseline U-Net (base={args.base}) [standard-architecture ref, NOT the GCG control]"
     else:
         from model_seg import build_model
+        gcg_factory = None
+        variant = "off" if args.no_gcg else (args.gcg_variant or "baseline")
+        if not args.no_gcg and args.gcg_variant and args.gcg_variant != "baseline":
+            from gcg_blocks import GCG_VARIANTS
+            gcg_factory = GCG_VARIANTS[args.gcg_variant]
         m = build_model(arch="gcg_unet", num_classes=num_classes,
-                        pretrained=args.pretrained, use_gcg=not args.no_gcg)
-        desc = f"GCG-U-Net (MobileNetV3) {'WITH GCG' if not args.no_gcg else 'NO GCG (control)'}"
+                        pretrained=args.pretrained, use_gcg=not args.no_gcg,
+                        gcg_factory=gcg_factory)
+        desc = f"GCG-U-Net (MobileNetV3) gcg={variant}"
     return m.to(device), desc
 
 
@@ -245,6 +252,9 @@ def main() -> int:
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
     p.add_argument("--base", type=int, default=32)
     p.add_argument("--no-gcg", action="store_true")
+    p.add_argument("--gcg-variant", default="baseline",
+                   choices=["baseline", "attention", "cbam", "se", "none"],
+                   help="Which GCG block to inject (see gcg_blocks.py). 'baseline' = built-in.")
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--run-name", default=None)
@@ -360,6 +370,7 @@ def main() -> int:
             opt.step()
         opt.zero_grad(set_to_none=True)
 
+    csv_log = CSVLogger(os.path.join(args.ckpt_dir, f"{run_name}_metrics.csv")) if is_main else None
     best_val, best_epoch = -1.0, -1
     log(f"\n=== training {args.epochs} epochs (val for selection) ===")
     for epoch in range(1, args.epochs + 1):
@@ -384,7 +395,7 @@ def main() -> int:
             if is_step:
                 optimizer_step()
 
-        val_dice = evaluate_whole(module, val_loader, args.lesions, device)   # counts all-reduced inside
+        val_dice, val_iou = evaluate_whole(module, val_loader, args.lesions, device)  # all-reduced inside
         mean_val = sum(val_dice.values()) / len(val_dice)
         per = "  ".join(f"{k}={v:.3f}" for k, v in val_dice.items())
         flag = ""
@@ -392,11 +403,18 @@ def main() -> int:
             best_val, best_epoch = mean_val, epoch
             if is_main:                             # only rank 0 writes the checkpoint
                 torch.save({"model": module.state_dict(), "epoch": epoch, "val_mean_dice": mean_val,
-                            "val_dice": val_dice, "lesions": args.lesions, "arch": desc,
-                            "args": vars(args)}, ckpt_path)
+                            "val_dice": val_dice, "val_iou": val_iou, "lesions": args.lesions,
+                            "arch": desc, "args": vars(args)}, ckpt_path)
             flag = "  <- best (saved)"
-        log(f"  epoch {epoch:2d}/{args.epochs}  loss={running/max(nb,1):.4f}  "
+        train_loss = running / max(nb, 1)
+        log(f"  epoch {epoch:2d}/{args.epochs}  loss={train_loss:.4f}  "
             f"val[mean={mean_val:.3f}]  {per}{flag}")
+        if csv_log is not None:
+            row = {"epoch": epoch, "train_loss": round(train_loss, 5),
+                   "val_mean_dice": round(mean_val, 5),
+                   "lr": round(opt.param_groups[0]["lr"], 6)}
+            row.update({f"val_dice_{k}": round(v, 5) for k, v in val_dice.items()})
+            csv_log.log(row)
         if sched is not None:
             sched.step()
 
@@ -407,28 +425,36 @@ def main() -> int:
     module.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
     if args.eval_tiled:
         tile = patch or args.image_size
-        test_dice = evaluate_tiled(module, test_ds, args.lesions, device, tile, args.tile_overlap,
-                                   tile_batch=args.tile_batch, num_workers=args.num_workers)
+        test_dice, test_iou = evaluate_tiled(module, test_ds, args.lesions, device, tile, args.tile_overlap,
+                                             tile_batch=args.tile_batch, num_workers=args.num_workers)
     else:
         test_sampler = DistributedSampler(test_ds, shuffle=False) if ddp else None
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, sampler=test_sampler,
                                  num_workers=args.num_workers, worker_init_fn=seed_worker)
-        test_dice = evaluate_whole(module, test_loader, args.lesions, device)
+        test_dice, test_iou = evaluate_whole(module, test_loader, args.lesions, device)
     mean_test = sum(test_dice.values()) / len(test_dice)
+    mean_iou = sum(test_iou.values()) / len(test_iou)
     per = "  ".join(f"{k}={v:.3f}" for k, v in test_dice.items())
-    log(f"\n=== TEST (held-out, best checkpoint) ===\n  mean Dice = {mean_test:.3f}   {per}")
+    per_iou = "  ".join(f"{k}={v:.3f}" for k, v in test_iou.items())
+    log(f"\n=== TEST (held-out, best checkpoint) ===")
+    log(f"  Dice [mean={mean_test:.3f}]   {per}")
+    log(f"  IoU  [mean={mean_iou:.3f}]   {per_iou}")
     log("\nOK: train/val/test separated; focal-tversky loss; best checkpoint scored on test.")
 
+    if csv_log is not None:
+        csv_log.close()
     if is_main and args.results_json:
         import json
         with open(args.results_json, "w") as f:
             json.dump({
                 "arch": args.arch,
                 "use_gcg": (args.arch == "gcg_unet" and not args.no_gcg),
+                "gcg_variant": (args.gcg_variant if args.arch == "gcg_unet" and not args.no_gcg else None),
                 "seed": args.seed, "epochs": args.epochs,
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
                 "test_dice": test_dice, "test_mean": mean_test,
+                "test_iou": test_iou, "test_iou_mean": mean_iou,
                 "best_val": best_val, "best_epoch": best_epoch,
             }, f, indent=2)
         log(f"[info] wrote results -> {args.results_json}")

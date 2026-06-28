@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset import MBRSETDataset       # noqa: E402
 from model import MBRSETClassifier      # noqa: E402
 from fundus_utils import seed_everything, seed_worker  # noqa: E402
+from metrics import quadratic_weighted_kappa, CSVLogger  # noqa: E402
 
 KAGGLE_SLUG = "mohamedabdalkader/retinal-disease-detection"
 COLUMN_MAP = {
@@ -95,8 +96,8 @@ def resolve_data(args):
 def evaluate(model, loader, criterion, device, num_classes):
     model.eval()
     total, correct, loss_sum = 0, 0, 0.0
-    # macro-F1 accumulators
     tp = torch.zeros(num_classes); fp = torch.zeros(num_classes); fn = torch.zeros(num_classes)
+    all_pred, all_true = [], []
     for batch in loader:
         x, y = batch["image"].to(device), batch["label"].to(device)
         logits = model(x)
@@ -104,13 +105,18 @@ def evaluate(model, loader, criterion, device, num_classes):
         pred = logits.argmax(1)
         correct += (pred == y).sum().item()
         total += y.size(0)
+        all_pred.append(pred.cpu()); all_true.append(y.cpu())
         for c in range(num_classes):
             pc, yc = (pred == c), (y == c)
             tp[c] += (pc & yc).sum().item()
             fp[c] += (pc & ~yc).sum().item()
             fn[c] += (~pc & yc).sum().item()
     f1 = (2 * tp / (2 * tp + fp + fn).clamp(min=1)).mean().item()
-    return loss_sum / max(total, 1), correct / max(total, 1), f1
+    preds = torch.cat(all_pred).numpy() if all_pred else []
+    trues = torch.cat(all_true).numpy() if all_true else []
+    # Quadratic-weighted kappa: the clinical standard for ordinal DR grading.
+    kappa = quadratic_weighted_kappa(preds, trues, num_classes) if len(preds) else 0.0
+    return loss_sum / max(total, 1), correct / max(total, 1), f1, kappa
 
 
 def main() -> int:
@@ -141,6 +147,7 @@ def main() -> int:
     device = pick_device()
     os.makedirs(args.weights_dir, exist_ok=True)
     logger = setup_logger(args.log_file)
+    csv_log = CSVLogger(os.path.join(os.path.dirname(args.log_file), "train_metrics.csv"))
     best_path = os.path.join(args.weights_dir, "best_model.pt")
     last_path = os.path.join(args.weights_dir, "last.pt")
 
@@ -205,13 +212,13 @@ def main() -> int:
         if args.max_val_batches:
             from itertools import islice
             vloader = list(islice(val_loader, args.max_val_batches))
-        val_loss, val_acc, val_f1 = evaluate(model, vloader, criterion, device, num_classes)
+        val_loss, val_acc, val_f1, val_kappa = evaluate(model, vloader, criterion, device, num_classes)
 
         # checkpoint: best by val accuracy
         is_best = val_acc > best_val_acc
         ckpt = {"model": model.state_dict(), "epoch": epoch, "val_acc": val_acc,
-                "val_loss": val_loss, "val_f1": val_f1, "task": args.task,
-                "num_classes": num_classes, "args": vars(args)}
+                "val_loss": val_loss, "val_f1": val_f1, "val_kappa": val_kappa,
+                "task": args.task, "num_classes": num_classes, "args": vars(args)}
         torch.save(ckpt, last_path)
         tag = ""
         if is_best:
@@ -221,9 +228,14 @@ def main() -> int:
 
         logger.info(f"epoch={epoch:03d}/{args.epochs}  "
                     f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}  "
-                    f"best_val_acc={best_val_acc:.4f}{tag}")
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} "
+                    f"val_kappa={val_kappa:.4f}  best_val_acc={best_val_acc:.4f}{tag}")
+        csv_log.log({"epoch": epoch, "train_loss": round(train_loss, 5), "train_acc": round(train_acc, 5),
+                     "val_loss": round(val_loss, 5), "val_acc": round(val_acc, 5),
+                     "val_f1": round(val_f1, 5), "val_kappa": round(val_kappa, 5),
+                     "best_val_acc": round(best_val_acc, 5)})
 
+    csv_log.close()
     logger.info(f"done: best_val_acc={best_val_acc:.4f}  best weights at {best_path}")
     return 0
 
