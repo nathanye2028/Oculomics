@@ -236,23 +236,32 @@ class GCGUNet(nn.Module):
             for i in range(4)
         ])
 
-        # Final upsample to input resolution + classifier.
-        self.final = nn.Sequential(
-            _ConvBNAct(dec[3], dec[4]),
-            nn.Conv2d(dec[4], num_classes, kernel_size=1),
+        # Full-resolution path. The MobileNetV3 encoder's shallowest tap is at
+        # stride 2 (H/2), so without this the decoder's finest learned features
+        # are half-res and the head just bilinearly upsamples them -> tiny lesions
+        # (microaneurysms, ~1-2 px) are unrecoverable. The stem is a stride-1
+        # feature of the input; the final decoder stage upsamples to full res and
+        # fuses it (gated like the others) so the head runs at full resolution.
+        stem_ch = dec[4]
+        self.stem = nn.Sequential(
+            _ConvBNAct(in_channels, stem_ch),
+            _ConvBNAct(stem_ch, stem_ch),
         )
+        self.up_full = DecoderBlock(dec[3], stem_ch, dec[4], gcg_factory=factory)
+        self.head = nn.Conv2d(dec[4], num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_hw = x.shape[-2:]
+        stem = self.stem(x)                       # full-resolution features [B, dec4, H, W]
         s2, s4, s8, s16, s32 = self.encoder(x)
         d = s32
         d = self.decoders[0](d, s16)
         d = self.decoders[1](d, s8)
         d = self.decoders[2](d, s4)
-        d = self.decoders[3](d, s2)
-        logits = self.final(d)
-        # Encoder stride-2 stem means s2 is at H/2; upsample logits to full input res.
-        if logits.shape[-2:] != input_hw:
+        d = self.decoders[3](d, s2)               # H/2
+        d = self.up_full(d, stem)                 # -> full res, learned conv at H x W
+        logits = self.head(d)
+        if logits.shape[-2:] != input_hw:         # safety for odd input sizes
             logits = F.interpolate(logits, size=input_hw, mode="bilinear", align_corners=False)
         return logits
 
