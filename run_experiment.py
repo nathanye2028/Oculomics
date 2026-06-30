@@ -70,6 +70,8 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--amp"]
     if args.warmup_epochs > 0:
         cmd += ["--warmup-epochs", str(args.warmup_epochs)]
+    if args.pretrained:
+        cmd += ["--pretrained"]
     return cmd
 
 
@@ -101,6 +103,8 @@ def main() -> int:
     p.add_argument("--gcg-variant", default="baseline",
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="GCG block for the 'gcg' condition (vs the --no-gcg control).")
+    p.add_argument("--pretrained", action="store_true",
+                   help="ImageNet-pretrained encoder (strongly recommended: only 54 train images).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--out-dir", default="experiments")
