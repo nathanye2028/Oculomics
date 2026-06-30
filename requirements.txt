@@ -16,5 +16,9 @@ importlib_metadata
 # Test suite.
 pytest>=7.0
 
+# Phase 3 — edge optimization (ONNX export + INT8 quantization, edge_optimize.py).
+onnx
+onnxruntime
+
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
 # tensorboard
