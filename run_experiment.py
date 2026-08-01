@@ -74,6 +74,8 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--pretrained"]
     if args.init_encoder:
         cmd += ["--init-encoder", args.init_encoder]
+    if args.init_weights:
+        cmd += ["--init-weights", args.init_weights]
     if args.datasets:
         cmd += ["--datasets", *args.datasets]
     return cmd
@@ -135,6 +137,8 @@ def main() -> int:
                    help="ImageNet-pretrained encoder (strongly recommended: only 54 train images).")
     p.add_argument("--init-encoder", default=None,
                    help="In-domain pretrained encoder weights (from pretrain_encoder.py).")
+    p.add_argument("--init-weights", default=None,
+                   help="Full-network vessel-pretrained weights (from pretrain_vessel.py).")
     p.add_argument("--datasets", nargs="+", default=["idrid"], choices=["idrid", "eophtha"],
                    help="Training sources (val/test stay IDRiD for comparability).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])

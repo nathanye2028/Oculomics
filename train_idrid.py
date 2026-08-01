@@ -247,6 +247,14 @@ def build(args, num_classes, device):
             ck = torch.load(args.init_encoder, map_location="cpu")
             m.encoder.load_state_dict(ck["encoder"] if "encoder" in ck else ck)
             desc += f" [encoder<-{os.path.basename(args.init_encoder)}]"
+        # Full-network transfer (e.g. vessel-pretrained GCG-U-Net): loads encoder,
+        # decoder, skips and GCG blocks; only the output head (1 vs C channels)
+        # is shape-incompatible and stays randomly initialised.
+        if getattr(args, "init_weights", None):
+            from pretrain_vessel import load_compatible
+            ck = torch.load(args.init_weights, map_location="cpu")
+            n_ok, _ = load_compatible(m, ck.get("model", ck))
+            desc += f" [weights<-{os.path.basename(args.init_weights)}:{n_ok}]"
     return m.to(device), desc
 
 
@@ -293,7 +301,9 @@ def main() -> int:
                    help="Which GCG block to inject (see gcg_blocks.py). 'baseline' = built-in.")
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--init-encoder", default=None,
-                   help="Encoder weights from pretrain_rfmid.py (in-domain init).")
+                   help="Encoder-only weights from pretrain_encoder.py (DDR/RFMiD).")
+    p.add_argument("--init-weights", default=None,
+                   help="FULL-network weights from pretrain_vessel.py (encoder+decoder+GCG).")
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--run-name", default=None)
     p.add_argument("--results-json", default=None,
