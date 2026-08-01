@@ -98,7 +98,9 @@ def main() -> int:
     p.add_argument("--root", default=None)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patches.")
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--patience", type=int, default=8,
+                   help="Early stop after N epochs with no test-Dice gain (0 = off).")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=4)
@@ -141,8 +143,9 @@ def main() -> int:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs))
     csv_log = CSVLogger(os.path.splitext(args.out)[0] + "_metrics.csv")
 
-    best = -1.0
-    print(f"\n=== pretraining {args.epochs} epochs (test Dice selects best) ===")
+    best, since_best = -1.0, 0
+    print(f"\n=== pretraining up to {args.epochs} epochs "
+          f"(test Dice selects best; patience={args.patience or 'off'}) ===")
     for epoch in range(1, args.epochs + 1):
         model.train()
         run, nb = 0.0, 0
@@ -157,15 +160,20 @@ def main() -> int:
         dice = evaluate(model, test_loader, device)
         tag = ""
         if dice > best:
-            best = dice
+            best, since_best = dice, 0
             torch.save({"model": model.state_dict(), "epoch": epoch,
                         "vessel_dice": dice, "args": vars(args)}, args.out)
             tag = "  <- best (saved)"
+        else:
+            since_best += 1
         print(f"  epoch {epoch:3d}/{args.epochs}  loss={run/max(nb,1):.4f}  "
               f"vessel_Dice={dice:.4f}{tag}")
         csv_log.log({"epoch": epoch, "train_loss": round(run/max(nb,1), 5),
                      "vessel_dice": round(dice, 5)})
         sched.step()
+        if args.patience and since_best >= args.patience:
+            print(f"  early stop: no gain for {args.patience} epochs (best {best:.4f})")
+            break
     csv_log.close()
 
     print(f"\nbest vessel Dice {best:.4f}  ->  {args.out}")

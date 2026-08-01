@@ -59,6 +59,7 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         "--run-name", run_name,
         "--results-json", results_json,
         "--gcg-variant", args.gcg_variant,
+        "--patience", str(args.patience),
     ]
     if args.patch_size > 0:
         cmd += ["--patch-size", str(args.patch_size)]
@@ -121,7 +122,9 @@ def paired_stats(gcg_by_seed: dict, ctrl_by_seed: dict):
 def main() -> int:
     p = argparse.ArgumentParser(description="GCG vs control benchmark on IDRiD.")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--epochs", type=int, default=120)
+    p.add_argument("--patience", type=int, default=30,
+                   help="Early-stop patience passed to each run (0 = off).")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=0)
     p.add_argument("--eval-tiled", action="store_true")

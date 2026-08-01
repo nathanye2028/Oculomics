@@ -285,7 +285,10 @@ def main() -> int:
                    help="Gradient accumulation: effective batch = batch-size * accum-steps.")
     p.add_argument("--amp", action="store_true",
                    help="Mixed precision (fp16) -> less memory, faster matmuls.")
-    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--epochs", type=int, default=120,
+                   help="Max epochs (cosine schedule spans this; shorter = faster anneal).")
+    p.add_argument("--patience", type=int, default=30,
+                   help="Early stop after N epochs with no val improvement (0 = off).")
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine"])
     p.add_argument("--warmup-epochs", type=int, default=0)
@@ -440,8 +443,9 @@ def main() -> int:
         opt.zero_grad(set_to_none=True)
 
     csv_log = CSVLogger(os.path.join(args.ckpt_dir, f"{run_name}_metrics.csv")) if is_main else None
-    best_val, best_epoch = -1.0, -1
-    log(f"\n=== training {args.epochs} epochs (val for selection) ===")
+    best_val, best_epoch, since_best = -1.0, -1, 0
+    log(f"\n=== training up to {args.epochs} epochs "
+        f"(val selects best; early stop patience={args.patience or 'off'}) ===")
     for epoch in range(1, args.epochs + 1):
         if ddp:
             train_sampler.set_epoch(epoch)          # reshuffle shards each epoch
@@ -469,12 +473,14 @@ def main() -> int:
         per = "  ".join(f"{k}={v:.3f}" for k, v in val_dice.items())
         flag = ""
         if mean_val > best_val:                     # identical on all ranks (reduced metric)
-            best_val, best_epoch = mean_val, epoch
+            best_val, best_epoch, since_best = mean_val, epoch, 0
             if is_main:                             # only rank 0 writes the checkpoint
                 torch.save({"model": module.state_dict(), "epoch": epoch, "val_mean_dice": mean_val,
                             "val_dice": val_dice, "val_iou": val_iou, "lesions": args.lesions,
                             "arch": desc, "args": vars(args)}, ckpt_path)
             flag = "  <- best (saved)"
+        else:
+            since_best += 1
         train_loss = running / max(nb, 1)
         log(f"  epoch {epoch:2d}/{args.epochs}  loss={train_loss:.4f}  "
             f"val[mean={mean_val:.3f}]  {per}{flag}")
@@ -486,6 +492,10 @@ def main() -> int:
             csv_log.log(row)
         if sched is not None:
             sched.step()
+        if args.patience and since_best >= args.patience:
+            log(f"  early stop: no val improvement for {args.patience} epochs "
+                f"(best {best_val:.3f} @ epoch {best_epoch})")
+            break
 
     # ---- final honest eval: best checkpoint on held-out TEST ----
     if ddp:
