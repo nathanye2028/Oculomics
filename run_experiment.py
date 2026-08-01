@@ -74,6 +74,8 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--pretrained"]
     if args.init_encoder:
         cmd += ["--init-encoder", args.init_encoder]
+    if args.datasets:
+        cmd += ["--datasets", *args.datasets]
     return cmd
 
 
@@ -132,7 +134,9 @@ def main() -> int:
     p.add_argument("--pretrained", action="store_true",
                    help="ImageNet-pretrained encoder (strongly recommended: only 54 train images).")
     p.add_argument("--init-encoder", default=None,
-                   help="RFMiD-pretrained encoder weights (from pretrain_rfmid.py).")
+                   help="In-domain pretrained encoder weights (from pretrain_encoder.py).")
+    p.add_argument("--datasets", nargs="+", default=["idrid"], choices=["idrid", "eophtha"],
+                   help="Training sources (val/test stay IDRiD for comparability).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--out-dir", default="experiments")

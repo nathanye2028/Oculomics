@@ -103,12 +103,22 @@ def pick_device(local_rank: int, ddp: bool) -> torch.device:
 
 
 def make_loss(name: str):
+    """Return loss(logits, target, valid=None).
+
+    ``valid`` [B,C] marks which lesion channels are annotated for each sample,
+    so partially-annotated sources (e-ophtha labels EX only) don't have their
+    unlabelled channels scored as all-negative.
+    """
     if name == "focal_tversky":
-        return lambda lg, t: focal_tversky_loss(lg, t, alpha=0.7, beta=0.3, gamma=0.75)
+        return lambda lg, t, valid=None: focal_tversky_loss(
+            lg, t, alpha=0.7, beta=0.3, gamma=0.75, valid=valid)
     if name == "tversky":
-        return lambda lg, t: tversky_loss(lg, t, alpha=0.7, beta=0.3)
+        return lambda lg, t, valid=None: tversky_loss(lg, t, alpha=0.7, beta=0.3, valid=valid)
     if name == "dice_bce":
-        def _dice_bce(lg, t):
+        def _dice_bce(lg, t, valid=None):
+            if valid is not None:                 # zero-out unannotated channels
+                w = valid.to(lg.dtype)[:, :, None, None]
+                lg, t = lg * w, t * w
             bce = F.binary_cross_entropy_with_logits(lg, t)
             p = torch.sigmoid(lg); dims = (0, 2, 3)
             num = 2 * (p * t).sum(dims) + 1.0
@@ -116,6 +126,21 @@ def make_loss(name: str):
             return bce + (1.0 - num / den).mean()
         return _dice_bce
     raise ValueError(f"unknown loss {name!r}")
+
+
+class _WithValid(torch.utils.data.Dataset):
+    """Adapt a 2-tuple (img, mask) dataset to the 3-tuple (img, mask, valid) API."""
+
+    def __init__(self, ds, num_classes: int):
+        self.ds = ds
+        self.valid = torch.ones(num_classes)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        x, m = self.ds[i]
+        return x, m, self.valid.clone()
 
 
 @torch.no_grad()
@@ -234,6 +259,10 @@ def default_run_name(args) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description="IDRiD lesion-segmentation trainer / benchmark.")
     p.add_argument("--root", default=None)
+    p.add_argument("--datasets", nargs="+", default=["idrid"], choices=["idrid", "eophtha"],
+                   help="Training sources. IDRiD is always the val/test set; "
+                        "'eophtha' adds 47 EX-only-annotated images to TRAIN.")
+    p.add_argument("--eophtha-root", default=None)
     p.add_argument("--lesions", nargs="+", default=list(DEFAULT_LESIONS))
     p.add_argument("--image-size", type=int, default=512, help="Whole-image (resize) size.")
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
@@ -318,12 +347,33 @@ def main() -> int:
     val_idx, train_idx = perm[:n_val].tolist(), perm[n_val:].tolist()
     train_ds = Subset(train_full, train_idx)
     val_ds = Subset(val_full, val_idx)
-
     C = train_full.num_classes
+
+    # Extra training sources. Val/test stay IDRiD-only on purpose: the held-out
+    # metric must remain comparable across runs (and e-ophtha has no official
+    # split). Training always yields (img, mask, valid).
+    train_ds = _WithValid(train_ds, C)
+    extra_counts = {}
+    if "eophtha" in args.datasets:
+        from multi_seg_dataset import MultiLesionSegDataset
+        eo_root = args.eophtha_root
+        if eo_root is None:
+            import kagglehub
+            from multi_seg_dataset import EOPHTHA_SLUG
+            eo_root = kagglehub.dataset_download(EOPHTHA_SLUG)
+        eo = MultiLesionSegDataset(idrid_root=None, eophtha_root=eo_root, split="train",
+                                   image_size=args.image_size, lesions=args.lesions,
+                                   patch_size=patch, fg_bias=args.fg_bias,
+                                   augment=True, seed=args.seed)
+        if len(eo):
+            train_ds = torch.utils.data.ConcatDataset([train_ds, eo])
+            extra_counts["eophtha(EX-only)"] = len(eo)
     log(f"[info] dist   : {'DDP world='+str(world)+' backend='+dist.get_backend() if ddp else 'single-process'}")
     log(f"[info] device : {device}")
     log(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
-    log(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
+    log(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
+        + (f"   (+{extra_counts})" if extra_counts else "")
+        + "   [val/test = IDRiD only]")
     log(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
         f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
     log(f"[info] ckpt   : {ckpt_path}")
@@ -389,15 +439,15 @@ def main() -> int:
         running, nb = 0.0, 0
         steps = len(train_loader)
         opt.zero_grad(set_to_none=True)
-        for i, (imgs, masks) in enumerate(train_loader):
-            imgs, masks = imgs.to(device), masks.to(device)
+        for i, (imgs, masks, valid) in enumerate(train_loader):
+            imgs, masks, valid = imgs.to(device), masks.to(device), valid.to(device)
             is_step = ((i + 1) % accum == 0) or (i + 1 == steps)
             # During accumulation, skip DDP's gradient all-reduce except on the
             # step that actually updates -> avoids redundant cross-GPU traffic.
             sync_ctx = model.no_sync() if (ddp and not is_step) else nullcontext()
             with sync_ctx:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_on):
-                    loss = loss_fn(model(imgs), masks) / accum
+                    loss = loss_fn(model(imgs), masks, valid) / accum
                 scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
             nb += 1
             running += loss.item() * accum

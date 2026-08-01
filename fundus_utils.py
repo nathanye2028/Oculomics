@@ -89,27 +89,53 @@ def circular_fov_mask(h: int, w: int) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Imbalance-aware segmentation losses
 # --------------------------------------------------------------------------- #
-def tversky_loss(logits, target, alpha=0.7, beta=0.3, smooth=1.0):
+def _tversky_index(logits, target, alpha, beta, smooth, valid=None):
+    """Per-channel Tversky index, optionally masking unannotated channels.
+
+    ``valid`` is [B, C] with 1 = this lesion is annotated for that sample.
+    Samples whose channel is unannotated contribute nothing (their pixels are
+    excluded from tp/fp/fn), so "not labelled" is never treated as "negative".
+    Returns (index[C], channel_has_data[C]).
+    """
+    probs = torch.sigmoid(logits)
+    if valid is not None:
+        w = valid.to(probs.dtype)[:, :, None, None]      # [B,C,1,1]
+        probs = probs * w
+        target = target * w
+        has = valid.sum(0) > 0                            # [C]
+    else:
+        has = torch.ones(logits.shape[1], dtype=torch.bool, device=logits.device)
+    dims = (0, 2, 3)
+    tp = (probs * target).sum(dims)
+    fp = (probs * (1 - target)).sum(dims)
+    fn = ((1 - probs) * target).sum(dims)
+    return (tp + smooth) / (tp + alpha * fn + beta * fp + smooth), has
+
+
+def _masked_mean(per_channel, has):
+    """Mean over channels that actually had annotated data this batch."""
+    if has.all():
+        return per_channel.mean()
+    hasf = has.to(per_channel.dtype)
+    return (per_channel * hasf).sum() / hasf.sum().clamp(min=1.0)
+
+
+def tversky_loss(logits, target, alpha=0.7, beta=0.3, smooth=1.0, valid=None):
     """Tversky loss. alpha weights false negatives (>beta -> recall-favouring,
-    good for tiny lesions). Per-channel, averaged."""
-    probs = torch.sigmoid(logits)
-    dims = (0, 2, 3)
-    tp = (probs * target).sum(dims)
-    fp = (probs * (1 - target)).sum(dims)
-    fn = ((1 - probs) * target).sum(dims)
-    t = (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
-    return (1.0 - t).mean()
+    good for tiny lesions). Per-channel, averaged over annotated channels."""
+    t, has = _tversky_index(logits, target, alpha, beta, smooth, valid)
+    return _masked_mean(1.0 - t, has)
 
 
-def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75, smooth=1.0):
-    """Focal Tversky: focuses learning on hard/rare structures (gamma<1)."""
-    probs = torch.sigmoid(logits)
-    dims = (0, 2, 3)
-    tp = (probs * target).sum(dims)
-    fp = (probs * (1 - target)).sum(dims)
-    fn = ((1 - probs) * target).sum(dims)
-    t = (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
-    return ((1.0 - t).clamp(min=1e-6) ** gamma).mean()
+def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75, smooth=1.0, valid=None):
+    """Focal Tversky: focuses learning on hard/rare structures (gamma<1).
+
+    ``valid`` [B, C] lets datasets with partial lesion annotation (e.g. e-ophtha
+    labels exudates only) contribute without their unlabelled channels being
+    scored as all-negative.
+    """
+    t, has = _tversky_index(logits, target, alpha, beta, smooth, valid)
+    return _masked_mean((1.0 - t).clamp(min=1e-6) ** gamma, has)
 
 
 # --------------------------------------------------------------------------- #
