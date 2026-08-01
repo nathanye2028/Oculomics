@@ -215,6 +215,13 @@ def build(args, num_classes, device):
                         pretrained=args.pretrained, use_gcg=not args.no_gcg,
                         gcg_factory=gcg_factory)
         desc = f"GCG-U-Net (MobileNetV3) gcg={variant}"
+        # In-domain init: overwrite the ImageNet encoder with one pretrained on
+        # RFMiD fundus images (see pretrain_rfmid.py). Fundus features transfer
+        # better than natural-image features to a 54-image segmentation task.
+        if getattr(args, "init_encoder", None):
+            ck = torch.load(args.init_encoder, map_location="cpu")
+            m.encoder.load_state_dict(ck["encoder"] if "encoder" in ck else ck)
+            desc += f" [encoder<-{os.path.basename(args.init_encoder)}]"
     return m.to(device), desc
 
 
@@ -256,6 +263,8 @@ def main() -> int:
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="Which GCG block to inject (see gcg_blocks.py). 'baseline' = built-in.")
     p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--init-encoder", default=None,
+                   help="Encoder weights from pretrain_rfmid.py (in-domain init).")
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--run-name", default=None)
     p.add_argument("--results-json", default=None,

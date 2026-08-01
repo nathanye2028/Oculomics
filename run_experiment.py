@@ -72,6 +72,8 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--warmup-epochs", str(args.warmup_epochs)]
     if args.pretrained:
         cmd += ["--pretrained"]
+    if args.init_encoder:
+        cmd += ["--init-encoder", args.init_encoder]
     return cmd
 
 
@@ -129,6 +131,8 @@ def main() -> int:
                    help="GCG block for the 'gcg' condition (vs the --no-gcg control).")
     p.add_argument("--pretrained", action="store_true",
                    help="ImageNet-pretrained encoder (strongly recommended: only 54 train images).")
+    p.add_argument("--init-encoder", default=None,
+                   help="RFMiD-pretrained encoder weights (from pretrain_rfmid.py).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--out-dir", default="experiments")
