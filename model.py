@@ -38,6 +38,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MBRSETClassifier(nn.Module):
@@ -66,6 +67,8 @@ class MBRSETClassifier(nn.Module):
         dropout: float = 0.2,
         head_hidden: int = 256,
         freeze_backbone: bool = False,
+        use_gcg: bool = False,
+        gcg_variant: str = "baseline",
     ) -> None:
         super().__init__()
         from torchvision.models import mobilenet_v3_small
@@ -88,6 +91,36 @@ class MBRSETClassifier(nn.Module):
         self.pool = backbone.avgpool               # -> [B, 576, 1, 1]
         feat_dim = backbone.classifier[0].in_features  # 576 for v3-small
 
+        # ---- Guided Context Gating for classification -------------------- #
+        # A classifier has no decoder, so the faithful analogue of gating a
+        # decoder skip is: let the DEEP semantic feature (stride 32, 576ch)
+        # guide which channels of a MID-level spatial feature (stride 16, 40ch)
+        # survive. Both are then pooled and concatenated for the head, so the
+        # gate decides how much fine spatial evidence reaches the classifier.
+        self.use_gcg = use_gcg
+        # Probe the backbone once to find the LAST block at stride 16 and its
+        # channel count (varies across torchvision versions -> never hardcode).
+        with torch.no_grad():
+            probe = torch.zeros(1, in_channels, 224, 224)
+            sizes = []
+            for i, blk in enumerate(self.features):
+                probe = blk(probe)
+                sizes.append((i, probe.shape[1], probe.shape[-1]))
+            final_hw = sizes[-1][2]
+            mids = [(i, c) for i, c, hw in sizes if hw == final_hw * 2]
+            self._mid_idx, mid_ch = mids[-1] if mids else (len(sizes) - 2, sizes[-2][1])
+        self.gcg = None
+        if use_gcg:
+            if gcg_variant and gcg_variant != "baseline":
+                from gcg_blocks import GCG_VARIANTS
+                self.gcg = GCG_VARIANTS[gcg_variant](mid_ch, feat_dim)
+            else:
+                from model_seg import GuidedContextGating
+                self.gcg = GuidedContextGating(mid_ch, feat_dim)
+        # The mid feature is concatenated whether or not it is gated, so the
+        # control differs from GCG ONLY by the gating block (apples-to-apples).
+        head_in = feat_dim + mid_ch
+
         self.regression = regression
         self.multilabel = multilabel
         if regression:
@@ -102,7 +135,7 @@ class MBRSETClassifier(nn.Module):
         self.head = nn.Sequential(
             nn.Flatten(1),
             nn.Dropout(p=dropout),
-            nn.Linear(feat_dim, head_hidden),
+            nn.Linear(head_in, head_hidden),
             nn.Hardswish(inplace=True),
             nn.Dropout(p=dropout),
             nn.Linear(head_hidden, out_dim),
@@ -113,9 +146,17 @@ class MBRSETClassifier(nn.Module):
                 p.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.pool(x)
-        logits = self.head(x)
+        mid = None
+        for i, blk in enumerate(self.features):
+            x = blk(x)
+            if i == self._mid_idx:
+                mid = x                                   # stride-16 spatial feature
+        deep = x                                          # stride-32 semantic feature
+        if self.gcg is not None:
+            mid = self.gcg(mid, deep)                     # deep context gates mid
+        pooled = torch.cat([self.pool(deep).flatten(1),
+                            F.adaptive_avg_pool2d(mid, 1).flatten(1)], dim=1)
+        logits = self.head(pooled)
         if self.regression:
             return logits.squeeze(-1)     # [B]
         return logits                     # [B, num_classes]
