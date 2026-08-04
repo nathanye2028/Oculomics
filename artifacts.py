@@ -89,12 +89,18 @@ def _fov_mask_for(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return cropped, circular_fov_mask(h, w)
 
 
-def assess_quality(rgb: np.ndarray, min_focus: float = 8.0,
-                   max_glare: float = 0.02) -> Dict[str, object]:
+def assess_quality(rgb: np.ndarray, min_focus: float = 13.16,
+                   max_glare: float = 0.0263) -> Dict[str, object]:
     """Per-image quality report + gradable decision.
 
-    Thresholds (`min_focus`, `max_glare`) are defaults; calibrate on mBRSET
-    quality labels for the final system.
+    Defaults are **calibrated** (Youden's J) against expert ``final_quality``
+    labels on 5,164 mBRSET images via :mod:`validate_artifacts`, replacing the
+    original hand-picked guesses.
+
+    Measured discrimination on that set is modest (AUROC 0.62 focus, 0.60
+    composite, 0.49 glare), i.e. these heuristics only weakly predict expert
+    gradability -- see the learned quality gate (``train_mbrset.py --task
+    quality``) for the stronger alternative.
     """
     cropped, fov = _fov_mask_for(rgb)
     focus = focus_score(cropped, fov)

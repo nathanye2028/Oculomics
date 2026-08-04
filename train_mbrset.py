@@ -90,7 +90,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="mBRSET clinical-label classification.")
     p.add_argument("--root", required=True, help="mBRSET 1.0 dir (images/ + labels_mbrset.csv).")
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema"])
+                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
+                            "quality", "artifacts"])
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)

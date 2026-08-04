@@ -34,7 +34,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="GCG vs control on mBRSET classification.")
     p.add_argument("--root", required=True)
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema"])
+                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
+                            "quality", "artifacts"])
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
