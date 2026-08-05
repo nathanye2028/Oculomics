@@ -294,6 +294,8 @@ def main() -> int:
     p.add_argument("--warmup-epochs", type=int, default=0)
     p.add_argument("--loss", default="focal_tversky", choices=["focal_tversky", "tversky", "dice_bce"])
     p.add_argument("--val-frac", type=float, default=0.2)
+    p.add_argument("--nondeterministic", action="store_true",
+                   help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
@@ -326,7 +328,7 @@ def main() -> int:
         if is_main:
             print(*a, **k)
 
-    seed_everything(args.seed)             # same on every rank -> identical init & data split
+    seed_everything(args.seed, deterministic=not args.nondeterministic)             # same on every rank -> identical init & data split
     device = pick_device(local_rank, ddp)
     run_name = args.run_name or default_run_name(args)
     os.makedirs(args.ckpt_dir, exist_ok=True)

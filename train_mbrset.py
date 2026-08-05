@@ -98,6 +98,8 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--nondeterministic", action="store_true",
+                   help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-gcg", action="store_true")
@@ -108,7 +110,7 @@ def main() -> int:
     p.add_argument("--results-json", default=None)
     args = p.parse_args()
 
-    seed_everything(args.seed)
+    seed_everything(args.seed, deterministic=not args.nondeterministic)
     device = pick_device()
     run_name = args.run_name or f"{'nogcg' if args.no_gcg else 'gcg'}_seed{args.seed}"
     os.makedirs(args.ckpt_dir, exist_ok=True)

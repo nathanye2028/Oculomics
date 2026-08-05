@@ -104,6 +104,8 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--nondeterministic", action="store_true",
+                   help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-gcg", action="store_true")
     p.add_argument("--no-imagenet", action="store_true")
@@ -111,7 +113,7 @@ def main() -> int:
     p.add_argument("--out", default="weights/vessel_unet.pt")
     args = p.parse_args()
 
-    seed_everything(args.seed)
+    seed_everything(args.seed, deterministic=not args.nondeterministic)
     device = pick_device()
     root = args.root or download_vessels()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

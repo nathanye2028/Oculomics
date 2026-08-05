@@ -29,13 +29,34 @@ import torch.nn.functional as F
 # --------------------------------------------------------------------------- #
 # Reproducibility
 # --------------------------------------------------------------------------- #
-def seed_everything(seed: int = 42) -> None:
+def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
+    """Seed every RNG, and (by default) force deterministic GPU kernels.
+
+    ``deterministic`` matters more than it looks. Seeding Python/NumPy/PyTorch
+    is NOT sufficient on CUDA: cuDNN autotunes and picks non-deterministic
+    convolution algorithms, so two runs with the SAME seed diverge. We hit this
+    for real — IDRiD runs with identical seeds produced test Dice 0.449 vs
+    0.328 across two experiments, which made "paired by seed" meaningless and
+    turned a 3-seed +0.084 into an 8-seed -0.010.
+
+    Costs roughly 10-20% throughput; worth it for results you can defend.
+    """
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        # cuDNN: fixed algorithm choice, no autotuning.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Required for deterministic cuBLAS reductions (must precede CUDA init).
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        try:    # warn_only: a few ops have no deterministic kernel; don't crash.
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            pass
 
 
 def seed_worker(worker_id: int) -> None:
