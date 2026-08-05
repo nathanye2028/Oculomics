@@ -267,10 +267,13 @@ def default_run_name(args) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description="IDRiD lesion-segmentation trainer / benchmark.")
     p.add_argument("--root", default=None)
-    p.add_argument("--datasets", nargs="+", default=["idrid"], choices=["idrid", "eophtha"],
-                   help="Training sources. IDRiD is always the val/test set; "
-                        "'eophtha' adds 47 EX-only-annotated images to TRAIN.")
+    p.add_argument("--datasets", nargs="+", default=["idrid"],
+                   choices=["idrid", "eophtha", "retlesion"],
+                   help="Training sources. IDRiD is always the val/test set. "
+                        "'eophtha' adds 47 EX-only images; 'retlesion' adds ~1.4k "
+                        "MA + ~0.5k cotton-wool-spot annotated images.")
     p.add_argument("--eophtha-root", default=None)
+    p.add_argument("--retlesion-root", default=None)
     p.add_argument("--lesions", nargs="+", default=list(DEFAULT_LESIONS))
     p.add_argument("--image-size", type=int, default=512, help="Whole-image (resize) size.")
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
@@ -383,6 +386,16 @@ def main() -> int:
         if len(eo):
             train_ds = torch.utils.data.ConcatDataset([train_ds, eo])
             extra_counts["eophtha(EX-only)"] = len(eo)
+    if "retlesion" in args.datasets:
+        from retlesion_dataset import RetLesionDataset, download_retlesion
+        rl_root = args.retlesion_root or download_retlesion()
+        rl = RetLesionDataset(rl_root, lesions=args.lesions,
+                              patch_size=patch or args.image_size,
+                              scale_match=True, drop_empty=True,
+                              fg_bias=args.fg_bias, augment=True, seed=args.seed)
+        if len(rl):
+            train_ds = torch.utils.data.ConcatDataset([train_ds, rl])
+            extra_counts[f"retlesion{rl.counts()}"] = len(rl)
     log(f"[info] dist   : {'DDP world='+str(world)+' backend='+dist.get_backend() if ddp else 'single-process'}")
     log(f"[info] device : {device}")
     log(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
