@@ -184,8 +184,22 @@ class IDRiDSegDataset(Dataset):
                 for c in range(masks.shape[0])
             ], axis=0)
 
-        if self.augment and bool(rng.integers(0, 2)):
-            img_np = img_np[:, ::-1, :].copy()
-            masks = masks[:, :, ::-1].copy()
+        if self.augment:
+            # Previously a single horizontal flip -- far too weak for 43 training
+            # images. Dihedral (flips + 90-deg rotations) is label-preserving for
+            # lesion masks and gives 8x the effective data; brightness/contrast
+            # jitter mimics the illumination variation of mobile capture.
+            if bool(rng.integers(0, 2)):
+                img_np = img_np[:, ::-1, :].copy(); masks = masks[:, :, ::-1].copy()
+            if bool(rng.integers(0, 2)):
+                img_np = img_np[::-1, :, :].copy(); masks = masks[:, ::-1, :].copy()
+            k = int(rng.integers(0, 4))
+            if k:
+                img_np = np.rot90(img_np, k, axes=(0, 1)).copy()
+                masks = np.rot90(masks, k, axes=(1, 2)).copy()
+            if bool(rng.integers(0, 2)):
+                a = float(rng.uniform(0.85, 1.15))     # contrast
+                b = float(rng.uniform(-18, 18))        # brightness
+                img_np = np.clip(img_np.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
 
         return self._to_tensors(img_np, masks)

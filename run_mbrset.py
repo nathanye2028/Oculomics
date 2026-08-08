@@ -44,6 +44,7 @@ def main() -> int:
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--gcg-variant", default="baseline")
+    p.add_argument("--nondeterministic", action="store_true")
     p.add_argument("--out-dir", default="exp_mbrset")
     p.add_argument("--ckpt-dir", default="ck_mbrset")
     args = p.parse_args()
@@ -64,6 +65,7 @@ def main() -> int:
                    "--patience", str(args.patience), "--batch-size", str(args.batch_size),
                    "--lr", str(args.lr), "--image-size", str(args.image_size),
                    "--num-workers", str(args.num_workers), "--gcg-variant", args.gcg_variant,
+                   *(["--nondeterministic"] if args.nondeterministic else []),
                    "--ckpt-dir", args.ckpt_dir, "--run-name", run_name,
                    "--results-json", rj] + flags
             print(f"\n[{i}/{total}] === {run_name} ===\n  {' '.join(cmd)}", flush=True)
