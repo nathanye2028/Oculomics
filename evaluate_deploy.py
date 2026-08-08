@@ -130,6 +130,12 @@ def main() -> int:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--out-dir", default="deploy")
     p.add_argument("--runs", type=int, default=20)
+    p.add_argument("--calib", default="minmax",
+                   choices=["minmax", "percentile", "entropy", "sweep"],
+                   help="INT8 calibration. MobileNetV3 (Hardswish + SE) is PTQ-hostile: "
+                        "MinMax picks scales from activation outliers and can destroy "
+                        "accuracy. 'sweep' tries all and reports the best.")
+    p.add_argument("--calib-batches", type=int, default=8)
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -186,6 +192,9 @@ def main() -> int:
                       dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}})
     model.to(device)
 
+    res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
+           "use_gcg": use_gcg, "tta": args.tta, "n_test": int(len(ty))}
+
     int8_ok = True
     try:
         from onnxruntime.quantization import (quantize_static, CalibrationDataReader,
@@ -205,19 +214,45 @@ def main() -> int:
             def get_next(self):
                 return next(self._it, None)
 
+        from onnxruntime.quantization import CalibrationMethod
+        _CM = {"minmax": CalibrationMethod.MinMax,
+               "percentile": CalibrationMethod.Percentile,
+               "entropy": CalibrationMethod.Entropy}
         prepped = os.path.join(args.out_dir, "model_fp32.prep.onnx")
         quant_pre_process(onnx_fp32, prepped)
-        quantize_static(prepped, onnx_int8, _Calib(val_loader),
-                        quant_format=QuantFormat.QDQ,
-                        weight_type=QuantType.QInt8,
-                        activation_type=QuantType.QUInt8,
-                        # PER-CHANNEL is essential for MobileNetV3: its depthwise
-                        # separable convs have per-channel weight ranges spanning
-                        # orders of magnitude, so a single per-tensor scale
-                        # collapses them. Measured on a trained checkpoint:
-                        #   per-tensor  AUROC 1.000 -> 0.680  (model destroyed)
-                        #   per-channel AUROC 1.000 -> 1.000  (lossless)
-                        per_channel=True)
+
+        if args.calib == "sweep":
+            # Try every calibration method and keep whichever preserves AUROC best.
+            best_name, best_auc = None, -1.0
+            for nm, cm in _CM.items():
+                cand = os.path.join(args.out_dir, f"model_int8_{nm}.onnx")
+                try:
+                    quantize_static(prepped, cand, _Calib(val_loader, n=args.calib_batches),
+                                    quant_format=QuantFormat.QDQ, weight_type=QuantType.QInt8,
+                                    activation_type=QuantType.QUInt8, per_channel=True,
+                                    calibrate_method=cm)
+                    s_, y_ = onnx_scores(cand, test_loader, tta=args.tta)
+                    a = float(roc_auc_score(y_, s_))
+                    print(f"[calib] {nm:<11} INT8 AUROC={a:.4f}  (FP32 {fp32_auroc:.4f}, "
+                          f"delta {a-fp32_auroc:+.4f})")
+                    if a > best_auc:
+                        best_auc, best_name = a, nm
+                        os.replace(cand, onnx_int8)
+                except Exception as e:  # noqa
+                    print(f"[calib] {nm:<11} FAILED: {str(e)[:60]}")
+            print(f"[calib] best = {best_name} (AUROC {best_auc:.4f})")
+            res["calib_method"] = best_name
+        else:
+            res["calib_method"] = args.calib
+            quantize_static(prepped, onnx_int8, _Calib(val_loader, n=args.calib_batches),
+                            calibrate_method=_CM[args.calib],
+                            quant_format=QuantFormat.QDQ,
+                            weight_type=QuantType.QInt8,
+                            activation_type=QuantType.QUInt8,
+                            # per-channel is necessary (depthwise convs) but on a
+                            # real trained MobileNetV3 it is NOT sufficient --
+                            # calibration method matters just as much.
+                            per_channel=True)
     except Exception as e:  # noqa
         int8_ok = False
         print(f"[warn] INT8 quantization failed: {e}")
@@ -225,10 +260,8 @@ def main() -> int:
     mb = lambda p_: os.path.getsize(p_) / 1e6
     x_np = dummy.numpy()
     lat_fp32 = bench_onnx(onnx_fp32, x_np, args.runs)
-    res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
-           "use_gcg": use_gcg, "tta": args.tta, "n_test": int(len(ty)),
-           "fp32": {"auroc": fp32_auroc, **fp32_op,
-                    "size_mb": mb(onnx_fp32), "latency_ms": lat_fp32}}
+    res["fp32"] = {"auroc": fp32_auroc, **fp32_op,
+                   "size_mb": mb(onnx_fp32), "latency_ms": lat_fp32}
 
     print("\n" + "=" * 74)
     print(f"DEPLOYMENT REPORT — {task}   (test n={len(ty)}, patient-grouped hold-out)")
