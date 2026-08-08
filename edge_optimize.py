@@ -124,9 +124,13 @@ def main() -> int:
 
         prepped = os.path.join(args.out_dir, f"{args.model}_fp32.prep.onnx")
         quant_pre_process(onnx_fp32, prepped)
+        # per_channel=True is REQUIRED for MobileNetV3 (depthwise convs); with a
+        # single per-tensor scale a trained model dropped from AUROC 1.00 -> 0.68.
         quantize_static(prepped, onnx_int8, _Calib("input", (1, C_in, H, W)),
                         quant_format=QuantFormat.QDQ,
-                        weight_type=QuantType.QInt8, activation_type=QuantType.QInt8)
+                        weight_type=QuantType.QInt8,
+                        activation_type=QuantType.QUInt8,
+                        per_channel=True)
         lat_int8 = bench_onnx(onnx_int8, x_np, args.runs)
     except Exception as e:  # noqa
         int8_ok = False

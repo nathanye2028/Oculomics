@@ -209,7 +209,15 @@ def main() -> int:
         quant_pre_process(onnx_fp32, prepped)
         quantize_static(prepped, onnx_int8, _Calib(val_loader),
                         quant_format=QuantFormat.QDQ,
-                        weight_type=QuantType.QInt8, activation_type=QuantType.QInt8)
+                        weight_type=QuantType.QInt8,
+                        activation_type=QuantType.QUInt8,
+                        # PER-CHANNEL is essential for MobileNetV3: its depthwise
+                        # separable convs have per-channel weight ranges spanning
+                        # orders of magnitude, so a single per-tensor scale
+                        # collapses them. Measured on a trained checkpoint:
+                        #   per-tensor  AUROC 1.000 -> 0.680  (model destroyed)
+                        #   per-channel AUROC 1.000 -> 1.000  (lossless)
+                        per_channel=True)
     except Exception as e:  # noqa
         int8_ok = False
         print(f"[warn] INT8 quantization failed: {e}")
@@ -230,9 +238,17 @@ def main() -> int:
           f"{fp32_op['specificity']:>8.3f}{fp32_op['ppv']:>8.3f}{mb(onnx_fp32):>10.2f}{lat_fp32:>11.1f}")
 
     if int8_ok:
+        # Quantization preserves RANKING (AUROC) but shifts the probability
+        # calibration, so the FP32 threshold does not transfer -- reusing it made
+        # measured sensitivity collapse 1.000 -> 0.263 at identical AUROC.
+        # Re-calibrate on the INT8 model's own VAL scores.
+        ivs, ivy = onnx_scores(onnx_int8, val_loader, tta=args.tta)
+        thr_int8, _, _ = operating_point(ivs, ivy, target_sens=args.target_sens)
         is_, iy = onnx_scores(onnx_int8, test_loader, tta=args.tta)
         int8_auroc = float(roc_auc_score(iy, is_))
-        int8_op = binary_report(is_, iy, thr)
+        int8_op = binary_report(is_, iy, thr_int8)
+        print(f"[info] INT8 threshold re-calibrated on VAL: {thr_int8:.4f} "
+              f"(FP32 threshold {thr:.4f} does not transfer after quantization)")
         lat_int8 = bench_onnx(onnx_int8, x_np, args.runs)
         res["int8"] = {"auroc": int8_auroc, **int8_op,
                        "size_mb": mb(onnx_int8), "latency_ms": lat_int8}
