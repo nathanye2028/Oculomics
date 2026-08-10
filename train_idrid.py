@@ -143,6 +143,27 @@ class _WithValid(torch.utils.data.Dataset):
         return x, m, self.valid.clone()
 
 
+class _NoValid(torch.utils.data.Dataset):
+    """Inverse of :class:`_WithValid` — drop ``valid`` for the 2-tuple eval API.
+
+    Evaluation sets are fully annotated by construction, so the vector carries
+    no information there; ``evaluate_whole`` expects (img, mask).
+    """
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        x, m = self.ds[i][:2]
+        return x, m
+
+    def load_full(self, i):                    # keep tiled eval working
+        return self.ds.load_full(i)
+
+
 @torch.no_grad()
 def evaluate_whole(model, loader, lesions, device):
     """Per-lesion Dice + IoU over a loader (whole-image, resized). Fast; for val selection.
@@ -268,12 +289,16 @@ def main() -> int:
     p = argparse.ArgumentParser(description="IDRiD lesion-segmentation trainer / benchmark.")
     p.add_argument("--root", default=None)
     p.add_argument("--datasets", nargs="+", default=["idrid"],
-                   choices=["idrid", "eophtha", "retlesion"],
+                   choices=["idrid", "eophtha", "retlesion", "fgadr"],
                    help="Training sources. IDRiD is always the val/test set. "
                         "'eophtha' adds 47 EX-only images; 'retlesion' adds ~1.4k "
-                        "MA + ~0.5k cotton-wool-spot annotated images.")
+                        "MA + ~0.5k cotton-wool-spot annotated images; 'fgadr' adds "
+                        "1475 fully-annotated (MA/HE/EX/SE) images and is scored on "
+                        "its own 367-image test split in addition to IDRiD's.")
     p.add_argument("--eophtha-root", default=None)
     p.add_argument("--retlesion-root", default=None)
+    p.add_argument("--fgadr-root", default=None,
+                   help="FGADR Seg-set dir; auto-detected under data/ when omitted.")
     p.add_argument("--lesions", nargs="+", default=list(DEFAULT_LESIONS))
     p.add_argument("--image-size", type=int, default=512, help="Whole-image (resize) size.")
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
@@ -386,6 +411,22 @@ def main() -> int:
         if len(eo):
             train_ds = torch.utils.data.ConcatDataset([train_ds, eo])
             extra_counts["eophtha(EX-only)"] = len(eo)
+    # FGADR: 1475 fully-annotated train images (~27x IDRiD's 54). It dominates the
+    # mixture, so it also gets scored on its own held-out split below — an IDRiD-only
+    # metric over 27 images would be too noisy to attribute changes to.
+    fgadr_test_ds = None
+    if "fgadr" in args.datasets:
+        from fgadr_dataset import FGADRSegDataset
+        fg = FGADRSegDataset(args.fgadr_root, split="train", image_size=args.image_size,
+                             lesions=args.lesions, fov_crop=True, patch_size=patch,
+                             fg_bias=args.fg_bias, augment=True, seed=args.seed)
+        if len(fg):
+            train_ds = torch.utils.data.ConcatDataset([train_ds, fg])
+            extra_counts["fgadr"] = len(fg)
+        fgadr_test_ds = _NoValid(FGADRSegDataset(
+            args.fgadr_root, split="test", image_size=args.image_size,
+            lesions=args.lesions, fov_crop=True, patch_size=None,
+            augment=False, seed=args.seed))
     if "retlesion" in args.datasets:
         from retlesion_dataset import RetLesionDataset, download_retlesion
         rl_root = args.retlesion_root or download_retlesion()
@@ -401,7 +442,8 @@ def main() -> int:
     log(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
     log(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
         + (f"   (+{extra_counts})" if extra_counts else "")
-        + "   [val/test = IDRiD only]")
+        + ("   [val = IDRiD; test = IDRiD + FGADR]" if fgadr_test_ds is not None
+           else "   [val/test = IDRiD only]"))
     log(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
         f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
     log(f"[info] ckpt   : {ckpt_path}")
@@ -517,22 +559,38 @@ def main() -> int:
         dist.barrier()                              # ensure rank 0 finished writing the ckpt
     log(f"\n[info] best val mean-Dice {best_val:.3f} @ epoch {best_epoch}; loading {ckpt_path}")
     module.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
-    if args.eval_tiled:
-        tile = patch or args.image_size
-        test_dice, test_iou = evaluate_tiled(module, test_ds, args.lesions, device, tile, args.tile_overlap,
-                                             tile_batch=args.tile_batch, num_workers=args.num_workers)
-    else:
-        test_sampler = DistributedSampler(test_ds, shuffle=False) if ddp else None
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, sampler=test_sampler,
-                                 num_workers=args.num_workers, worker_init_fn=seed_worker)
-        test_dice, test_iou = evaluate_whole(module, test_loader, args.lesions, device)
-    mean_test = sum(test_dice.values()) / len(test_dice)
-    mean_iou = sum(test_iou.values()) / len(test_iou)
-    per = "  ".join(f"{k}={v:.3f}" for k, v in test_dice.items())
-    per_iou = "  ".join(f"{k}={v:.3f}" for k, v in test_iou.items())
-    log(f"\n=== TEST (held-out, best checkpoint) ===")
-    log(f"  Dice [mean={mean_test:.3f}]   {per}")
-    log(f"  IoU  [mean={mean_iou:.3f}]   {per_iou}")
+    def score(ds):
+        """Score a held-out set with the configured eval mode (tiled or whole)."""
+        if args.eval_tiled:
+            tile = patch or args.image_size
+            return evaluate_tiled(module, ds, args.lesions, device, tile, args.tile_overlap,
+                                  tile_batch=args.tile_batch, num_workers=args.num_workers)
+        sampler = DistributedSampler(ds, shuffle=False) if ddp else None
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, sampler=sampler,
+                            num_workers=args.num_workers, worker_init_fn=seed_worker)
+        return evaluate_whole(module, loader, args.lesions, device)
+
+    def report(name, dice, iou):
+        md = sum(dice.values()) / len(dice)
+        mi = sum(iou.values()) / len(iou)
+        log(f"\n=== TEST — {name} (best checkpoint) ===")
+        log(f"  Dice [mean={md:.3f}]   " + "  ".join(f"{k}={v:.3f}" for k, v in dice.items()))
+        log(f"  IoU  [mean={mi:.3f}]   " + "  ".join(f"{k}={v:.3f}" for k, v in iou.items()))
+        return md, mi
+
+    test_dice, test_iou = score(test_ds)
+    mean_test, mean_iou = report(f"IDRiD ({len(test_ds)} imgs)", test_dice, test_iou)
+
+    # FGADR's own split: matched-distribution and large enough for stable
+    # per-lesion numbers. IDRiD's 27 images then read as an out-of-distribution
+    # generalisation check. They answer different questions — report both.
+    fgadr_dice = fgadr_iou = None
+    if fgadr_test_ds is not None:
+        fgadr_dice, fgadr_iou = score(fgadr_test_ds)
+        report(f"FGADR ({len(fgadr_test_ds)} imgs)", fgadr_dice, fgadr_iou)
+        log("\n[note] IDRiD is the out-of-distribution check here (27 images, noisy); "
+            "FGADR is the matched-distribution number.")
+
     log("\nOK: train/val/test separated; focal-tversky loss; best checkpoint scored on test.")
 
     if csv_log is not None:
@@ -547,8 +605,13 @@ def main() -> int:
                 "seed": args.seed, "epochs": args.epochs,
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
+                "datasets": args.datasets,
                 "test_dice": test_dice, "test_mean": mean_test,
                 "test_iou": test_iou, "test_iou_mean": mean_iou,
+                "fgadr_test_dice": fgadr_dice,
+                "fgadr_test_mean": (sum(fgadr_dice.values()) / len(fgadr_dice)
+                                    if fgadr_dice else None),
+                "fgadr_test_iou": fgadr_iou,
                 "best_val": best_val, "best_epoch": best_epoch,
             }, f, indent=2)
         log(f"[info] wrote results -> {args.results_json}")

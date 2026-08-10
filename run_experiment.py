@@ -143,7 +143,7 @@ def main() -> int:
     p.add_argument("--init-weights", default=None,
                    help="Full-network vessel-pretrained weights (from pretrain_vessel.py).")
     p.add_argument("--datasets", nargs="+", default=["idrid"],
-                   choices=["idrid", "eophtha", "retlesion"],
+                   choices=["idrid", "eophtha", "retlesion", "fgadr"],
                    help="Training sources (val/test stay IDRiD for comparability).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
