@@ -20,6 +20,10 @@ Current sources
 ---------------
 * **IDRiD**    54 train / 27 test, masks for MA, HE, EX, SE   (valid = all)
 * **e-ophtha** 47 images, masks for EX only                   (valid = EX)
+* **FGADR**    1474 train / 368 test, masks for MA, HE, EX, SE (valid = all)
+
+FGADR dominates the mixture by ~18x, so treat it as the primary training signal
+and IDRiD/e-ophtha as held-out-distribution checks rather than equal partners.
 
 Note both DDR and RFMiD (as mirrored on Kaggle) are *classification* sets with
 no lesion masks — they are used for encoder pretraining (:mod:`pretrain_rfmid`),
@@ -102,7 +106,8 @@ class MultiLesionSegDataset(Dataset):
 
     Parameters
     ----------
-    idrid_root / eophtha_root : dataset roots; pass None to skip a source.
+    idrid_root / eophtha_root / fgadr_root : dataset roots; None skips a source.
+                FGADR auto-detects under data/ when passed the string "auto".
     split : 'train' | 'test'  (e-ophtha has no official split -> train only).
     image_size / patch_size / fg_bias / augment : as in :class:`IDRiDSegDataset`.
     """
@@ -111,6 +116,7 @@ class MultiLesionSegDataset(Dataset):
         self,
         idrid_root: Optional[str] = None,
         eophtha_root: Optional[str] = None,
+        fgadr_root: Optional[str] = None,
         split: str = "train",
         image_size: int = 512,
         lesions: Sequence[str] = DEFAULT_LESIONS,
@@ -136,6 +142,13 @@ class MultiLesionSegDataset(Dataset):
         if eophtha_root and split == "train":       # e-ophtha: train-only source
             ds = EOphthaEXDataset(eophtha_root, lesions=self.lesions)
             self.sources.append(("eophtha", ds, ds.valid))
+        if fgadr_root:
+            from fgadr_dataset import FGADRSegDataset
+            ds = FGADRSegDataset(
+                None if fgadr_root == "auto" else fgadr_root,
+                split=split, image_size=image_size, lesions=self.lesions,
+                fov_crop=True, patch_size=None, augment=False, seed=seed)
+            self.sources.append(("fgadr", ds, ds.valid))
 
         self.index: List[Tuple[int, int]] = []      # (source_i, local_i)
         for si, (_, ds, _) in enumerate(self.sources):

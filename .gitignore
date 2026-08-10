@@ -8,3 +8,10 @@ artifact_samples/
 edge_export/
 *.pt
 *.onnx
+*.mlpackage/
+*.mlmodel
+
+# Datasets — never commit. FGADR is ~4 GB zipped and its licence forbids
+# redistribution (non-commercial research use only; see data/fgadr/Readme.txt).
+data/
+*.zip
