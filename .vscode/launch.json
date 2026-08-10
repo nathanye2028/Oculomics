@@ -54,6 +54,76 @@
                "--epochs", "200", "--eval-tiled", "--batch-size", "16"],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "1. fgadr_dataset.py (data sanity)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/fgadr_dataset.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "2. losses.py (loss sanity)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/losses.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "3. overfit_test.py (can it learn at all?)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/overfit_test.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--steps", "400", "--patch-size", "256"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "4. eval_fgadr.py (score a checkpoint)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval_fgadr.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt",
+               "--limit", "40", "--save-overlays", "out/overlays"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "4b. eval_fgadr.py (full test split, tiled @ native)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval_fgadr.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt", "--tiled", "--tile", "512"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "5. export_coreml.py (on-device export)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/export_coreml.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt", "--classes", "4",
+               "--image-size", "512"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "pytest (full suite)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["tests/", "-v"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
     }
   ]
 }
