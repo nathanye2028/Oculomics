@@ -6,12 +6,18 @@ checkpoints/
 experiments/
 artifact_samples/
 edge_export/
+runs/
 *.pt
+*.pth
+*.ckpt
 *.onnx
 *.mlpackage/
 *.mlmodel
+*.pte
 
 # Datasets — never commit. FGADR is ~4 GB zipped and its licence forbids
 # redistribution (non-commercial research use only; see data/fgadr/Readme.txt).
 data/
 *.zip
+*.tar
+*.tar.gz

@@ -23,10 +23,10 @@ onnxruntime
 # Core ML export for on-device iOS inference (export_coreml.py). macOS only.
 # NB: do NOT add executorch on Python 3.9 — pip resolves it to executorch 0.3.0
 # and downgrades torch 2.8 -> 2.4. It needs a separate 3.10+ environment.
-coremltools
+coremltools==9.0
 
 # Connected-component analysis in fgadr_dataset.lesion_retention.
-scipy
+scipy==1.13.1
 
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
 # tensorboard
