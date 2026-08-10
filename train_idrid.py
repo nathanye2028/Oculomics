@@ -299,6 +299,12 @@ def main() -> int:
     p.add_argument("--retlesion-root", default=None)
     p.add_argument("--fgadr-root", default=None,
                    help="FGADR Seg-set dir; auto-detected under data/ when omitted.")
+    p.add_argument("--val-source", default="auto", choices=["auto", "idrid", "fgadr"],
+                   help="Which held-out set selects the best checkpoint. 'auto' uses "
+                        "FGADR's val split when FGADR is training data (matched "
+                        "distribution, ~184 imgs), else IDRiD's ~11. Selecting on 11 "
+                        "out-of-distribution images is noisy enough to pick a worse "
+                        "checkpoint than a better one.")
     p.add_argument("--lesions", nargs="+", default=list(DEFAULT_LESIONS))
     p.add_argument("--image-size", type=int, default=512, help="Whole-image (resize) size.")
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
@@ -427,6 +433,22 @@ def main() -> int:
             args.fgadr_root, split="test", image_size=args.image_size,
             lesions=args.lesions, fov_crop=True, patch_size=None,
             augment=False, seed=args.seed))
+
+        # Model selection: prefer FGADR's val split. IDRiD's ~11 held-out images
+        # cannot reliably rank checkpoints once training is ~97% FGADR, and a bad
+        # selection silently ships a worse model than the run actually reached.
+        if args.val_source in ("auto", "fgadr"):
+            val_ds = _NoValid(FGADRSegDataset(
+                args.fgadr_root, split="val", image_size=args.image_size,
+                lesions=args.lesions, fov_crop=True, patch_size=None,
+                augment=False, seed=args.seed))
+            val_source = "fgadr"
+        else:
+            val_source = "idrid"
+    else:
+        if args.val_source == "fgadr":
+            raise SystemExit("--val-source fgadr requires 'fgadr' in --datasets")
+        val_source = "idrid"
     if "retlesion" in args.datasets:
         from retlesion_dataset import RetLesionDataset, download_retlesion
         rl_root = args.retlesion_root or download_retlesion()
@@ -442,7 +464,7 @@ def main() -> int:
     log(f"[info] lesions: {args.lesions}  (C={C})   loss={args.loss}")
     log(f"[info] splits : train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}"
         + (f"   (+{extra_counts})" if extra_counts else "")
-        + ("   [val = IDRiD; test = IDRiD + FGADR]" if fgadr_test_ds is not None
+        + (f"   [val={val_source}; test=IDRiD+FGADR]" if fgadr_test_ds is not None
            else "   [val/test = IDRiD only]"))
     log(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
         f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
@@ -605,7 +627,7 @@ def main() -> int:
                 "seed": args.seed, "epochs": args.epochs,
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
-                "datasets": args.datasets,
+                "datasets": args.datasets, "val_source": val_source,
                 "test_dice": test_dice, "test_mean": mean_test,
                 "test_iou": test_iou, "test_iou_mean": mean_iou,
                 "fgadr_test_dice": fgadr_dice,

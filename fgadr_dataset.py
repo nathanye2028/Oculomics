@@ -131,15 +131,24 @@ def read_grades(seg_root: str) -> Dict[str, int]:
 def stratified_split(
     files: Sequence[str],
     grades: Dict[str, int],
+    val_frac: float = 0.1,
     test_frac: float = 0.2,
     seed: int = 42,
-) -> Tuple[List[str], List[str]]:
-    """Split filenames into (train, test), stratified on DR grade.
+) -> Tuple[List[str], List[str], List[str]]:
+    """Split filenames into (train, val, test), stratified on DR grade.
 
     FGADR ships no official split. Stratifying matters because grades are far
     from uniform (grade 0 is only ~5% of the set), so an unstratified draw can
-    leave the test set with almost no grade-0 or grade-4 cases and make metrics
-    jump between seeds for reasons unrelated to the model.
+    leave a held-out set with almost no grade-0 or grade-4 cases and make
+    metrics jump between seeds for reasons unrelated to the model.
+
+    A dedicated **val** split exists so model selection has a matched-distribution
+    signal. Selecting the best checkpoint on a small out-of-distribution set (e.g.
+    IDRiD's 27 images) is noisy enough to save a worse checkpoint than a better one.
+
+    Splits are disjoint and deterministic given ``seed``: test is drawn first,
+    then val from what remains, so changing ``val_frac`` never moves an image
+    into or out of test.
     """
     rng = np.random.default_rng(seed)
     by_grade: Dict[int, List[str]] = {}
@@ -147,14 +156,17 @@ def stratified_split(
         by_grade.setdefault(grades.get(f, -1), []).append(f)
 
     train: List[str] = []
+    val: List[str] = []
     test: List[str] = []
     for g in sorted(by_grade):
         group = sorted(by_grade[g])
         idx = rng.permutation(len(group))
         n_test = int(round(len(group) * test_frac))
+        n_val = int(round(len(group) * val_frac))
         test.extend(group[i] for i in idx[:n_test])
-        train.extend(group[i] for i in idx[n_test:])
-    return sorted(train), sorted(test)
+        val.extend(group[i] for i in idx[n_test:n_test + n_val])
+        train.extend(group[i] for i in idx[n_test + n_val:])
+    return sorted(train), sorted(val), sorted(test)
 
 
 def _load_mask(path: str) -> np.ndarray:
@@ -171,7 +183,8 @@ class FGADRSegDataset(Dataset):
     Parameters
     ----------
     root       : path to ``Seg-set`` (auto-detected under data/ if None).
-    split      : 'train' | 'test' | 'all'  (grade-stratified; no official split).
+    split      : 'train' | 'val' | 'test' | 'all'. Grade-stratified and disjoint;
+                 FGADR ships no official split. Use 'val' for model selection.
     image_size : square resolution in whole-image mode (patch_size=None).
     lesions    : ordered lesion codes -> output channels.
     fov_crop   : crop the black border to the retinal field of view first.
@@ -192,6 +205,7 @@ class FGADRSegDataset(Dataset):
         patch_size: Optional[int] = None,
         fg_bias: float = 0.7,
         augment: bool = False,
+        val_frac: float = 0.1,
         test_frac: float = 0.2,
         seed: int = 42,
     ) -> None:
@@ -199,8 +213,8 @@ class FGADRSegDataset(Dataset):
         for code in lesions:
             if code not in LESION_FOLDERS:
                 raise KeyError(f"Unknown lesion code {code!r}; choices: {list(LESION_FOLDERS)}")
-        if split not in ("train", "test", "all"):
-            raise ValueError(f"split must be 'train', 'test' or 'all', got {split!r}")
+        if split not in ("train", "val", "test", "all"):
+            raise ValueError(f"split must be 'train', 'val', 'test' or 'all', got {split!r}")
 
         self.root = resolve_seg_root(root)
         self.split = split
@@ -225,8 +239,10 @@ class FGADRSegDataset(Dataset):
                   "grade-stratified. Extract it with:\n"
                   f"       unzip -q -o data/FGADR-Seg-set_Release.zip 'Seg-set/{GRADING_CSV}'"
                   " -d data/fgadr")
-        train, test = stratified_split(all_files, self.grades, test_frac, seed)
-        self.files: List[str] = {"train": train, "test": test, "all": all_files}[split]
+        train, val, test = stratified_split(all_files, self.grades, val_frac, test_frac, seed)
+        self.files: List[str] = {
+            "train": train, "val": val, "test": test, "all": all_files,
+        }[split]
 
         # All four default lesions are annotated for every image.
         self.valid = torch.tensor(
@@ -388,13 +404,17 @@ def main() -> int:
         return 0
 
     tr = FGADRSegDataset(args.root, split="train", image_size=args.image_size, augment=True)
+    va = FGADRSegDataset(args.root, split="val", image_size=args.image_size)
     te = FGADRSegDataset(args.root, split="test", image_size=args.image_size)
     print(f"[info] root    : {tr.root}")
     print(f"[info] lesions : {tr.lesions}   valid={tr.valid.tolist()}")
-    print(f"[info] split   : {len(tr)} train / {len(te)} test")
+    print(f"[info] split   : {len(tr)} train / {len(va)} val / {len(te)} test")
+    overlap = (set(tr.files) & set(va.files)) | (set(tr.files) & set(te.files)) \
+        | (set(va.files) & set(te.files))
+    print(f"[info] disjoint: {'YES' if not overlap else f'NO — {len(overlap)} leaked!'}")
 
     from collections import Counter
-    for name, ds in (("train", tr), ("test", te)):
+    for name, ds in (("train", tr), ("val", va), ("test", te)):
         c = Counter(ds.grade_of(f) for f in ds.files)
         print(f"[info] {name:5} grades: " + "  ".join(f"{g}:{c[g]}" for g in sorted(c)))
 

@@ -118,7 +118,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Evaluate a checkpoint on the FGADR test split.")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--root", default=None, help="FGADR Seg-set dir (auto-detected under data/).")
-    p.add_argument("--split", default="test", choices=["test", "train", "all"])
+    p.add_argument("--split", default="test", choices=["test", "val", "train", "all"])
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--limit", type=int, default=None, help="Evaluate only the first N images.")
     p.add_argument("--thresh", type=float, default=0.5)
