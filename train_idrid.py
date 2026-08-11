@@ -619,6 +619,9 @@ def main() -> int:
         csv_log.close()
     if is_main and args.results_json:
         import json
+        # Create the parent dir: this write is the very last thing the run does,
+        # so a missing directory would discard a full training run's results.
+        os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
         with open(args.results_json, "w") as f:
             json.dump({
                 "arch": args.arch,
