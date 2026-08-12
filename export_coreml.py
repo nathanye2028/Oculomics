@@ -101,9 +101,21 @@ def load_checkpoint(net: nn.Module, path: Optional[str]) -> bool:
 
 
 def build_wrapped(args: argparse.Namespace) -> Tuple[nn.Module, bool]:
-    from model_seg import build_model
+    from model_seg import arch_cfg_from_checkpoint, build_model
+    # Peek at the checkpoint's recorded architecture BEFORE building, so a run
+    # trained with --decoder separable exports as a separable-decoder model
+    # instead of silently loading into the dense default.
+    cfg = {"encoder": args.encoder, "decoder": args.decoder,
+           "lateral_channels": None if args.lateral_channels < 0 else args.lateral_channels}
+    if args.checkpoint and os.path.isfile(args.checkpoint) and args.encoder == "auto":
+        ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        cfg = arch_cfg_from_checkpoint(ck)
+    elif args.encoder == "auto":
+        cfg["encoder"] = "mobilenetv3"
+    print(f"[info] arch: encoder={cfg['encoder']} decoder={cfg['decoder']} "
+          f"lateral={cfg['lateral_channels']}")
     net = build_model(arch="gcg_unet", num_classes=args.classes,
-                      pretrained=False, use_gcg=not args.no_gcg)
+                      pretrained=False, use_gcg=not args.no_gcg, **cfg)
     trained = load_checkpoint(net, args.checkpoint)
     wrapper = DeployWrapper(net).eval()
     for p in wrapper.parameters():
@@ -231,6 +243,14 @@ def main() -> int:
     p.add_argument("--quantize", choices=("none", "fp16", "int8"), default="fp16")
     p.add_argument("--min-target", default="iOS17", help="e.g. iOS16 / iOS17 / iOS18.")
     p.add_argument("--no-gcg", action="store_true", help="Match a --no-gcg ablation checkpoint.")
+    # 'auto' reads the architecture out of the checkpoint (train_idrid.py records
+    # it). Override only to export an architecture with no checkpoint, e.g. to
+    # measure ANE latency for a variant before it has been trained.
+    from model_seg import ENCODER_NAMES                          # noqa: E402
+    p.add_argument("--encoder", default="auto", choices=["auto"] + list(ENCODER_NAMES))
+    p.add_argument("--decoder", default="dense", choices=["dense", "separable"],
+                   help="Ignored unless --encoder is given explicitly (else read from ckpt).")
+    p.add_argument("--lateral-channels", type=int, default=-1)
     p.add_argument("--runs", type=int, default=20)
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--skip-benchmark", action="store_true")

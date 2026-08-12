@@ -7,6 +7,13 @@ scikit-learn==1.6.1
 torch==2.8.0
 torchvision==0.23.0
 
+# Modern encoders for model_seg.build_encoder: MobileNetV4 (mobilenetv4_*) and
+# EfficientViT (efficientvit_*). The default 'mobilenetv3' encoder comes from
+# torchvision and does NOT need this — timm is only required if you pass
+# --encoder something-else. Pinned because MobileNetV4 landed in timm 1.0.3 and
+# an unpinned install is free to drag torch backwards (see the executorch note).
+timm==1.0.19
+
 # Used only by test_loader.py to fetch the Kaggle smoke-test dataset.
 kagglehub==0.3.13
 

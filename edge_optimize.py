@@ -33,10 +33,13 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-def build(model_kind: str, num_classes: int):
+def build(model_kind: str, num_classes: int, encoder: str = "mobilenetv3",
+          decoder: str = "dense", lateral_channels: int = -1):
     if model_kind == "seg":
         from model_seg import build_model
-        return build_model(arch="gcg_unet", num_classes=num_classes, pretrained=False, use_gcg=True)
+        return build_model(arch="gcg_unet", num_classes=num_classes, pretrained=False,
+                           use_gcg=True, encoder=encoder, decoder=decoder,
+                           lateral_channels=None if lateral_channels < 0 else lateral_channels)
     from model import build_classifier
     return build_classifier(num_classes=num_classes, pretrained=False)
 
@@ -79,11 +82,25 @@ def main() -> int:
     p.add_argument("--weights", default=None, help="Optional checkpoint (.pt) to load real trained weights.")
     p.add_argument("--runs", type=int, default=30)
     p.add_argument("--out-dir", default="edge_export")
+    # Mobile cost knobs (seg only). With --weights, the architecture is read from
+    # the checkpoint; these are for profiling a variant before training it.
+    from model_seg import ENCODER_NAMES                          # noqa: E402
+    p.add_argument("--encoder", default="mobilenetv3", choices=list(ENCODER_NAMES))
+    p.add_argument("--decoder", default="dense", choices=["dense", "separable"])
+    p.add_argument("--lateral-channels", type=int, default=-1)
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     nc = args.num_classes if args.model == "seg" else max(args.num_classes, 5)
-    model = build(args.model, nc).eval()
+    enc, dec, lat = args.encoder, args.decoder, args.lateral_channels
+    if args.model == "seg" and args.weights and os.path.exists(args.weights):
+        from model_seg import arch_cfg_from_checkpoint      # noqa: E402
+        cfg = arch_cfg_from_checkpoint(
+            torch.load(args.weights, map_location="cpu", weights_only=False))
+        enc, dec = str(cfg["encoder"]), str(cfg["decoder"])
+        lat = -1 if cfg["lateral_channels"] is None else int(cfg["lateral_channels"])
+        print(f"[info] arch from checkpoint: encoder={enc} decoder={dec} lateral={lat}")
+    model = build(args.model, nc, encoder=enc, decoder=dec, lateral_channels=lat).eval()
     if args.weights and os.path.exists(args.weights):
         state = torch.load(args.weights, map_location="cpu")
         model.load_state_dict(state.get("model", state))

@@ -60,6 +60,9 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         "--results-json", results_json,
         "--gcg-variant", args.gcg_variant,
         "--patience", str(args.patience),
+        "--encoder", args.encoder,
+        "--decoder", args.decoder,
+        "--lateral-channels", str(args.lateral_channels),
     ]
     if args.patch_size > 0:
         cmd += ["--patch-size", str(args.patch_size)]
@@ -136,6 +139,15 @@ def main() -> int:
     p.add_argument("--gcg-variant", default="baseline",
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="GCG block for the 'gcg' condition (vs the --no-gcg control).")
+    # Applied to BOTH conditions, so the GCG-vs-control contrast stays clean and
+    # the architecture change is a separate, orthogonal comparison.
+    from model_seg import ENCODER_NAMES                          # noqa: E402
+    p.add_argument("--encoder", default="mobilenetv3", choices=list(ENCODER_NAMES),
+                   help="Backbone for both conditions (default = the one prior results used).")
+    p.add_argument("--decoder", default="dense", choices=["dense", "separable"],
+                   help="Decoder fuse convs for both conditions. 'separable' = mobile-first.")
+    p.add_argument("--lateral-channels", type=int, default=-1,
+                   help="Deep-feature 1x1 projection width; -1 = pick by --decoder, 0 = off.")
     p.add_argument("--pretrained", action="store_true",
                    help="Deprecated no-op — ImageNet init is the default now.")
     p.add_argument("--no-pretrained", action="store_true",

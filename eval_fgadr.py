@@ -75,8 +75,15 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: bool):
         lesions = ["MA", "HE", "EX", "SE"]
         print(f"[warn] checkpoint records no lesion list; assuming {lesions}")
 
-    from model_seg import build_model
-    net = build_model(arch=arch, num_classes=len(lesions), pretrained=False, use_gcg=use_gcg)
+    from model_seg import arch_cfg_from_checkpoint, build_model
+    # The checkpoint records which encoder/decoder it was trained with; honour it
+    # rather than assuming the defaults, or a separable-decoder run would load as
+    # a pile of missing keys and score near chance.
+    cfg = arch_cfg_from_checkpoint(ck)
+    print(f"[info] arch from checkpoint: encoder={cfg['encoder']} decoder={cfg['decoder']} "
+          f"lateral={cfg['lateral_channels']}")
+    net = build_model(arch=arch, num_classes=len(lesions), pretrained=False,
+                      use_gcg=use_gcg, **cfg)
     state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
     missing, unexpected = net.load_state_dict(state, strict=False)
     if missing:

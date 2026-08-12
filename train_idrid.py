@@ -258,10 +258,14 @@ def build(args, num_classes, device):
             from gcg_blocks import GCG_VARIANTS
             gcg_factory = GCG_VARIANTS[args.gcg_variant]
         imagenet = not getattr(args, "no_pretrained", False)
+        # -1 is the "let the decoder style decide" sentinel; 0 means explicitly off.
+        lat = getattr(args, "lateral_channels", -1)
         m = build_model(arch="gcg_unet", num_classes=num_classes,
                         pretrained=imagenet, use_gcg=not args.no_gcg,
-                        gcg_factory=gcg_factory)
-        desc = f"GCG-U-Net (MobileNetV3) gcg={variant}"
+                        gcg_factory=gcg_factory,
+                        encoder=args.encoder, decoder=args.decoder,
+                        lateral_channels=None if lat < 0 else lat)
+        desc = f"GCG-U-Net ({args.encoder}/{args.decoder}-decoder) gcg={variant}"
         desc += " [imagenet]" if imagenet else " [SCRATCH — no pretraining]"
         # In-domain init: overwrite the ImageNet encoder with one pretrained on
         # RFMiD fundus images (see pretrain_rfmid.py). Fundus features transfer
@@ -340,6 +344,24 @@ def main() -> int:
     p.add_argument("--gcg-variant", default="baseline",
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="Which GCG block to inject (see gcg_blocks.py). 'baseline' = built-in.")
+    # --- mobile cost knobs -------------------------------------------------- #
+    # Profiling the default at 512x512 gives 14.09 GMAC split encoder 7.9% /
+    # decoder 92.1%: the deployment cost of this network is the decoder, not the
+    # mobile backbone. Both flags below default to the original architecture so
+    # every result recorded before 2026-08 stays reproducible.
+    from model_seg import ENCODER_NAMES                          # noqa: E402
+    p.add_argument("--encoder", default="mobilenetv3", choices=list(ENCODER_NAMES),
+                   help="Backbone. 'mobilenetv3' (default) is the encoder all prior "
+                        "results used. 'mobilenetv4_*' / 'efficientvit_*' need timm.")
+    p.add_argument("--decoder", default="dense", choices=["dense", "separable"],
+                   help="Decoder fuse convs. 'separable' swaps each stage's two dense "
+                        "3x3s for depthwise-separable blocks and 1x1-projects the deep "
+                        "encoder feature: 14.09 -> 3.26 GMAC (4.3x) at 512 on mobilenetv3.")
+    p.add_argument("--lateral-channels", type=int, default=-1,
+                   help="Width of the 1x1 projection applied to the deepest encoder "
+                        "feature. -1 = pick by --decoder (off for dense, 256 for "
+                        "separable); 0 = force off. Set explicitly to ablate the "
+                        "projection apart from the separable blocks.")
     # Pretraining is ON by default: ImageNet transfer alone moved mean Dice
     # 0.183 -> 0.387 on IDRiD (pretrain_encoder.py), a larger effect than any
     # architecture change measured here. Scratch training must be asked for.

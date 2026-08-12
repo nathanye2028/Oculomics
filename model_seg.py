@@ -8,8 +8,9 @@ Design constraints (per project spec)
 -------------------------------------
 * Pure image -> mask. **No systemic / demographic metadata fusion** — the
   network sees only the fundus image, so learned features are spatial-visual.
-* Encoder: **MobileNetV3-Large** (torchvision, optionally ImageNet-pretrained),
-  chosen for a lightweight, mobile-capable backbone.
+* Encoder: a lightweight, mobile-capable backbone. **MobileNetV3-Large**
+  (torchvision) is the default and the one all pre-2026-08 results were measured
+  with; ``encoder=`` selects a modern alternative (see :func:`build_encoder`).
 * Decoder: a U-Net-style upsampling path with skip connections from the
   encoder stages.
 * **GCG injection**: every decoder skip connection passes through a GCG block
@@ -21,10 +22,36 @@ Design constraints (per project spec)
 
 The model returns per-pixel logits of shape ``[B, num_classes, H, W]`` at the
 input resolution (single-channel for binary lesion-vs-background).
+
+Where the mobile budget actually goes
+-------------------------------------
+Profiling the default (MobileNetV3-Large, dense decoder) at 512x512 gives
+**14.09 GMAC**, split encoder **7.9%** / decoder **92.1%**. The mobile cost of
+this network is almost entirely the decoder, not the backbone that was chosen
+for being mobile-friendly. Two knobs address that directly:
+
+``decoder="separable"``
+    Replaces each decoder stage's two dense 3x3 convs with depthwise-separable
+    blocks (3x3 DW -> 1x1 PW), the same substitution MobileNetV3's own
+    segmentation heads make. A dense 3x3 ``c_in -> c_out`` costs
+    ``HW*c_in*c_out*9``; the separable form costs ``HW*c_in*(9 + c_out)``, i.e.
+    a ``1/9 + 1/c_out`` fraction — ~8.7x cheaper at ``c_out=256``.
+
+``lateral_channels=N``
+    1x1-projects the deepest encoder feature (960ch for both MobileNetV3-L and
+    MobileNetV4) down to ``N`` before the decoder consumes it. Without this,
+    decoder stage 0 fuses ``960 + 112 = 1072`` channels through a 256-wide 3x3
+    and single-handedly costs 23% of the whole network.
+
+Both default to OFF so the default build is byte-identical to the pre-existing
+architecture and every checkpoint under ``checkpoints/`` and ``exp_*/`` still
+loads. ``decoder="separable"`` turns both on (the projection is what makes the
+separable decoder's cheapest stage cheap); pass ``lateral_channels`` explicitly
+to ablate them apart.
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -109,7 +136,7 @@ class GuidedContextGating(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# MobileNetV3-Large encoder (multi-scale feature taps)
+# Encoders (multi-scale feature taps)
 # --------------------------------------------------------------------------- #
 class MobileNetV3Encoder(nn.Module):
     """MobileNetV3-Large feature extractor returning 5 stages at strides 2..32.
@@ -151,6 +178,10 @@ class MobileNetV3Encoder(nn.Module):
         self.features = features
         # Output channel counts at each tapped stage (from torchvision arch).
         self.out_channels: List[int] = [16, 24, 40, 112, 960]
+        # Spatial stride of each tapped stage, coarsest-last. The decoder walks
+        # this ladder, so an encoder whose finest tap is coarser than 2 (e.g.
+        # EfficientViT, which starts at 4) is handled without special-casing.
+        self.reductions: List[int] = [2, 4, 8, 16, 32]
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         feats: List[torch.Tensor] = []
@@ -162,10 +193,71 @@ class MobileNetV3Encoder(nn.Module):
         return feats  # [s2, s4, s8, s16, s32]
 
 
+class TimmEncoder(nn.Module):
+    """``timm`` backbone in ``features_only`` mode, exposing the same contract.
+
+    Provides ``out_channels`` / ``reductions`` and returns features finest-first,
+    matching :class:`MobileNetV3Encoder`. Channel counts and strides are read
+    from ``timm``'s ``feature_info`` rather than hardcoded, because they differ
+    per backbone — notably EfficientViT emits only 4 taps (strides 4..32) with
+    no stride-2 feature at all.
+    """
+
+    def __init__(self, timm_name: str, pretrained: bool = True, in_channels: int = 3) -> None:
+        super().__init__()
+        import timm
+
+        self.backbone = timm.create_model(
+            timm_name, pretrained=pretrained, features_only=True, in_chans=in_channels,
+        )
+        info = self.backbone.feature_info
+        self.out_channels: List[int] = list(info.channels())
+        self.reductions: List[int] = list(info.reduction())
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        return list(self.backbone(x))
+
+
+# name -> timm model id. ``mobilenetv3`` is the torchvision default and is
+# deliberately NOT here; it is the pre-existing, already-benchmarked encoder.
+TIMM_ENCODERS: Dict[str, str] = {
+    # MobileNetV4 (2024) — the direct successor to MobileNetV3. Universal
+    # Inverted Bottleneck blocks, searched with on-NPU latency in the loop.
+    # 5 taps at strides 2..32, so it is a drop-in for MobileNetV3-Large.
+    "mobilenetv4_s": "mobilenetv4_conv_small",
+    "mobilenetv4_m": "mobilenetv4_conv_medium",
+    "mobilenetv4_hybrid_m": "mobilenetv4_hybrid_medium",
+    # EfficientViT (MIT) — ReLU *linear* attention, so cost stays O(n) in tokens
+    # instead of O(n^2); designed for high-resolution dense prediction on edge
+    # hardware. NB: 4 taps at strides 4..32 (no stride-2 feature).
+    "efficientvit_b1": "efficientvit_b1",
+    "efficientvit_b2": "efficientvit_b2",
+}
+
+ENCODER_NAMES: Tuple[str, ...] = ("mobilenetv3",) + tuple(TIMM_ENCODERS)
+
+
+def build_encoder(name: str = "mobilenetv3", pretrained: bool = True,
+                  in_channels: int = 3) -> nn.Module:
+    """Encoder factory. ``name`` is one of :data:`ENCODER_NAMES`.
+
+    ``mobilenetv3`` is the default and the encoder every result recorded in this
+    repo before 2026-08 was measured with — keep it for like-for-like
+    comparisons. The rest need ``timm`` (see requirements.txt).
+    """
+    if name == "mobilenetv3":
+        return MobileNetV3Encoder(pretrained=pretrained, in_channels=in_channels)
+    if name in TIMM_ENCODERS:
+        return TimmEncoder(TIMM_ENCODERS[name], pretrained=pretrained, in_channels=in_channels)
+    raise ValueError(f"Unknown encoder {name!r}; expected one of {ENCODER_NAMES}")
+
+
 # --------------------------------------------------------------------------- #
-# Decoder block
+# Decoder building blocks
 # --------------------------------------------------------------------------- #
 class _ConvBNAct(nn.Sequential):
+    """Dense 3x3 conv -> BN -> ReLU. Costs ``HW * c_in * c_out * 9`` MAC."""
+
     def __init__(self, c_in: int, c_out: int) -> None:
         super().__init__(
             nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
@@ -174,8 +266,42 @@ class _ConvBNAct(nn.Sequential):
         )
 
 
+class _SepConvBNAct(nn.Sequential):
+    """Depthwise-separable 3x3: DW -> BN -> ReLU -> PW 1x1 -> BN -> ReLU.
+
+    Costs ``HW * c_in * (9 + c_out)`` MAC against the dense block's
+    ``HW * c_in * c_out * 9`` — a ``1/9 + 1/c_out`` fraction, so ~8.7x cheaper
+    at ``c_out=256`` and ~7.2x at ``c_out=32``. The depthwise conv keeps the 3x3
+    spatial receptive field; only the channel mixing is factored out into the
+    1x1, which is the trade MobileNet's segmentation heads already make.
+    """
+
+    def __init__(self, c_in: int, c_out: int) -> None:
+        super().__init__(
+            nn.Conv2d(c_in, c_in, 3, padding=1, groups=c_in, bias=False),
+            nn.BatchNorm2d(c_in),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_in, c_out, 1, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.ReLU(inplace=True),
+        )
+
+
+DECODER_BLOCKS: Dict[str, Callable[[int, int], nn.Module]] = {
+    "dense": _ConvBNAct,
+    "separable": _SepConvBNAct,
+}
+
+
 class DecoderBlock(nn.Module):
-    """Upsample the decoder feature, GCG-gate the skip, concat, then fuse."""
+    """Upsample the decoder feature, GCG-gate the skip, concat, then fuse.
+
+    ``skip_channels=0`` builds a skip-less stage that only upsamples and fuses.
+    That is needed for encoders whose finest tap is coarser than stride 2
+    (EfficientViT starts at 4), where the decoder must cover the remaining
+    octave to full resolution on its own. Skip-less stages carry no GCG block,
+    since there is no skip to gate.
+    """
 
     def __init__(
         self,
@@ -183,27 +309,33 @@ class DecoderBlock(nn.Module):
         skip_channels: int,
         out_channels: int,
         gcg_factory: Optional[Callable[[int, int], nn.Module]] = None,
+        block: str = "dense",
     ) -> None:
         super().__init__()
-        self.gcg = gcg_factory(skip_channels, in_channels) if gcg_factory else None
+        conv = DECODER_BLOCKS[block]
+        self.has_skip = skip_channels > 0
+        self.gcg = gcg_factory(skip_channels, in_channels) if (gcg_factory and self.has_skip) else None
         self.fuse = nn.Sequential(
-            _ConvBNAct(in_channels + skip_channels, out_channels),
-            _ConvBNAct(out_channels, out_channels),
+            conv(in_channels + skip_channels, out_channels),
+            conv(out_channels, out_channels),
         )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        if self.gcg is not None:
-            skip = self.gcg(skip, x)          # guided gating, guide = upsampled decoder feat
-        x = torch.cat([x, skip], dim=1)
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if skip is not None:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            if self.gcg is not None:
+                skip = self.gcg(skip, x)      # guided gating, guide = upsampled decoder feat
+            x = torch.cat([x, skip], dim=1)
+        else:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         return self.fuse(x)
 
 
 # --------------------------------------------------------------------------- #
-# U-Net with MobileNetV3 encoder + GCG-gated skips
+# U-Net with a mobile encoder + GCG-gated skips
 # --------------------------------------------------------------------------- #
 class GCGUNet(nn.Module):
-    """2D U-Net (MobileNetV3-Large encoder) with GCG-gated skip connections.
+    """2D U-Net (mobile encoder) with GCG-gated skip connections.
 
     Parameters
     ----------
@@ -211,6 +343,16 @@ class GCGUNet(nn.Module):
     pretrained  : load ImageNet weights into the encoder. **Defaults to True** —
                   see :class:`MobileNetV3Encoder` for why scratch training is
                   the opt-in case, not the default.
+    encoder     : backbone name from :data:`ENCODER_NAMES`. Default
+                  ``mobilenetv3`` reproduces every prior result in this repo.
+    decoder     : ``"dense"`` (the original) or ``"separable"`` (mobile-first,
+                  depthwise-separable fuse convs). ``"separable"`` also switches
+                  ``lateral_channels`` on by default.
+    lateral_channels : if >0, 1x1-project the deepest encoder feature to this
+                  many channels before the decoder consumes it. Kills the
+                  ``960+112 -> 256`` dense 3x3 that is 23% of the default net.
+                  ``None`` means "pick by ``decoder``"; pass an int (or 0) to
+                  ablate this independently of the block type.
     decoder_channels : channel widths of the 5 decoder stages (coarse->fine).
     use_gcg     : insert GCG blocks on the skip connections.
     gcg_factory : custom ``(skip_ch, guide_ch) -> nn.Module``; defaults to
@@ -222,13 +364,25 @@ class GCGUNet(nn.Module):
         num_classes: int = 1,
         in_channels: int = 3,
         pretrained: bool = True,
+        encoder: str = "mobilenetv3",
+        decoder: str = "dense",
+        lateral_channels: Optional[int] = None,
         decoder_channels: Sequence[int] = (256, 128, 64, 32, 16),
         use_gcg: bool = True,
         gcg_factory: Optional[Callable[[int, int], nn.Module]] = None,
     ) -> None:
         super().__init__()
-        self.encoder = MobileNetV3Encoder(pretrained=pretrained, in_channels=in_channels)
-        enc_ch = self.encoder.out_channels            # [16, 24, 40, 112, 960]
+        if decoder not in DECODER_BLOCKS:
+            raise ValueError(f"decoder must be one of {tuple(DECODER_BLOCKS)}, got {decoder!r}")
+        self.encoder = build_encoder(encoder, pretrained=pretrained, in_channels=in_channels)
+        enc_ch = list(self.encoder.out_channels)          # finest -> coarsest
+        reductions = list(self.encoder.reductions)
+        conv = DECODER_BLOCKS[decoder]
+
+        # Default the lateral projection on for the separable decoder: it is what
+        # makes stage 0 cheap, and leaving it off would understate the win.
+        if lateral_channels is None:
+            lateral_channels = decoder_channels[0] if decoder == "separable" else 0
 
         if use_gcg:
             factory = gcg_factory or (lambda s, g: GuidedContextGating(s, g))
@@ -236,39 +390,81 @@ class GCGUNet(nn.Module):
             factory = None
 
         dec = list(decoder_channels)
-        # Decoder consumes encoder stages coarse->fine; skips are the 4 shallower stages.
-        # x starts as the deepest feature (enc_ch[-1]).
-        skips = [enc_ch[3], enc_ch[2], enc_ch[1], enc_ch[0]]   # s16, s8, s4, s2
-        ins = [enc_ch[4], dec[0], dec[1], dec[2]]
-        outs = [dec[0], dec[1], dec[2], dec[3]]
-        self.decoders = nn.ModuleList([
-            DecoderBlock(ins[i], skips[i], outs[i], gcg_factory=factory)
-            for i in range(4)
-        ])
+        # One width per skip-fusing stage, one per skip-less octave needed to
+        # reach stride 2, plus one for the full-resolution stage.
+        n_octaves = max(reductions[0].bit_length() - 2, 0)   # stride 2 -> 0, 4 -> 1, 8 -> 2
+        n_needed = (len(enc_ch) - 1) + n_octaves + 1
+        if len(dec) < n_needed:
+            raise ValueError(
+                f"decoder_channels needs >= {n_needed} entries for a "
+                f"{len(enc_ch)}-tap encoder starting at stride {reductions[0]}, "
+                f"got {len(dec)}")
 
-        # Full-resolution path. The MobileNetV3 encoder's shallowest tap is at
-        # stride 2 (H/2), so without this the decoder's finest learned features
-        # are half-res and the head just bilinearly upsamples them -> tiny lesions
+        # Optional 1x1 reduction of the deepest feature. Both MobileNetV3-L and
+        # MobileNetV4 emit 960 channels at stride 32; feeding that straight into
+        # the decoder is the single most expensive op in the network.
+        deep_ch = enc_ch[-1]
+        if lateral_channels:
+            self.lateral = nn.Sequential(
+                nn.Conv2d(deep_ch, lateral_channels, 1, bias=False),
+                nn.BatchNorm2d(lateral_channels),
+                nn.ReLU(inplace=True),
+            )
+            deep_ch = lateral_channels
+        else:
+            self.lateral = None
+
+        # Decoder consumes encoder stages coarse->fine; skips are the shallower
+        # taps. x starts as the (optionally projected) deepest feature.
+        skips = enc_ch[-2::-1]                      # e.g. [112, 40, 24, 16]
+        ins = [deep_ch] + dec[:len(skips) - 1]
+        self.decoders = nn.ModuleList([
+            DecoderBlock(ins[i], skips[i], dec[i], gcg_factory=factory, block=decoder)
+            for i in range(len(skips))
+        ])
+        cur_ch = dec[len(skips) - 1]
+        cur_red = reductions[0]                     # stride we have reached
+
+        # Cover any octaves between the encoder's finest tap and stride 2 with
+        # skip-less upsample stages (EfficientViT's finest tap is stride 4).
+        mid: List[nn.Module] = []
+        next_dec = len(skips)
+        while cur_red > 2:
+            out_ch = dec[next_dec]
+            mid.append(DecoderBlock(cur_ch, 0, out_ch, gcg_factory=None, block=decoder))
+            cur_ch, cur_red, next_dec = out_ch, cur_red // 2, next_dec + 1
+        self.mid_ups = nn.ModuleList(mid) if mid else None
+
+        # Full-resolution path. The encoder's shallowest tap is at stride >= 2,
+        # so without this the decoder's finest learned features are half-res and
+        # the head just bilinearly upsamples them -> tiny lesions
         # (microaneurysms, ~1-2 px) are unrecoverable. The stem is a stride-1
         # feature of the input; the final decoder stage upsamples to full res and
         # fuses it (gated like the others) so the head runs at full resolution.
-        stem_ch = dec[4]
+        #
+        # The stem's first conv stays dense: it reads 3 input channels, where a
+        # depthwise factorisation would save ~nothing and cost representation.
+        stem_ch = dec[-1]
         self.stem = nn.Sequential(
             _ConvBNAct(in_channels, stem_ch),
-            _ConvBNAct(stem_ch, stem_ch),
+            conv(stem_ch, stem_ch),
         )
-        self.up_full = DecoderBlock(dec[3], stem_ch, dec[4], gcg_factory=factory)
-        self.head = nn.Conv2d(dec[4], num_classes, kernel_size=1)
+        self.up_full = DecoderBlock(cur_ch, stem_ch, dec[-1],
+                                    gcg_factory=factory, block=decoder)
+        self.head = nn.Conv2d(dec[-1], num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_hw = x.shape[-2:]
-        stem = self.stem(x)                       # full-resolution features [B, dec4, H, W]
-        s2, s4, s8, s16, s32 = self.encoder(x)
-        d = s32
-        d = self.decoders[0](d, s16)
-        d = self.decoders[1](d, s8)
-        d = self.decoders[2](d, s4)
-        d = self.decoders[3](d, s2)               # H/2
+        stem = self.stem(x)                       # full-resolution features
+        feats = self.encoder(x)                   # finest -> coarsest
+        d = feats[-1]
+        if self.lateral is not None:
+            d = self.lateral(d)
+        for i, block in enumerate(self.decoders):
+            d = block(d, feats[-2 - i])
+        if self.mid_ups is not None:
+            for block in self.mid_ups:
+                d = block(d)                      # skip-less octave
         d = self.up_full(d, stem)                 # -> full res, learned conv at H x W
         logits = self.head(d)
         if logits.shape[-2:] != input_hw:         # safety for odd input sizes
@@ -282,31 +478,94 @@ def build_model(
     pretrained: bool = True,
     use_gcg: bool = True,
     gcg_factory: Optional[Callable[[int, int], nn.Module]] = None,
+    encoder: str = "mobilenetv3",
+    decoder: str = "dense",
+    lateral_channels: Optional[int] = None,
 ) -> nn.Module:
-    """Factory. ``arch='gcg_unet'`` -> MobileNetV3-U-Net with GCG skips.
+    """Factory. ``arch='gcg_unet'`` -> mobile-encoder U-Net with GCG skips.
 
     ``pretrained`` defaults to True — see :class:`MobileNetV3Encoder`. Pass
     False only when a checkpoint is about to overwrite the encoder anyway
     (export/eval) or when scratch init is the point (ablation, overfit test).
+
+    ``encoder`` / ``decoder`` / ``lateral_channels`` default to the original
+    architecture, so callers that do not pass them are unaffected.
     """
     if arch == "gcg_unet":
         return GCGUNet(
             num_classes=num_classes, pretrained=pretrained,
             use_gcg=use_gcg, gcg_factory=gcg_factory,
+            encoder=encoder, decoder=decoder, lateral_channels=lateral_channels,
         )
     raise ValueError(f"Unknown arch {arch!r}")
 
 
+def arch_cfg_from_checkpoint(ck: object) -> Dict[str, object]:
+    """Recover ``encoder`` / ``decoder`` / ``lateral_channels`` from a checkpoint.
+
+    ``train_idrid.py`` records ``vars(args)`` under ``"args"``, so a checkpoint
+    knows which architecture it was trained with. Eval and export read it from
+    there instead of requiring the caller to remember matching flags — a
+    mismatch would otherwise surface as a silent pile of missing/unexpected keys
+    and a model scoring near chance.
+
+    Checkpoints written before these flags existed carry no record of them and
+    correctly fall back to the original architecture.
+    """
+    cfg: Dict[str, object] = {"encoder": "mobilenetv3", "decoder": "dense",
+                              "lateral_channels": None}
+    saved = ck.get("args") if isinstance(ck, dict) else None
+    if isinstance(saved, dict):
+        cfg["encoder"] = saved.get("encoder", cfg["encoder"])
+        cfg["decoder"] = saved.get("decoder", cfg["decoder"])
+        lat = saved.get("lateral_channels", -1)
+        cfg["lateral_channels"] = None if lat is None or lat < 0 else lat
+    return cfg
+
+
 if __name__ == "__main__":
-    # Tiny self-check (no data needed): shapes + one backward pass.
+    # Tiny self-check (no data needed): shapes + one backward pass, for the
+    # original build and each mobile-first variant.
+    def macs_of(net: nn.Module, size: int = 512) -> Tuple[float, float]:
+        """(total GMAC, encoder GMAC) via conv forward hooks."""
+        tally: Dict[str, int] = {}
+
+        def hook(name):
+            def f(m, _i, o):
+                tally[name] = tally.get(name, 0) + (
+                    m.in_channels // m.groups * m.out_channels
+                    * m.kernel_size[0] * m.kernel_size[1] * o.shape[-2] * o.shape[-1])
+            return f
+
+        handles = [m.register_forward_hook(hook(n))
+                   for n, m in net.named_modules() if isinstance(m, nn.Conv2d)]
+        with torch.no_grad():
+            net(torch.randn(1, 3, size, size))
+        for h in handles:
+            h.remove()
+        total = sum(tally.values())
+        enc = sum(v for k, v in tally.items() if k.startswith("encoder"))
+        return total / 1e9, enc / 1e9
+
     torch.manual_seed(0)
-    net = build_model(num_classes=1, pretrained=False, use_gcg=True)
-    n_params = sum(p.numel() for p in net.parameters())
-    x = torch.randn(2, 3, 256, 256)
-    y = net(x)
-    print(f"params: {n_params/1e6:.2f}M  input: {tuple(x.shape)}  output: {tuple(y.shape)}")
-    assert y.shape == (2, 1, 256, 256), y.shape
-    loss = F.binary_cross_entropy_with_logits(y, torch.rand_like(y))
-    loss.backward()
-    print(f"loss: {loss.item():.4f}  backward OK")
+    configs = [
+        ("mobilenetv3", "dense", None),          # the original architecture
+        ("mobilenetv3", "separable", None),
+        ("mobilenetv4_m", "separable", None),
+        ("efficientvit_b1", "separable", None),  # 4-tap encoder (no stride-2)
+    ]
+    base = None
+    for enc_name, dec_name, lat in configs:
+        net = build_model(num_classes=4, pretrained=False, use_gcg=True,
+                          encoder=enc_name, decoder=dec_name, lateral_channels=lat).eval()
+        n_params = sum(p.numel() for p in net.parameters())
+        x = torch.randn(2, 3, 256, 256)
+        y = net(x)
+        assert y.shape == (2, 4, 256, 256), (enc_name, dec_name, y.shape)
+        loss = F.binary_cross_entropy_with_logits(y, torch.rand_like(y))
+        loss.backward()
+        g, ge = macs_of(net)
+        base = base or g
+        print(f"{enc_name:16s} {dec_name:10s} params {n_params/1e6:5.2f}M  "
+              f"{g:6.2f} GMAC @512 (enc {100*ge/g:4.1f}%)  {base/g:4.2f}x cheaper  backward OK")
     print("model.py self-check passed.")
