@@ -82,6 +82,14 @@ def cost_of(label: str, num_classes: int, size: int = 512):
     import torch.nn as nn
     from model_seg import build_model
 
+    # Some cluster CPUs lack the ISA NNPACK wants, and torch then logs a warning
+    # per conv per forward — hundreds of lines that bury the cost table this
+    # function exists to print. We only need shapes here, so turn it off.
+    try:
+        torch.backends.nnpack.set_flags(False)
+    except Exception:                       # noqa: BLE001 - cosmetic only
+        pass
+
     enc, dec, lat = VARIANTS[label]
     net = build_model(arch="gcg_unet", num_classes=num_classes, pretrained=False,
                       use_gcg=True, encoder=enc, decoder=dec,
