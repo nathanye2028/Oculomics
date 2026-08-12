@@ -336,6 +336,12 @@ def main() -> int:
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--nondeterministic", action="store_true",
                    help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
+    p.add_argument("--allow-tf32", action="store_true",
+                   help="Re-enable TF32 convs on Ampere+ (faster, 10-bit mantissa). OFF by "
+                        "default: measured on the overfit test, TF32 drove mobilenetv4_m's "
+                        "MA Dice 0.974 -> 0.000 while HE/EX were unaffected, because MA "
+                        "carries the smallest gradients in the batch. Use only to reproduce "
+                        "a pre-fix run or to measure the speed/accuracy trade deliberately.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
@@ -399,7 +405,8 @@ def main() -> int:
         if is_main:
             print(*a, **k)
 
-    seed_everything(args.seed, deterministic=not args.nondeterministic)             # same on every rank -> identical init & data split
+    seed_everything(args.seed, deterministic=not args.nondeterministic,
+                    allow_tf32=args.allow_tf32)                                     # same on every rank -> identical init & data split
     device = pick_device(local_rank, ddp)
     run_name = args.run_name or default_run_name(args)
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -673,6 +680,7 @@ def main() -> int:
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
                 "datasets": args.datasets, "val_source": val_source,
+                "allow_tf32": args.allow_tf32, "amp": args.amp,
                 "pretrained": not getattr(args, "no_pretrained", False),
                 "init_encoder": args.init_encoder, "init_weights": args.init_weights,
                 "test_dice": test_dice, "test_mean": mean_test,
