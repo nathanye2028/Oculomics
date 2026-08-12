@@ -33,7 +33,12 @@ onnxruntime
 coremltools==9.0
 
 # Connected-component analysis in fgadr_dataset.lesion_retention.
-scipy==1.13.1
+# Deliberately NOT pinned: scikit-learn already requires scipy, and this repo
+# runs on Python 3.9 (macOS dev) and 3.13 (GPU cluster). Pinning 1.13.1 — the
+# newest release with 3.9 wheels — leaves 3.13 with no wheel at all, so pip
+# falls back to a source build that needs OpenBLAS headers and fails, taking
+# the whole requirements install (including timm) down with it.
+scipy>=1.13
 
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
 # tensorboard
