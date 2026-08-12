@@ -29,8 +29,27 @@ import torch.nn.functional as F
 # --------------------------------------------------------------------------- #
 # Reproducibility
 # --------------------------------------------------------------------------- #
-def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
-    """Seed every RNG, and (by default) force deterministic GPU kernels.
+def seed_everything(seed: int = 42, deterministic: bool = True,
+                    allow_tf32: bool = False) -> None:
+    """Seed every RNG, force deterministic GPU kernels, and disable TF32.
+
+    ``allow_tf32=False`` (the default) is a correctness fix, not a style choice.
+    PyTorch enables TF32 for cuDNN convolutions by default on Ampere+, which
+    drops the mantissa from 23 bits to 10. Measured on this repo's overfit test
+    (3 fixed IDRiD patches, MA=463 px, mobilenetv4_m, identical seed/LR):
+
+        TF32 on   -> MA Dice 0.000  (collapses to all-background by step 150)
+        TF32 off  -> MA Dice 0.974
+
+    Microaneurysms are the sparsest class and therefore carry the smallest
+    gradients in the batch, so they are the first thing reduced precision
+    destroys — and they are the lesion the project most needs. MobileNetV3
+    happens to tolerate TF32 in this test and MobileNetV4 does not, so the
+    failure is architecture-dependent and will not announce itself; it just
+    looks like "that backbone can't learn MA".
+
+    Re-enable only with a measured reason, and never for a run whose MA number
+    you intend to report.
 
     ``deterministic`` matters more than it looks. Seeding Python/NumPy/PyTorch
     is NOT sufficient on CUDA: cuDNN autotunes and picks non-deterministic
@@ -47,6 +66,11 @@ def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Precision, independent of determinism: TF32 silently zeroes the smallest
+    # gradients in the batch, which on this task means the microaneurysm channel.
+    # Set before any CUDA work so the first conv already sees it.
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     if deterministic:
         # cuDNN: fixed algorithm choice, no autotuning.
         torch.backends.cudnn.deterministic = True
