@@ -76,7 +76,13 @@ def test_default_build_is_the_original_architecture():
     assert w.kernel_size == (3, 3) and w.groups == 1
 
 
-def test_separable_decoder_is_cheaper_and_trains():
+def test_separable_decoder_cuts_macs_and_trains():
+    """Guards the MAC/param reduction only.
+
+    Deliberately NOT a latency claim: measured Core ML latency is 9.2 ms vs the
+    dense decoder's 9.0 ms at 512x512 (bandwidth-bound). See model_seg's module
+    docstring.
+    """
     dense = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=True)
     sep = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=True,
                       decoder="separable")
@@ -89,8 +95,7 @@ def test_separable_decoder_is_cheaper_and_trains():
     first = sep.decoders[0].fuse[0][0]
     assert first.groups == first.in_channels and first.kernel_size == (3, 3)
 
-    # The whole point: a large MAC reduction. Measured 4.33x at 512x512.
-    ratio = _conv_macs(dense) / _conv_macs(sep)
+    ratio = _conv_macs(dense) / _conv_macs(sep)     # 4.33x at 512x512
     assert ratio > 3.0, f"expected >3x MAC reduction, got {ratio:.2f}x"
     assert sum(p.numel() for p in sep.parameters()) < sum(p.numel() for p in dense.parameters())
 

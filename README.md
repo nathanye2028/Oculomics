@@ -19,7 +19,7 @@ PyTorch pipeline for diabetic-retinopathy work on fundus images, built around tw
 | `model.py` | `MBRSETClassifier` — MobileNetV3-Small + custom head (multiclass/multilabel/regression) |
 | `train.py` | Classification trainer — CrossEntropy + Adam, val tracking (acc/F1/**kappa**), best-checkpoint, file+CSV logging |
 | `test_loader.py`, `test_classifier.py` | One-batch smoke tests for the classification path |
-| `model_seg.py` | `GCGUNet` — MobileNetV3-Large U-Net with GCG-gated skips (`gcg_factory` injectable) |
+| `model_seg.py` | `GCGUNet` — mobile-encoder U-Net with GCG-gated skips (`gcg_factory` injectable); `--encoder` / `--decoder` / `--lateral-channels` select the backbone and decoder style |
 | `unet_baseline.py` | Vanilla U-Net — *standard-architecture reference* (NOT the GCG control) |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop in your custom block here |
 | `idrid_dataset.py` | `IDRiDSegDataset` — real IDRiD lesion masks → multi-label `[C,H,W]`, FOV crop, native-res patches |
@@ -62,6 +62,58 @@ torchrun --nproc_per_node=4 train_idrid.py --arch gcg_unet --amp \
 Add your block to `gcg_blocks.py` implementing `forward(skip, guide) -> skip-shaped`,
 register it in `GCG_VARIANTS`, then benchmark with the *same* harness:
 `run_experiment.py --gcg-variant <name>`.
+
+## Mobile cost: what is actually true (measured, 2026-08-11)
+
+The deployment claim is the point of this project, so the numbers matter more
+than the intuitions. Profiling `model_seg.GCGUNet` at 512×512 gives **14.09
+GMAC**, split **encoder 7.9% / decoder 92.1%** — MobileNetV3-Large was chosen
+for mobile and then paired with a decoder costing 12× the backbone.
+
+Optimising that away **does not work**. Core ML fp16 at 512×512 on Apple
+silicon, median of 60 runs after 10 warmups:
+
+| config | GMAC | ANE median | CPU median | params |
+|---|---|---|---|---|
+| `mobilenetv3 / dense` (default) | 14.09 | **9.0 ms** | 46.5 ms | 6.84M |
+| `mobilenetv3 / separable` | 3.26 | 9.2 ms | 46.6 ms | 3.53M |
+| `mobilenetv3 / dense --lateral-channels 256` | 12.41 | **8.4 ms** | **40.3 ms** | 5.38M |
+| `mobilenetv4_m / separable` | 6.86 | 9.3 ms | 83.5 ms | 7.84M |
+| `efficientvit_b1 / separable` | 4.61 | 12.7 ms | 61.2 ms | 5.05M |
+
+**A 4.33× MAC reduction bought 0% latency.** The network is memory-bandwidth-
+bound, not compute-bound: activations dominate at this resolution, and
+depthwise-separable convs trade arithmetic for an extra intermediate activation.
+Three things follow:
+
+1. **Do not justify an architecture change here with FLOPs/MACs.** Export and
+   time it — `export_coreml.py` is the ground truth. The 135 ms in
+   `edge_export/seg_edge_metrics.json` is ONNX-INT8 on **CPU** and is ~15× the
+   real Core ML figure; it must not be quoted as the deployment latency.
+2. **There is large latency headroom, so spend it on resolution** — the lever
+   that actually matters for ~1–2 px microaneurysms. Same config, ANE median:
+   512 → 7.8 ms, 768 → 21.6 ms, 1024 → 34.3 ms, 1280 → 48.3 ms.
+3. `--lateral-channels 256` is the one cost knob that won on both paths
+   (1.07× ANE, 1.15× CPU, −1.46M params), because it cuts activation *traffic*
+   (960 → 256 channels at stride 32), not just arithmetic.
+
+GCG itself costs **3.9% of MACs** — worth reporting alongside its Dice delta.
+
+```bash
+# recommended cost config (also the only one that measured faster on both paths)
+python train_idrid.py --decoder dense --lateral-channels 256 --patch-size 512 ...
+
+# modern encoders (need timm; pick for ACCURACY — neither is faster)
+python train_idrid.py --encoder mobilenetv4_m ...
+python train_idrid.py --encoder efficientvit_b1 ...
+
+# re-measure any variant end to end
+python export_coreml.py --image-size 512 --quantize fp16 --decoder separable
+```
+
+Defaults are unchanged (`mobilenetv3` / `dense` / no projection), so every
+checkpoint in `checkpoints/` and `exp_*/` still loads and all prior results stay
+reproducible — `tests/test_models.py` guards this.
 
 ## Classification training
 

@@ -23,31 +23,69 @@ Design constraints (per project spec)
 The model returns per-pixel logits of shape ``[B, num_classes, H, W]`` at the
 input resolution (single-channel for binary lesion-vs-background).
 
-Where the mobile budget actually goes
--------------------------------------
+Where the mobile budget actually goes  (MEASURED — read before optimising)
+--------------------------------------------------------------------------
 Profiling the default (MobileNetV3-Large, dense decoder) at 512x512 gives
-**14.09 GMAC**, split encoder **7.9%** / decoder **92.1%**. The mobile cost of
-this network is almost entirely the decoder, not the backbone that was chosen
-for being mobile-friendly. Two knobs address that directly:
+**14.09 GMAC**, split encoder **7.9%** / decoder **92.1%**. So on paper the
+decoder is the whole mobile cost. **On the actual Core ML deployment path that
+turns out not to matter at all**, and the numbers below are the reason this
+module keeps the dense decoder as the default.
+
+Core ML fp16 at 512x512, Apple silicon, median of 60 runs after 10 warmups
+(``ComputeUnit.ALL`` = ANE/GPU eligible; ``CPU_ONLY`` for the fallback path):
+
+===============================  =====  =======  =======  =======
+config                            GMAC  ANE med  CPU med   params
+===============================  =====  =======  =======  =======
+mobilenetv3 / dense (default)    14.09    9.0 ms  46.5 ms   6.84M
+mobilenetv3 / separable           3.26    9.2 ms  46.6 ms   3.53M
+mobilenetv3 / dense + lat=256    12.41    8.4 ms  40.3 ms   5.38M
+mobilenetv4_m / separable         6.86    9.3 ms  83.5 ms   7.84M
+efficientvit_b1 / separable       4.61   12.7 ms  61.2 ms   5.05M
+===============================  =====  =======  =======  =======
+
+**A 4.33x MAC reduction bought 0% latency** — on either compute path. This
+network is memory-bandwidth-bound, not compute-bound: at 512x512 the activation
+tensors dominate, and factoring a dense 3x3 into DW+PW cuts arithmetic while
+*adding* an intermediate activation to write and re-read. Depthwise convs have
+very low arithmetic intensity, so they cannot convert a FLOP win into a time
+win here. (This is precisely why MobileNetV4's authors searched against
+on-device latency instead of FLOPs.)
+
+Practical consequences, in order of importance:
+
+1. **Never justify an architecture change here with MAC counts.** Export it and
+   time it. ``export_coreml.py --benchmark`` is the ground truth; the ONNX-INT8
+   CPU number in ``edge_export/seg_edge_metrics.json`` (135 ms) is ~15x the real
+   Core ML figure and should not be quoted as the deployment latency.
+2. **There is a lot of latency headroom.** ~9 ms at 512x512 means resolution is
+   affordable, and resolution is the lever that matters for microaneurysms
+   (~1-2 px). Same config, ANE median: 512 -> 7.8 ms, 768 -> 21.6 ms,
+   1024 -> 34.3 ms, 1280 -> 48.3 ms.
+3. ``lateral_channels`` is the one cost knob that paid off on both paths
+   (1.07x ANE, 1.15x CPU, and -1.46M params), because it removes activation
+   *traffic* — 960 -> 256 channels at stride 32 — rather than just arithmetic.
+
+The two knobs, both defaulting to the original architecture so that every
+checkpoint under ``checkpoints/`` and ``exp_*/`` still loads:
 
 ``decoder="separable"``
     Replaces each decoder stage's two dense 3x3 convs with depthwise-separable
-    blocks (3x3 DW -> 1x1 PW), the same substitution MobileNetV3's own
-    segmentation heads make. A dense 3x3 ``c_in -> c_out`` costs
-    ``HW*c_in*c_out*9``; the separable form costs ``HW*c_in*(9 + c_out)``, i.e.
-    a ``1/9 + 1/c_out`` fraction — ~8.7x cheaper at ``c_out=256``.
+    blocks (3x3 DW -> 1x1 PW). Cuts MACs ~8.7x per stage at ``c_out=256`` and
+    params by half. Retained because it is the instrument that established the
+    result above, and because on a compute-bound target (some Android NPUs, or
+    a CPU-only fallback with better depthwise kernels) it may yet pay — but on
+    Apple silicon it does not. Not recommended as a default.
 
 ``lateral_channels=N``
     1x1-projects the deepest encoder feature (960ch for both MobileNetV3-L and
-    MobileNetV4) down to ``N`` before the decoder consumes it. Without this,
-    decoder stage 0 fuses ``960 + 112 = 1072`` channels through a 256-wide 3x3
-    and single-handedly costs 23% of the whole network.
+    MobileNetV4) down to ``N`` before the decoder consumes it. Without it,
+    decoder stage 0 fuses ``960 + 112 = 1072`` channels through a 256-wide 3x3,
+    23% of the network's MACs. **This is the one to use**:
+    ``--decoder dense --lateral-channels 256``.
 
-Both default to OFF so the default build is byte-identical to the pre-existing
-architecture and every checkpoint under ``checkpoints/`` and ``exp_*/`` still
-loads. ``decoder="separable"`` turns both on (the projection is what makes the
-separable decoder's cheapest stage cheap); pass ``lateral_channels`` explicitly
-to ablate them apart.
+``decoder="separable"`` switches ``lateral_channels`` on by default; pass
+``lateral_channels`` explicitly to ablate the two apart.
 """
 from __future__ import annotations
 
@@ -274,6 +312,12 @@ class _SepConvBNAct(nn.Sequential):
     at ``c_out=256`` and ~7.2x at ``c_out=32``. The depthwise conv keeps the 3x3
     spatial receptive field; only the channel mixing is factored out into the
     1x1, which is the trade MobileNet's segmentation heads already make.
+
+    **That MAC win does not become a latency win on Apple silicon** — measured
+    9.2 ms vs the dense decoder's 9.0 ms at 512x512, and identical on CPU. See
+    the module docstring: this network is bandwidth-bound, and DW+PW writes an
+    extra intermediate activation. Kept for the record and for compute-bound
+    targets; do not reach for it expecting a speedup.
     """
 
     def __init__(self, c_in: int, c_out: int) -> None:
