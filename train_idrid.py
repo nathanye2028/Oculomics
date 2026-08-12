@@ -664,6 +664,11 @@ def main() -> int:
                 "arch": args.arch,
                 "use_gcg": (args.arch == "gcg_unet" and not args.no_gcg),
                 "gcg_variant": (args.gcg_variant if args.arch == "gcg_unet" and not args.no_gcg else None),
+                # Architecture identity, so a results file is self-describing and
+                # an arch sweep can group runs without re-deriving it from flags.
+                "encoder": args.encoder, "decoder": args.decoder,
+                "lateral_channels": args.lateral_channels,
+                "params_m": round(sum(p.numel() for p in module.parameters()) / 1e6, 4),
                 "seed": args.seed, "epochs": args.epochs,
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
