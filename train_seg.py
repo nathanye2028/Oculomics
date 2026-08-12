@@ -84,7 +84,10 @@ def main() -> int:
                    help="'baseline' = plain U-Net benchmark; 'gcg_unet' = MobileNetV3+GCG.")
     p.add_argument("--base", type=int, default=32, help="Baseline U-Net base channel width.")
     p.add_argument("--no-gcg", action="store_true", help="Disable GCG blocks (gcg_unet ablation).")
-    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--pretrained", action="store_true",
+                   help="Deprecated no-op — ImageNet init is the default now.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Train the encoder from scratch (ablation only).")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -116,7 +119,7 @@ def main() -> int:
     else:
         model = build_model(
             arch="gcg_unet", num_classes=1,
-            pretrained=args.pretrained, use_gcg=not args.no_gcg,
+            pretrained=not args.no_pretrained, use_gcg=not args.no_gcg,
         ).to(device)
         desc = (f"GCG-U-Net (MobileNetV3 enc) "
                 f"{'WITH' if not args.no_gcg else 'NO'} GCG")

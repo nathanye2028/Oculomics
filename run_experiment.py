@@ -71,8 +71,8 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--amp"]
     if args.warmup_epochs > 0:
         cmd += ["--warmup-epochs", str(args.warmup_epochs)]
-    if args.pretrained:
-        cmd += ["--pretrained"]
+    if args.no_pretrained:
+        cmd += ["--no-pretrained"]
     if args.init_encoder:
         cmd += ["--init-encoder", args.init_encoder]
     if args.init_weights:
@@ -137,7 +137,9 @@ def main() -> int:
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="GCG block for the 'gcg' condition (vs the --no-gcg control).")
     p.add_argument("--pretrained", action="store_true",
-                   help="ImageNet-pretrained encoder (strongly recommended: only 54 train images).")
+                   help="Deprecated no-op — ImageNet init is the default now.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Train encoders from scratch in BOTH conditions (ablation only).")
     p.add_argument("--init-encoder", default=None,
                    help="In-domain pretrained encoder weights (from pretrain_encoder.py).")
     p.add_argument("--init-weights", default=None,

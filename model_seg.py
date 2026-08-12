@@ -116,9 +116,17 @@ class MobileNetV3Encoder(nn.Module):
 
     Taps the ``features`` blocks where the spatial resolution halves, yielding
     skip features for a U-Net decoder.
+
+    ``pretrained`` defaults to **True**. Initialisation dominates on datasets
+    this small — ImageNet transfer alone moved mean Dice 0.183 -> 0.387 on IDRiD
+    (see :mod:`pretrain_encoder`), which is larger than any architectural change
+    measured in this project. Training from scratch is the exception and must be
+    asked for explicitly; scripts that immediately load a checkpoint over these
+    weights (export, eval, deployment) pass ``pretrained=False`` to skip the
+    download.
     """
 
-    def __init__(self, pretrained: bool = False, in_channels: int = 3) -> None:
+    def __init__(self, pretrained: bool = True, in_channels: int = 3) -> None:
         super().__init__()
         from torchvision.models import mobilenet_v3_large
 
@@ -200,7 +208,9 @@ class GCGUNet(nn.Module):
     Parameters
     ----------
     num_classes : output channels of the per-pixel logits (1 for binary).
-    pretrained  : load ImageNet weights into the encoder.
+    pretrained  : load ImageNet weights into the encoder. **Defaults to True** —
+                  see :class:`MobileNetV3Encoder` for why scratch training is
+                  the opt-in case, not the default.
     decoder_channels : channel widths of the 5 decoder stages (coarse->fine).
     use_gcg     : insert GCG blocks on the skip connections.
     gcg_factory : custom ``(skip_ch, guide_ch) -> nn.Module``; defaults to
@@ -211,7 +221,7 @@ class GCGUNet(nn.Module):
         self,
         num_classes: int = 1,
         in_channels: int = 3,
-        pretrained: bool = False,
+        pretrained: bool = True,
         decoder_channels: Sequence[int] = (256, 128, 64, 32, 16),
         use_gcg: bool = True,
         gcg_factory: Optional[Callable[[int, int], nn.Module]] = None,
@@ -269,11 +279,16 @@ class GCGUNet(nn.Module):
 def build_model(
     arch: str = "gcg_unet",
     num_classes: int = 1,
-    pretrained: bool = False,
+    pretrained: bool = True,
     use_gcg: bool = True,
     gcg_factory: Optional[Callable[[int, int], nn.Module]] = None,
 ) -> nn.Module:
-    """Factory. ``arch='gcg_unet'`` -> MobileNetV3-U-Net with GCG skips."""
+    """Factory. ``arch='gcg_unet'`` -> MobileNetV3-U-Net with GCG skips.
+
+    ``pretrained`` defaults to True — see :class:`MobileNetV3Encoder`. Pass
+    False only when a checkpoint is about to overwrite the encoder anyway
+    (export/eval) or when scratch init is the point (ablation, overfit test).
+    """
     if arch == "gcg_unet":
         return GCGUNet(
             num_classes=num_classes, pretrained=pretrained,

@@ -64,7 +64,9 @@ def main() -> int:
     print("=" * 60)
     try:
         from model_seg import build_model
-        m = build_model(arch="gcg_unet", num_classes=4, use_gcg=True).to(device)
+        # pretrained=False on purpose: this is a fast hardware check, not a
+        # training run, and it must not block on downloading ImageNet weights.
+        m = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=True).to(device)
         x = torch.randn(2, 3, 256, 256, device=device)
         use_amp = device.type == "cuda"
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(use_amp or device.type == "mps")):

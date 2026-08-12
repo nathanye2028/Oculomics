@@ -257,10 +257,12 @@ def build(args, num_classes, device):
         if not args.no_gcg and args.gcg_variant and args.gcg_variant != "baseline":
             from gcg_blocks import GCG_VARIANTS
             gcg_factory = GCG_VARIANTS[args.gcg_variant]
+        imagenet = not getattr(args, "no_pretrained", False)
         m = build_model(arch="gcg_unet", num_classes=num_classes,
-                        pretrained=args.pretrained, use_gcg=not args.no_gcg,
+                        pretrained=imagenet, use_gcg=not args.no_gcg,
                         gcg_factory=gcg_factory)
         desc = f"GCG-U-Net (MobileNetV3) gcg={variant}"
+        desc += " [imagenet]" if imagenet else " [SCRATCH — no pretraining]"
         # In-domain init: overwrite the ImageNet encoder with one pretrained on
         # RFMiD fundus images (see pretrain_rfmid.py). Fundus features transfer
         # better than natural-image features to a 54-image segmentation task.
@@ -338,7 +340,15 @@ def main() -> int:
     p.add_argument("--gcg-variant", default="baseline",
                    choices=["baseline", "attention", "cbam", "se", "none"],
                    help="Which GCG block to inject (see gcg_blocks.py). 'baseline' = built-in.")
-    p.add_argument("--pretrained", action="store_true")
+    # Pretraining is ON by default: ImageNet transfer alone moved mean Dice
+    # 0.183 -> 0.387 on IDRiD (pretrain_encoder.py), a larger effect than any
+    # architecture change measured here. Scratch training must be asked for.
+    p.add_argument("--pretrained", action="store_true",
+                   help="Deprecated no-op — ImageNet init is now the default. "
+                        "Kept so existing scripts keep working.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Train the encoder from scratch (ablation only). Expect "
+                        "roughly half the Dice of an ImageNet-initialised run.")
     p.add_argument("--init-encoder", default=None,
                    help="Encoder-only weights from pretrain_encoder.py (DDR/RFMiD).")
     p.add_argument("--init-weights", default=None,
@@ -631,6 +641,8 @@ def main() -> int:
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
                 "datasets": args.datasets, "val_source": val_source,
+                "pretrained": not getattr(args, "no_pretrained", False),
+                "init_encoder": args.init_encoder, "init_weights": args.init_weights,
                 "test_dice": test_dice, "test_mean": mean_test,
                 "test_iou": test_iou, "test_iou_mean": mean_iou,
                 "fgadr_test_dice": fgadr_dice,
