@@ -32,6 +32,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS  # noqa: E402
 from fundus_utils import seed_everything, focal_tversky_loss  # noqa: E402
+from model_seg import ENCODER_NAMES  # noqa: E402
 
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
 
@@ -64,9 +65,12 @@ def build(args, C, device):
     if not args.no_gcg and args.gcg_variant != "baseline":
         from gcg_blocks import GCG_VARIANTS
         gcg_factory = GCG_VARIANTS[args.gcg_variant]
+    lat = args.lateral_channels
     m = build_model(arch="gcg_unet", num_classes=C, pretrained=False,
-                    use_gcg=not args.no_gcg, gcg_factory=gcg_factory)
-    return m.to(device), f"GCG-U-Net (gcg={variant})"
+                    use_gcg=not args.no_gcg, gcg_factory=gcg_factory,
+                    encoder=args.encoder, decoder=args.decoder,
+                    lateral_channels=None if lat < 0 else lat)
+    return m.to(device), f"GCG-U-Net ({args.encoder}/{args.decoder}, gcg={variant})"
 
 
 def main() -> int:
@@ -78,6 +82,16 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=400)
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
+    # A new backbone can build cleanly and still fail to LEARN — wrong tap strides,
+    # a skip the decoder never receives, or dead gradients through the gate. Unit
+    # tests catch shapes; only this catches "trains but goes nowhere". Run it per
+    # encoder before committing a 15-run sweep to the queue.
+    p.add_argument("--encoder", default="mobilenetv3", choices=list(ENCODER_NAMES),
+                   help="Backbone under test. NB: efficientvit_* expose 4 taps "
+                        "(strides 4..32), not MobileNet's 5 — worth verifying.")
+    p.add_argument("--decoder", default="dense", choices=["dense", "separable"])
+    p.add_argument("--lateral-channels", type=int, default=-1,
+                   help="-1 = decide from --decoder; 0 = force off; N = project to N.")
     p.add_argument("--base", type=int, default=32)
     p.add_argument("--no-gcg", action="store_true")
     p.add_argument("--gcg-variant", default="baseline",
