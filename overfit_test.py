@@ -16,14 +16,25 @@ We sample patches that *contain lesions* at NATIVE resolution (so even
 microaneurysms are big enough to learn), freeze that exact batch, and train on
 it. We also assert the GCG block's parameters receive non-zero gradients.
 
+It is also the only tool in this repo that reproduces a *numeric-precision*
+failure. TF32 (10-bit mantissa) drove mobilenetv4_m's MA Dice 0.974 -> 0.000
+here while HE/EX were untouched, because microaneurysms are the sparsest class
+and carry the smallest gradients in the batch. ``--amp`` and ``--allow-tf32``
+exist so the exact numeric conditions of a sweep run can be reproduced on three
+patches in minutes, instead of discovered after 15 GPU-hours as "that backbone
+can't learn MA".
+
 Run:
     python overfit_test.py                      # GCG-U-Net, with gating
     python overfit_test.py --no-gcg             # control
     python overfit_test.py --gcg-variant attention
+    python overfit_test.py --encoder mobilenetv4_m --amp     # sweep's numerics
+    python precision_check.py                   # the whole matrix, tabulated
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -98,10 +109,23 @@ def main() -> int:
                    choices=["baseline", "attention", "cbam", "se", "none"])
     p.add_argument("--dice-thresh", type=float, default=0.80,
                    help="Pass bar: mean Dice over present lesions must exceed this.")
+    # --- numeric precision -------------------------------------------------- #
+    # These reproduce a sweep run's arithmetic, not just its architecture. Both
+    # default OFF, i.e. full fp32, which is the reference every Dice number in
+    # this repo should be comparable against.
+    p.add_argument("--amp", action="store_true",
+                   help="Train under fp16 autocast + GradScaler, exactly as train_idrid.py "
+                        "does. fp16 has the same 10-bit mantissa as TF32, so if TF32 broke "
+                        "an encoder's MA channel this is the next thing to rule out.")
+    p.add_argument("--allow-tf32", action="store_true",
+                   help="Re-enable TF32 convs on Ampere+. Known to collapse MA Dice to "
+                        "0.000 on mobilenetv4_m; kept so the failure stays reproducible.")
+    p.add_argument("--json", default=None,
+                   help="Write per-lesion Dice + the precision config to this path.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    seed_everything(args.seed)
+    seed_everything(args.seed, allow_tf32=args.allow_tf32)
     device = pick_device()
     root = args.root
     if root is None:
@@ -129,32 +153,58 @@ def main() -> int:
     print(f"[info] model: {desc}, {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Mirror train_idrid.py exactly: fp16 autocast, GradScaler only on CUDA.
+    amp_on = args.amp and device.type in ("cuda", "mps")
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and device.type == "cuda"))
+    if args.amp and not amp_on:
+        print(f"[warn] --amp ignored on device {device.type} (cuda/mps only)")
+    print(f"[info] precision: amp={'on(fp16)' if amp_on else 'off'}  tf32={args.allow_tf32}")
+
     model.train()
     init_loss = None
     gcg_grad_ok = None
+    # A GradScaler that keeps halving its scale is reporting inf/nan gradients and
+    # silently discarding those steps. With focal-Tversky on a class as sparse as
+    # MA that is a plausible failure mode, and it looks identical to "didn't
+    # learn" unless counted.
+    skipped = 0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
-        logits = model(imgs)
-        loss = focal_tversky_loss(logits, masks)
-        loss.backward()
-        # one-time gradient-flow check through the GCG block
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_on):
+            logits = model(imgs)
+            loss = focal_tversky_loss(logits, masks)
+        scaler.scale(loss).backward()
+        # one-time gradient-flow check through the GCG block. unscale_ first, or
+        # the norm reported is the scaled one (and is a no-op when disabled).
         if gcg_grad_ok is None and not args.no_gcg and args.arch == "gcg_unet":
+            scaler.unscale_(opt)
             gnorm = sum(p.grad.abs().sum().item()
                         for n, p in model.named_parameters()
                         if "gcg" in n and p.grad is not None)
             n_gcg = sum(1 for n, _ in model.named_parameters() if "gcg" in n)
             gcg_grad_ok = (n_gcg > 0 and gnorm > 0)
             print(f"[info] GCG params={n_gcg}, grad-flow {'OK' if gcg_grad_ok else 'FAIL'} (|grad|={gnorm:.3e})")
-        opt.step()
+        prev_scale = scaler.get_scale()
+        scaler.step(opt)
+        scaler.update()
+        if scaler.is_enabled() and scaler.get_scale() < prev_scale:
+            skipped += 1                      # inf/nan grads -> this step applied nothing
         if init_loss is None:
             init_loss = loss.item()
         if step % 50 == 0 or step == 1:
-            dice, present = per_lesion_dice(logits, masks, args.lesions)
+            dice, present = per_lesion_dice(logits.float(), masks, args.lesions)
             shown = "  ".join(f"{l}={dice[l]:.3f}{'*' if present[i] else ''}"
                               for i, l in enumerate(args.lesions))
             print(f"  step {step:4d}  loss={loss.item():.4f}  dice[{shown}]")
+    if skipped:
+        print(f"[warn] GradScaler skipped {skipped}/{args.steps} steps (inf/nan grads under fp16)")
 
-    # final assessment on present lesions
+    # Final assessment in fp32 regardless of --amp (no autocast here): the
+    # question is what the training procedure produced, not whether the eval cast
+    # loses anything. Stays in train() mode so this is comparable to every
+    # pre-existing run of this script — with batch=3, switching to eval() would
+    # swap batch stats for BN running stats and change the number for reasons
+    # that have nothing to do with precision.
     dice, present = per_lesion_dice(model(imgs), masks, args.lesions)
     present_vals = [dice[l] for i, l in enumerate(args.lesions) if present[i]]
     mean_present = sum(present_vals) / max(len(present_vals), 1)
@@ -170,6 +220,24 @@ def main() -> int:
         print(f"GCG gradient flow: {'OK' if gcg_grad_ok else 'FAIL'}")
     print(f"\nRESULT: {'PASS — pipeline can learn the real task' if ok else 'FAIL — investigate (alignment/loss/gradients)'}")
     print("=" * 60)
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({
+                "encoder": args.encoder, "decoder": args.decoder,
+                "lateral_channels": args.lateral_channels,
+                "amp": bool(amp_on), "allow_tf32": bool(args.allow_tf32),
+                "device": device.type, "seed": args.seed, "steps": args.steps,
+                "lesions": args.lesions,
+                "dice": {l: dice[l] for l in args.lesions},
+                "present": {l: bool(present[i]) for i, l in enumerate(args.lesions)},
+                "lesion_pixels": {l: int(pos[i]) for i, l in enumerate(args.lesions)},
+                "mean_present_dice": mean_present,
+                "init_loss": init_loss, "final_loss": final_loss,
+                "scaler_skipped_steps": skipped,
+                "gcg_grad_ok": gcg_grad_ok, "pass": bool(ok),
+            }, f, indent=2)
+        print(f"[info] wrote {args.json}")
     return 0 if ok else 1
 
 
