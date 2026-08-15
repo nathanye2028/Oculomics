@@ -173,12 +173,28 @@ def main() -> int:
             row += note
             L.append(row)
 
-        if ref and results[enc].get("tf32") and "MA" in args.lesions:
-            t = results[enc]["tf32"]
-            if ref["present"].get("MA") and ref["dice"]["MA"] - t["dice"]["MA"] < args.drop_thresh:
-                L.append("  [note] tf32 did NOT reproduce the known MA collapse on this GPU —")
-                L.append("         the positive control is uninformative, so an 'ok' amp row")
-                L.append("         here is weak evidence. Check the card supports TF32.")
+    # The TF32 positive control is a property of the RUN, not of each encoder:
+    # the known collapse is mobilenetv4_m-specific, and mobilenetv3 tolerating
+    # TF32 is the documented, expected outcome. Warning per-encoder would flag
+    # that healthy row as a failed control every time.
+    if "tf32" in modes and "MA" in args.lesions:
+        reproduced = [
+            enc for enc in args.encoders
+            if results[enc].get("fp32") and results[enc].get("tf32")
+            and results[enc]["fp32"]["present"].get("MA")
+            and results[enc]["fp32"]["dice"]["MA"] - results[enc]["tf32"]["dice"]["MA"]
+            > args.drop_thresh
+        ]
+        L.append("")
+        if reproduced:
+            L.append(f"  [control] tf32 reproduced the MA collapse on {', '.join(reproduced)} —")
+            L.append("            the harness detects precision damage, so the 'ok' rows above")
+            L.append("            are meaningful negatives rather than a blind spot.")
+        else:
+            L.append("  [control] tf32 did NOT reproduce the known MA collapse on ANY encoder.")
+            L.append("            Either this card predates TF32 (needs Ampere+) or the harness")
+            L.append("            is not measuring what it claims. Every 'ok' above is then weak")
+            L.append("            evidence — do not clear --amp on the strength of it.")
 
     L.append(f"\n{'-'*78}")
     if suspicious:

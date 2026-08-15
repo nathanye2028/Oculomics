@@ -51,6 +51,24 @@ def seed_everything(seed: int = 42, deterministic: bool = True,
     Re-enable only with a measured reason, and never for a run whose MA number
     you intend to report.
 
+    **This flag is inert whenever ``--amp`` is on** (measured 2026-08-14, A100,
+    ``precision_check.py``). Under fp16 autocast the convolutions run on tensor
+    cores in fp16, and cuDNN's TF32 setting governs only fp32 convolutions, so
+    ``amp`` and ``amp+tf32`` produced bit-identical runs — same loss, same MA
+    Dice, same gradient norm. Two consequences:
+
+      * The TF32 collapse can only bite an **fp32** run. Every sweep command in
+        this repo passes ``--amp``, so those runs were never exposed to it.
+      * fp16 autocast is NOT the same hazard, despite sharing TF32's 10-bit
+        mantissa. Measured on the same test, mobilenetv4_m scored MA 0.991
+        under AMP against 0.987 in fp32, while TF32 gave 0.000. AMP keeps a
+        master copy of the weights in fp32 and rescales the loss; TF32 truncates
+        the accumulation itself with no such protection.
+
+    So: leave TF32 off, and do not extrapolate its failure to AMP. Re-measure
+    with ``precision_check.py`` after any encoder change — the collapse was
+    architecture-dependent, hitting MobileNetV4 and not MobileNetV3.
+
     ``deterministic`` matters more than it looks. Seeding Python/NumPy/PyTorch
     is NOT sufficient on CUDA: cuDNN autotunes and picks non-deterministic
     convolution algorithms, so two runs with the SAME seed diverge. We hit this

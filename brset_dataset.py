@@ -51,10 +51,35 @@ error naming the columns that were present instead.
     quality               -> final_quality     optional; absent in some releases
     artifacts             -> final_artifacts   optional
 
-``patient_sex`` is re-encoded because BRSET uses 1/2 while ``LABEL_REGISTRY["sex"]``
-declares ``num_classes=2`` and passes the raw value through. Feeding it a 2 would
-index past the end of a 2-logit head and crash inside CrossEntropyLoss — or, with
-a wider head, train silently against a class that never occurs.
+Value re-encoding (verified against a real BRSET CSV, n=1619)
+-------------------------------------------------------------
+Renaming the columns is not enough — three of them carry values that mean
+something different from their mBRSET counterparts. All three were caught by
+reading an actual CSV, not the spec, and all three fail *silently* or crash far
+from the cause:
+
+``patient_sex``  1/2 -> 0/1
+    ``LABEL_REGISTRY["sex"]`` declares ``num_classes=2`` and passes the raw value
+    through. A 2 indexes past the end of a 2-logit head and raises inside
+    CrossEntropyLoss with no mention of the CSV.
+
+``quality``  Adequate/Inadequate -> 1/0
+    mBRSET stores yes/no here, and ``dataset._yes_no`` returns 1.0 only for the
+    literal string "yes". Left alone, every BRSET row — gradable or not —
+    becomes 0.0, and the quality head trains against a constant.
+
+``artifacts``  1/2 -> 0/1, **polarity inverted**
+    BRSET's 1/2 follows its focus/illumination/image_field convention where
+    1 = adequate and 2 = inadequate, so 2 means artifacts ARE present. mBRSET's
+    ``final_artifacts="yes"`` also means present. The crosstab that settled it:
+    ``artifacts=2`` occurs only within ``quality=Inadequate`` (7/7). Passed
+    through raw this both crashes on the label 2 and, for every other row, trains
+    "clean image" as "artifacts present".
+
+Only ``sex`` affects the DR tasks; ``quality``/``artifacts`` matter if you use
+the image-quality heads, which is precisely the artifact-resilience angle this
+project cares about, so they are fixed rather than dropped. ``DR_ICDR`` (0-4)
+and ``macular_edema`` (0/1) needed no re-encoding — they already match.
 
 Run this first, on the real CSV, before trusting any of the above:
 
@@ -121,6 +146,57 @@ def _normalise_sex(s: pd.Series) -> pd.Series:
     return s
 
 
+def _normalise_quality(s: pd.Series) -> pd.Series:
+    """BRSET 'Adequate'/'Inadequate' -> 1/0, matching mBRSET's yes/no polarity.
+
+    ``dataset._yes_no`` only recognises the literal "yes", so without this every
+    row lands on 0.0 and the head trains against a constant label — no error, no
+    warning, just an AUROC of 0.5 that looks like a modelling problem.
+    """
+    if s.dtype == object:
+        m = s.astype(str).str.strip().str.lower()
+        return m.map({"adequate": 1.0, "inadequate": 0.0,
+                      "yes": 1.0, "no": 0.0}).astype(float)
+    return _flip_12(s)          # some releases use the 1/2 convention here too
+
+
+def _flip_12(s: pd.Series) -> pd.Series:
+    """BRSET quality-parameter convention 1=adequate / 2=inadequate -> 1/0."""
+    vals = set(pd.unique(s.dropna()))
+    if vals and vals <= {1, 2, 1.0, 2.0}:
+        return (s == 1).astype(float)
+    return s
+
+
+def _normalise_artifacts(s: pd.Series) -> pd.Series:
+    """BRSET artifacts 1/2 -> 0/1 with the polarity INVERTED.
+
+    BRSET follows its focus/illumination convention: 1 = adequate, 2 = inadequate,
+    so 2 is the row that HAS artifacts. mBRSET's ``final_artifacts="yes"`` also
+    means present, so 2 -> 1 and 1 -> 0. Verified on a real CSV: artifacts=2
+    occurred only among quality=Inadequate rows (7/7).
+
+    Get this backwards and the label is not merely wrong, it is anti-correlated
+    with the truth — the model learns to call clean images artifacted.
+    """
+    vals = set(pd.unique(s.dropna()))
+    if vals and vals <= {1, 2, 1.0, 2.0}:
+        return (s == 2).astype(float)
+    if s.dtype == object:
+        m = s.astype(str).str.strip().str.lower()
+        return m.map({"yes": 1.0, "no": 0.0}).astype(float)
+    return s
+
+
+# mBRSET column -> re-encoder, applied after the rename. Keyed on the *destination*
+# name so it reads against the schema dataset.py consumes.
+VALUE_NORMALISERS = {
+    "sex": _normalise_sex,
+    "final_quality": _normalise_quality,
+    "final_artifacts": _normalise_artifacts,
+}
+
+
 def _ensure_ext(files: pd.Series, ext: str) -> pd.Series:
     """Append ``ext`` to filenames that carry no extension.
 
@@ -176,8 +252,9 @@ def load_brset(
 
     if "file" in out.columns:
         out["file"] = _ensure_ext(out["file"], image_ext)
-    if "sex" in out.columns:
-        out["sex"] = _normalise_sex(out["sex"])
+    for col, fn in VALUE_NORMALISERS.items():
+        if col in out.columns:
+            out[col] = fn(out[col])
     if "final_icdr" in out.columns:
         # dataset.py's _icdr_grade does int() on this; a stray string grade would
         # otherwise raise per-row deep inside label vectorisation.
@@ -269,8 +346,23 @@ def main() -> int:
     if "patient" in df.columns:
         print(f"  patients: {df['patient'].nunique()} "
               f"({len(df)/max(df['patient'].nunique(),1):.2f} images/patient)")
-    if "sex" in df.columns:
-        print(f"  sex values after re-encode: {sorted(pd.unique(df['sex'].dropna()))}")
+    # Show every re-encoded column as raw -> adapted. These are the mappings most
+    # likely to be wrong on an unfamiliar release, and the ones that fail quietly.
+    inv = {v: k for k, v in {**REQUIRED_MAP, **OPTIONAL_MAP}.items()}
+    print("\n  VALUE RE-ENCODING (raw -> adapted)")
+    for col in VALUE_NORMALISERS:
+        if col not in df.columns:
+            continue
+        src = inv.get(col, col)
+        raw_vals = sorted(map(str, pd.unique(raw[src].dropna()))) if src in raw.columns else ["?"]
+        new_vals = sorted(pd.unique(df[col].dropna()))
+        print(f"    {src:<14} {str(raw_vals):<34} -> {new_vals}")
+        if len(new_vals) and set(new_vals) - {0.0, 1.0, 0, 1}:
+            print(f"      ^ NOT 0/1 after re-encode. A 2 here crashes CrossEntropyLoss;")
+            print(f"        add a rule to VALUE_NORMALISERS for this release.")
+    print("    ^ verify the POLARITY, not just the range. BRSET's artifacts column")
+    print("      is inverted relative to mBRSET's (2 = present); a silent flip trains")
+    print("      the model to call clean images artifacted.")
 
     if args.images_dir:
         if os.path.isdir(args.images_dir):
