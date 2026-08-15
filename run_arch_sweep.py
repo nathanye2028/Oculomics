@@ -199,6 +199,22 @@ def main() -> int:
                    help="Reuse a results JSON that already exists (resume a partial sweep).")
     args = p.parse_args()
 
+    # Fail on run 0, not run 9. Children are spawned with sys.executable, so
+    # launching this script with the wrong interpreter (conda base instead of
+    # .venv) propagates that interpreter to every run and each one dies on
+    # `import numpy`. Nine identical tracebacks scroll past, then a summary of
+    # NaNs gets written that looks like a completed sweep with missing data.
+    try:
+        import torch                                          # noqa: F401
+    except ImportError as e:
+        venv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python")
+        print(f"[fatal] this interpreter cannot import torch: {sys.executable}\n"
+              f"        ({e})\n"
+              f"        Every run would be spawned with it and fail identically.\n"
+              f"        Re-run with the project venv:\n"
+              f"          {venv} {os.path.basename(__file__)} ...", file=sys.stderr)
+        return 2
+
     variants = [BASELINE] + [v for v in args.variants if v != BASELINE]
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -322,6 +338,16 @@ def main() -> int:
 
     out = "\n".join(L)
     print(out)
+
+    # A summary of NaNs is worse than no summary: it survives on disk, reads like
+    # a finished sweep with missing cells, and there is nothing in the file itself
+    # to say every run crashed. Refuse to write one.
+    if not any(means[v] for v in variants):
+        print(f"\n[fatal] every run failed — refusing to write a summary of NaNs to "
+              f"{args.out_dir}/. Fix the failure above and re-run; the first traceback "
+              f"in this log is the real error.", file=sys.stderr)
+        return 2
+
     with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
         f.write("```\n" + out + "\n```\n")
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
