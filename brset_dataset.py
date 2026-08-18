@@ -278,13 +278,23 @@ def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]
         return {"df": pd.read_csv(csv_path), "images_dir": img_dir,
                 "csv": csv_path, "source": "mbrset"}
     if dataset == "brset":
-        csv_path = os.path.join(root, "labels.csv")
-        # BRSET's image directory is named differently across releases.
+        # The label CSV name varies by release: PhysioNet 1.0.1 ships
+        # labels_brset.csv, the Kaggle mirror ships labels.csv. Hardcoding one
+        # and raising "expected <path>" sends the caller hunting for a file that
+        # is sitting right there under a different name, so try each and name
+        # them all if none match.
+        csv_names = ["labels_brset.csv", "labels.csv", "dataframe_brset.csv"]
+        csv_path = next((os.path.join(root, n) for n in csv_names
+                         if os.path.isfile(os.path.join(root, n))), None)
+        if csv_path is None:
+            found = (sorted(f for f in os.listdir(root) if f.endswith(".csv"))
+                     if os.path.isdir(root) else "<root does not exist>")
+            raise FileNotFoundError(
+                f"no BRSET label CSV under {root}; tried {csv_names}; found {found}")
+        # BRSET's image directory is named differently across releases too.
         candidates = ["fundus_photos", "images", "photos"]
         img_dir = next((os.path.join(root, c) for c in candidates
                         if os.path.isdir(os.path.join(root, c))), os.path.join(root, "fundus_photos"))
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"expected {csv_path}")
         return {"df": load_brset(csv_path, image_ext=image_ext), "images_dir": img_dir,
                 "csv": csv_path, "source": "brset"}
     raise ValueError(f"unknown dataset {dataset!r}; expected 'mbrset' or 'brset'")
