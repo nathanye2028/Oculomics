@@ -239,10 +239,13 @@ def build_transforms(
             # Occlusion (dust / eyelash / reflections); operates on tensors.
             pipeline.append(T.RandomErasing(p=0.25, scale=(0.02, 0.08), ratio=(0.3, 3.3)))
     else:
-        resize_to = (int(round(size[0] * 1.14)), int(round(size[1] * 1.14)))
+        # Full-frame resize, NOT the ImageNet 1.14x-resize + center-crop recipe.
+        # These images are already FOV-cropped tight to the retina, so a center
+        # crop throws away the peripheral ~23% of area — exactly where dot/blot
+        # haemorrhages sit — and evaluates on a narrower view than training's
+        # RandomResizedCrop(scale=(0.85, 1.0)) ever produces.
         pipeline = list(to_tensor) + [
-            T.Resize(resize_to, antialias=True),
-            T.CenterCrop(size),
+            T.Resize(size, antialias=True),
             normalize,
         ]
 

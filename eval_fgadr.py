@@ -64,8 +64,14 @@ def pick_device(explicit: Optional[str] = None) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(path: str, device: torch.device, arch: str, use_gcg: bool):
-    """Load a checkpoint, preferring the lesion list recorded inside it."""
+def load_model(path: str, device: torch.device, arch: str, use_gcg: "bool | None"):
+    """Load a checkpoint, preferring the lesion list recorded inside it.
+
+    ``use_gcg=None`` (the default) reads gating from the checkpoint's recorded
+    args. Trusting a CLI flag here is how a ``--no-gcg`` checkpoint gets scored
+    with randomly-initialised GCG blocks bolted on: strict=False turns the
+    mismatch into a [warn] and the run proceeds on a corrupted model.
+    """
     ck = torch.load(path, map_location="cpu", weights_only=False)
     state = ck.get("model", ck.get("state_dict", ck)) if isinstance(ck, dict) else ck
     lesions = ck.get("lesions") if isinstance(ck, dict) else None
@@ -74,6 +80,15 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: bool):
     else:
         lesions = ["MA", "HE", "EX", "SE"]
         print(f"[warn] checkpoint records no lesion list; assuming {lesions}")
+
+    ck_args = ck.get("args", {}) if isinstance(ck, dict) else {}
+    if use_gcg is None:
+        use_gcg = not ck_args.get("no_gcg", False)
+        print(f"[info] gcg from checkpoint: {'on' if use_gcg else 'off'}")
+    elif "no_gcg" in ck_args and use_gcg == ck_args["no_gcg"]:
+        raise SystemExit(f"[fatal] checkpoint was trained with no_gcg={ck_args['no_gcg']} "
+                         f"but the CLI requests use_gcg={use_gcg}. Drop the flag to use "
+                         f"the recorded setting, or pass a matching checkpoint.")
 
     from model_seg import arch_cfg_from_checkpoint, build_model
     # The checkpoint records which encoder/decoder it was trained with; honour it
@@ -86,6 +101,11 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: bool):
                       use_gcg=use_gcg, **cfg)
     state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
     missing, unexpected = net.load_state_dict(state, strict=False)
+    gcg_mismatch = [k for k in list(missing) + list(unexpected) if "gcg" in k.lower()]
+    if gcg_mismatch:
+        raise SystemExit(f"[fatal] GCG parameter mismatch between checkpoint and built model "
+                         f"(e.g. {gcg_mismatch[:3]}). Scoring would use randomly-initialised "
+                         f"gates; refusing.")
     if missing:
         print(f"[warn] {len(missing)} missing keys, e.g. {missing[:3]}")
     if unexpected:
@@ -130,11 +150,19 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=None, help="Evaluate only the first N images.")
     p.add_argument("--thresh", type=float, default=0.5)
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
-    p.add_argument("--no-gcg", action="store_true")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--no-gcg", dest="gcg", action="store_false",
+                   help="Force gating OFF (default: read from the checkpoint).")
+    g.add_argument("--gcg", dest="gcg", action="store_true",
+                   help="Force gating ON (default: read from the checkpoint).")
+    p.set_defaults(gcg=None)
     p.add_argument("--tiled", action="store_true",
                    help="Infer at native resolution via tiled_predict (slower, fairer to MA).")
     p.add_argument("--tile", type=int, default=512)
-    p.add_argument("--overlap", type=int, default=64)
+    p.add_argument("--overlap", type=int, default=0,
+                   help="Tile overlap. Default 0 matches train_idrid --tile-overlap, so this "
+                        "script reproduces a training run's recorded fgadr_test_dice; the old "
+                        "default of 64 changed stitched seams and gave a different number.")
     p.add_argument("--save-overlays", default=None, metavar="DIR",
                    help="Write side-by-side GT/prediction PNGs here.")
     p.add_argument("--max-overlays", type=int, default=12)
@@ -142,7 +170,7 @@ def main() -> int:
     args = p.parse_args()
 
     device = pick_device(args.device)
-    net, lesions = load_model(args.checkpoint, device, args.arch, not args.no_gcg)
+    net, lesions = load_model(args.checkpoint, device, args.arch, args.gcg)
 
     ds = FGADRSegDataset(args.root, split=args.split, image_size=args.image_size,
                          lesions=lesions, augment=False)
@@ -160,7 +188,11 @@ def main() -> int:
             img_np, gt_np = ds.load_full(i)                       # native resolution
             x = torch.from_numpy(img_np.astype(np.float32).transpose(2, 0, 1) / 255.0)
             x = (x - IMAGENET_MEAN) / IMAGENET_STD
-            probs = tiled_predict(net, x, args.tile, args.overlap, device).cpu()
+            # Same FOV tile-skipping as train_idrid's eval path: corner tiles of
+            # the black frame cost forwards and contribute nothing.
+            fg = torch.from_numpy(img_np.max(axis=2) > 12).to(device)
+            probs = tiled_predict(net, x, args.tile, args.overlap, device,
+                                  fg_map=fg, n_classes=len(lesions)).cpu()
             gt = torch.from_numpy(gt_np.astype(np.float32))
         else:
             x, gt, _ = ds[i]
@@ -196,7 +228,9 @@ def main() -> int:
         print(f"{c:<7}{dice[c]:>8.4f}{iou[c]:>8.4f}{sens[i]:>8.4f}{prec[i]:>8.4f}"
               f"{int(empty_gt[i]):>13}/{n:<4}")
     print("-" * 57)
-    print(f"{'mean':<7}{np.mean(list(dice.values())):>8.4f}{np.mean(list(iou.values())):>8.4f}"
+    # nanmean: dice_iou_from_counts scores a lesion absent from both pred and GT
+    # as NaN (unscoreable), not 0 — averaging in a 0 would deflate the mean.
+    print(f"{'mean':<7}{np.nanmean(list(dice.values())):>8.4f}{np.nanmean(list(iou.values())):>8.4f}"
           f"{sens.mean():>8.4f}{prec.mean():>8.4f}")
 
     # Interpretation hints — the failure modes Dice alone hides.

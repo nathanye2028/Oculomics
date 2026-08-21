@@ -8,7 +8,7 @@ a binary ``Disease_Risk``.
 IMPORTANT: RFMiD ships **image-level labels only — no segmentation masks**. It
 therefore cannot train lesion segmentation. Its value here is *in-domain
 pretraining*: pretrain the MobileNetV3 encoder on these 1,920 retinas
-(:mod:`pretrain_rfmid`), then fine-tune on IDRiD's 54 masked images. Transfer
+(:mod:`pretrain_encoder`), then fine-tune on IDRiD's 54 masked images. Transfer
 from fundus photographs beats ImageNet transfer for a 54-image target task.
 
 Works with either Kaggle mirror (layouts differ slightly); the split dirs and

@@ -1,6 +1,12 @@
 """
 train_seg.py
 ============
+.. deprecated:: 2026-08
+   Superseded: pipeline sanity now lives in ``overfit_test.py`` (real
+   IDRiD data, stronger check) and real training in ``train_idrid.py``.
+   This script trains against PLACEHOLDER masks and must not be used for
+   results.
+
 Baseline trainer + smoke test for the 2D U-Net (MobileNetV3 encoder) with
 GCG-gated skips (:mod:`model`) on retinal fundus images (:mod:`seg_dataset`).
 

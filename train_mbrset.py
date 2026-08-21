@@ -41,6 +41,21 @@ attributable to the pixels once prevalence is accounted for.
 Both datasets flow through the same :class:`dataset.MBRSETDataset` — see
 ``brset_dataset.py`` for why a second loader would confound the comparison.
 
+Training recipe notes (2026-08-20)
+----------------------------------
+* Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
+  behaviour — balanced sampler AND inverse-frequency CE weights — is kept
+  reachable as ``--imbalance both`` but double-corrects: with a 5% positive
+  class the positives were effectively ~10x over-weighted.
+* ``--warmup-epochs 2`` (linear) before cosine decay; AMP auto-on for CUDA;
+  channels_last + non-blocking H2D on CUDA. All of it applies identically to
+  the GCG and control arms, so the contrast is unaffected.
+* ``--ema-decay 0.999`` enables weight EMA; the EMA weights are what get
+  validated, selected and checkpointed (they are what would ship).
+* Val/test images are full-frame resized, not 1.14x + center-cropped — see
+  ``dataset.build_transforms`` for why center-cropping an FOV-cropped fundus
+  throws away the peripheral retina.
+
 Run:
     python train_mbrset.py --root <mBRSET 1.0 dir> --task dr_referable --seed 0
 """
@@ -63,6 +78,33 @@ from dataset import MBRSETDataset, stratified_split      # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
+
+
+class ModelEMA:
+    """Exponential moving average of a model's weights.
+
+    Kept deliberately explicit instead of ``torch.optim.swa_utils.AveragedModel``:
+    with ``use_buffers=False`` that class freezes BatchNorm running stats at the
+    copy point (silently wrong), and with ``use_buffers=True`` it tries to lerp
+    the integer ``num_batches_tracked`` buffer. Here float tensors (params and
+    BN stats) are EMA'd and integer buffers are copied through.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        import copy
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+            else:
+                v.copy_(msd[k])
 
 
 def pick_device() -> torch.device:
@@ -130,6 +172,24 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--warmup-epochs", type=int, default=2,
+                   help="Linear LR warmup epochs before the cosine decay (0 = off). "
+                        "Stabilises the first steps of fine-tuning a pretrained backbone.")
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="CrossEntropy label smoothing (0 = off).")
+    p.add_argument("--imbalance", default="sampler", choices=["sampler", "loss", "both"],
+                   help="How to correct class imbalance. 'sampler' = balanced "
+                        "WeightedRandomSampler (default); 'loss' = inverse-frequency CE "
+                        "weights; 'both' = the old behaviour, which double-corrects "
+                        "(balanced batches AND re-weighted loss) and over-weights the "
+                        "minority class quadratically.")
+    p.add_argument("--ema-decay", type=float, default=0.0,
+                   help="Exponential moving average of weights, evaluated/checkpointed "
+                        "instead of the raw weights (e.g. 0.999). 0 disables. Applied "
+                        "identically to GCG and control, so the contrast stays clean.")
+    p.add_argument("--amp", dest="amp", action="store_true", default=None,
+                   help="Mixed-precision training (default: auto-on for CUDA).")
+    p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--nondeterministic", action="store_true",
                    help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
     p.add_argument("--seed", type=int, default=0)
@@ -185,22 +245,51 @@ def main() -> int:
     print(f"[info] class counts (train): {train_ds.class_counts().tolist()}")
 
     g = torch.Generator(); g.manual_seed(args.seed)
-    sampler = WeightedRandomSampler(train_ds.sample_weights(), num_samples=len(train_ds),
-                                    replacement=True, generator=g)
+    # One imbalance correction, not two: a balanced sampler already delivers
+    # ~uniform class frequency per batch, so adding inverse-frequency CE weights
+    # on top multiplies the corrections (a 5% positive class ends up ~10x
+    # over-weighted) and distorts the loss surface for no gain in AUROC.
+    use_sampler = args.imbalance in ("sampler", "both")
+    use_loss_w = args.imbalance in ("loss", "both")
+    sampler = (WeightedRandomSampler(train_ds.sample_weights(), num_samples=len(train_ds),
+                                     replacement=True, generator=g) if use_sampler else None)
     dl = lambda ds, **kw: DataLoader(ds, batch_size=args.batch_size,
                                      num_workers=args.num_workers, worker_init_fn=seed_worker,
-                                     generator=g, pin_memory=(device.type == "cuda"), **kw)
-    train_loader = dl(train_ds, sampler=sampler)
+                                     generator=g, pin_memory=(device.type == "cuda"),
+                                     persistent_workers=(args.num_workers > 0), **kw)
+    train_loader = dl(train_ds, sampler=sampler, shuffle=(sampler is None), drop_last=True)
     val_loader, test_loader = dl(val_ds, shuffle=False), dl(test_ds, shuffle=False)
     ext_loader = dl(ext_ds, shuffle=False) if ext_ds is not None else None
 
     model = MBRSETClassifier(num_classes=C, pretrained=not args.no_pretrained,
                              use_gcg=not args.no_gcg, gcg_variant=args.gcg_variant).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     print(f"[info] model  : MobileNetV3-Small, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params")
 
-    crit = nn.CrossEntropyLoss(weight=train_ds.class_weights().to(device))
+    # Optional EMA shadow of the weights: the averaged model is what gets
+    # evaluated and checkpointed, so downstream loading is unchanged. Float
+    # buffers (BN running stats) are EMA'd too; integer buffers are copied.
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"[info] ema    : decay={args.ema_decay} (EMA weights are selected/saved)")
+
+    use_amp = args.amp if args.amp is not None else (device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
+    print(f"[info] amp    : {'on' if use_amp else 'off'}  imbalance={args.imbalance}")
+
+    cw = train_ds.class_weights().to(device) if use_loss_w else None
+    crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs))
+    warm = max(0, min(args.warmup_epochs, args.epochs - 1))
+    cos = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs - warm))
+    if warm > 0:
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt, [torch.optim.lr_scheduler.LinearLR(
+                      opt, start_factor=0.1, total_iters=warm), cos],
+            milestones=[warm])
+    else:
+        sched = cos
     csv_log = CSVLogger(os.path.join(args.ckpt_dir, f"{run_name}_metrics.csv"))
 
     best_auroc, best_epoch, since = -1.0, -1, 0
@@ -209,23 +298,46 @@ def main() -> int:
         model.train()
         run, nb = 0.0, 0
         for batch in train_loader:
-            x, y = batch["image"].to(device), batch["label"].to(device)
+            x = batch["image"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
+            if device.type == "cuda":
+                x = x.to(memory_format=torch.channels_last)
             opt.zero_grad(set_to_none=True)
-            loss = crit(model(x), y)
-            loss.backward(); opt.step()
-            run += loss.item(); nb += 1
-        vm = evaluate(model, val_loader, device, C)
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                loss = crit(model(x), y)
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update()
+            if ema is not None:
+                ema.update(model)
+            # Accumulate on-device; a per-step .item() would force a GPU sync
+            # every iteration on a model this small.
+            run = run + loss.detach(); nb += 1
+        run = float(run) / max(nb, 1)                 # one sync per epoch
+        # Selection/checkpointing use the EMA weights when enabled: they are the
+        # weights that would ship, so they are the ones that must win selection.
+        eval_model = ema.ema if ema is not None else model
+        vm = evaluate(eval_model, val_loader, device, C)
+        # NaN-safe selection: a degenerate (single-class) val split makes AUROC
+        # NaN every epoch, and NaN > best is always False — without a fallback
+        # NO checkpoint is ever saved and the final test load crashes, losing
+        # the whole run. Fall back to accuracy so something is always selected.
+        sel = vm["auroc"]
+        if sel != sel:
+            if best_epoch < 0:
+                print("  [warn] val AUROC is NaN (single-class val split?); "
+                      "selecting on accuracy instead")
+            sel = vm["acc"]
         tag = ""
-        if vm["auroc"] > best_auroc:
-            best_auroc, best_epoch, since = vm["auroc"], epoch, 0
-            torch.save({"model": model.state_dict(), "epoch": epoch, "val": vm,
+        if sel > best_auroc:
+            best_auroc, best_epoch, since = sel, epoch, 0
+            torch.save({"model": eval_model.state_dict(), "epoch": epoch, "val": vm,
                         "args": vars(args)}, ckpt)
             tag = "  <- best"
         else:
             since += 1
-        print(f"  epoch {epoch:3d}/{args.epochs}  loss={run/max(nb,1):.4f}  "
+        print(f"  epoch {epoch:3d}/{args.epochs}  loss={run:.4f}  "
               f"val_AUROC={vm['auroc']:.4f} acc={vm['acc']:.3f} kappa={vm['kappa']:.3f}{tag}")
-        csv_log.log({"epoch": epoch, "train_loss": round(run/max(nb,1), 5),
+        csv_log.log({"epoch": epoch, "train_loss": round(run, 5),
                      **{f"val_{k}": round(v, 5) for k, v in vm.items() if k != "n"}})
         sched.step()
         if args.patience and since >= args.patience:
@@ -245,7 +357,7 @@ def main() -> int:
         print(f"\n=== EXTERNAL TEST ({args.external_test_dataset}, out-of-domain) ===")
         print(f"  AUROC={em['auroc']:.4f}  acc={em['acc']:.4f}  macroF1={em['f1']:.4f}  "
               f"kappa={em['kappa']:.4f}  n={em['n']}")
-        print(f"\n  DOMAIN GAP (in-domain minus out-of-domain):")
+        print("\n  DOMAIN GAP (out-of-domain minus in-domain; negative = transfer loses AUROC):")
         print(f"    AUROC {tm['auroc']:.4f} -> {em['auroc']:.4f}   "
               f"delta={em['auroc'] - tm['auroc']:+.4f}")
         print("    NB: one seed. Run >=3 and report mean+/-std, and check the class")

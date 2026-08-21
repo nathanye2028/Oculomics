@@ -40,7 +40,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from fundus_utils import fov_bbox, make_rng, random_patch
+from fundus_utils import dihedral_jitter, fov_bbox, make_rng, random_patch
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -101,6 +101,7 @@ class IDRiDSegDataset(Dataset):
         fg_bias: float = 0.7,
         augment: bool = False,
         seed: int = 42,
+        cache_images: bool = False,
     ) -> None:
         super().__init__()
         if os.path.isdir(os.path.join(root_or_base, "2. All Segmentation Groundtruths")):
@@ -129,6 +130,14 @@ class IDRiDSegDataset(Dataset):
             f for f in os.listdir(self.img_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))
         )
 
+        # Optional per-process decode cache. In patch mode every 512px crop
+        # otherwise costs a full 4288x2848 JPEG decode + C mask decodes + an
+        # fov_bbox scan — the dominant per-item cost over 43 images re-read
+        # thousands of times per run. Masks are bit-packed (÷8 memory); with
+        # persistent DataLoader workers the cache lives across epochs.
+        self.cache_images = cache_images
+        self._cache: Dict[int, Tuple[np.ndarray, np.ndarray, tuple]] = {}
+
     @property
     def num_classes(self) -> int:
         return len(self.lesions)
@@ -147,6 +156,10 @@ class IDRiDSegDataset(Dataset):
 
     def load_full(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """Load FOV-cropped native-resolution (image[H,W,3], masks[C,H,W])."""
+        if self.cache_images and idx in self._cache:
+            img, packed, mshape = self._cache[idx]
+            masks = np.unpackbits(packed, count=int(np.prod(mshape))).reshape(mshape)
+            return img, masks
         fname = self.files[idx]
         stem = os.path.splitext(fname)[0]
         img = np.asarray(Image.open(os.path.join(self.img_dir, fname)).convert("RGB"))
@@ -161,6 +174,9 @@ class IDRiDSegDataset(Dataset):
             r0, r1, c0, c1 = fov_bbox(img)
             img = img[r0:r1, c0:c1]
             masks = masks[:, r0:r1, c0:c1]
+        if self.cache_images:
+            img = np.ascontiguousarray(img)
+            self._cache[idx] = (img, np.packbits(masks), masks.shape)
         return img, masks
 
     def _to_tensors(self, img_np: np.ndarray, masks: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -185,21 +201,9 @@ class IDRiDSegDataset(Dataset):
             ], axis=0)
 
         if self.augment:
-            # Previously a single horizontal flip -- far too weak for 43 training
-            # images. Dihedral (flips + 90-deg rotations) is label-preserving for
-            # lesion masks and gives 8x the effective data; brightness/contrast
-            # jitter mimics the illumination variation of mobile capture.
-            if bool(rng.integers(0, 2)):
-                img_np = img_np[:, ::-1, :].copy(); masks = masks[:, :, ::-1].copy()
-            if bool(rng.integers(0, 2)):
-                img_np = img_np[::-1, :, :].copy(); masks = masks[:, ::-1, :].copy()
-            k = int(rng.integers(0, 4))
-            if k:
-                img_np = np.rot90(img_np, k, axes=(0, 1)).copy()
-                masks = np.rot90(masks, k, axes=(1, 2)).copy()
-            if bool(rng.integers(0, 2)):
-                a = float(rng.uniform(0.85, 1.15))     # contrast
-                b = float(rng.uniform(-18, 18))        # brightness
-                img_np = np.clip(img_np.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
+            # A single horizontal flip is far too weak for 43 training images;
+            # dihedral + jitter (shared across all lesion loaders) gives 8x the
+            # effective data. See fundus_utils.dihedral_jitter.
+            img_np, masks = dihedral_jitter(img_np, masks, rng)
 
         return self._to_tensors(img_np, masks)

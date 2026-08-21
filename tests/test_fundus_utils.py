@@ -35,11 +35,22 @@ def test_random_patch_shape_and_lesion_bias():
     assert mp.sum() > 0       # fg_bias=1.0 -> patch centred on the lesion
 
 
-def test_make_rng_reproducible():
-    a = make_rng(42, 3).random()
-    b = make_rng(42, 3).random()
+def test_make_rng_reproducible_yet_diverse():
+    # Main-process semantics (num_workers=0): successive calls for the SAME
+    # sample must differ (else every epoch replays identical augmentation),
+    # but the whole sequence must replay after re-seeding — reproducibility
+    # is per-run, anchored by seed_everything.
+    seed_everything(42)
+    a1 = make_rng(42, 3).random()
+    a2 = make_rng(42, 3).random()      # "next epoch" fetch of the same sample
     c = make_rng(42, 4).random()
-    assert a == b and a != c
+    assert a1 != a2                     # diverse across epochs
+    assert a1 != c                      # diverse across samples
+
+    seed_everything(42)                 # re-run: exact same sequence
+    b1 = make_rng(42, 3).random()
+    b2 = make_rng(42, 3).random()
+    assert (a1, a2) == (b1, b2)
 
 
 def test_tiled_predict_shape():

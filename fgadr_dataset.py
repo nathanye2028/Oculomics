@@ -74,7 +74,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from fundus_utils import fov_bbox, make_rng, random_patch
+from fundus_utils import dihedral_jitter, fov_bbox, make_rng, random_patch
 from idrid_dataset import DEFAULT_LESIONS
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -192,7 +192,13 @@ class FGADRSegDataset(Dataset):
     fg_bias    : prob. a training patch is centred on a lesion pixel.
     augment    : light joint geometric augmentation (flips).
     test_frac  : held-out fraction for the stratified split.
-    seed       : base seed for reproducible per-sample augmentation and split.
+    seed       : base seed for reproducible per-sample augmentation ONLY.
+    split_seed : seed for the train/val/test partition. Deliberately separate
+                 from ``seed`` and fixed by default: if the partition followed
+                 the run seed, every ``--seeds 0 1 2`` sweep would score each
+                 run on a different "test" set, and ``eval_fgadr.py`` (which
+                 rebuilds the default partition) would evaluate non-default-seed
+                 checkpoints on images they were trained on.
     """
 
     def __init__(
@@ -208,6 +214,7 @@ class FGADRSegDataset(Dataset):
         val_frac: float = 0.1,
         test_frac: float = 0.2,
         seed: int = 42,
+        split_seed: int = 42,
     ) -> None:
         super().__init__()
         for code in lesions:
@@ -239,7 +246,10 @@ class FGADRSegDataset(Dataset):
                   "grade-stratified. Extract it with:\n"
                   f"       unzip -q -o data/FGADR-Seg-set_Release.zip 'Seg-set/{GRADING_CSV}'"
                   " -d data/fgadr")
-        train, val, test = stratified_split(all_files, self.grades, val_frac, test_frac, seed)
+        # NB: split_seed, not seed — the partition must be identical across runs
+        # (see the parameter docstring; a run-seed-coupled split leaks test data
+        # into eval_fgadr.py and makes cross-seed "test" numbers incomparable).
+        train, val, test = stratified_split(all_files, self.grades, val_frac, test_frac, split_seed)
         self.files: List[str] = {
             "train": train, "val": val, "test": test, "all": all_files,
         }[split]
@@ -307,9 +317,10 @@ class FGADRSegDataset(Dataset):
             masks = np.stack([np.asarray(Image.fromarray(masks[c]).resize(size, Image.NEAREST))
                               for c in range(masks.shape[0])], axis=0)
 
-        if self.augment and bool(rng.integers(0, 2)):
-            img_np = img_np[:, ::-1, :].copy()
-            masks = masks[:, :, ::-1].copy()
+        if self.augment:
+            # Shared dihedral+jitter (fundus_utils): the same augmentation as
+            # IDRiD, so no source in a mixed training set is under-augmented.
+            img_np, masks = dihedral_jitter(img_np, masks, rng)
 
         x, m = self._to_tensors(img_np, masks)
         return x, m, self.valid_for(idx)

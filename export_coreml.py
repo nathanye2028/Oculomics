@@ -93,6 +93,11 @@ def load_checkpoint(net: nn.Module, path: Optional[str]) -> bool:
 
     state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in obj.items()}
     missing, unexpected = net.load_state_dict(state, strict=False)
+    gcg_mismatch = [k for k in list(missing) + list(unexpected) if "gcg" in k.lower()]
+    if gcg_mismatch:
+        raise SystemExit(f"[fatal] GCG parameter mismatch between checkpoint and built model "
+                         f"(e.g. {gcg_mismatch[:3]}). Exporting would ship randomly-initialised "
+                         f"gates; refusing.")
     if missing:
         print(f"[warn] {len(missing)} missing keys, e.g. {missing[:3]}")
     if unexpected:
@@ -107,15 +112,25 @@ def build_wrapped(args: argparse.Namespace) -> Tuple[nn.Module, bool]:
     # instead of silently loading into the dense default.
     cfg = {"encoder": args.encoder, "decoder": args.decoder,
            "lateral_channels": None if args.lateral_channels < 0 else args.lateral_channels}
-    if args.checkpoint and os.path.isfile(args.checkpoint) and args.encoder == "auto":
+    use_gcg = not args.no_gcg
+    if args.checkpoint and os.path.isfile(args.checkpoint):
         ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        cfg = arch_cfg_from_checkpoint(ck)
+        if args.encoder == "auto":
+            cfg = arch_cfg_from_checkpoint(ck)
+        # Gating comes from the checkpoint too: exporting a --no-gcg checkpoint
+        # into a GCG-enabled graph would ship randomly-initialised gates AND
+        # benchmark a latency the control checkpoint doesn't have.
+        ck_args = ck.get("args", {}) if isinstance(ck, dict) else {}
+        if "no_gcg" in ck_args and not args.no_gcg:
+            use_gcg = not ck_args["no_gcg"]
+            if not use_gcg:
+                print("[info] gcg: OFF (from checkpoint args)")
     elif args.encoder == "auto":
         cfg["encoder"] = "mobilenetv3"
     print(f"[info] arch: encoder={cfg['encoder']} decoder={cfg['decoder']} "
           f"lateral={cfg['lateral_channels']}")
     net = build_model(arch="gcg_unet", num_classes=args.classes,
-                      pretrained=False, use_gcg=not args.no_gcg, **cfg)
+                      pretrained=False, use_gcg=use_gcg, **cfg)
     trained = load_checkpoint(net, args.checkpoint)
     wrapper = DeployWrapper(net).eval()
     for p in wrapper.parameters():

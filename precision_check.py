@@ -128,9 +128,21 @@ def main() -> int:
         for mode in modes:
             oj = os.path.join(args.out_dir, f"{enc}_{mode}.json")
             if args.skip_existing and os.path.isfile(oj):
-                print(f"[skip] reusing {oj}")
                 with open(oj) as f:
-                    results[enc][mode] = json.load(f)
+                    old_r = json.load(f)
+                # Reuse only when the stored run matches the current config; a
+                # same-named JSON from an older sweep (different steps/patch)
+                # would silently pollute the matrix under the current header.
+                expect = {"steps": args.steps, "encoder": enc,
+                          "patch_size": args.patch_size, "batch_size": args.batch_size}
+                mismatch = {k: (old_r.get(k), want) for k, want in expect.items()
+                            if k in old_r and old_r.get(k) != want}
+                if mismatch:
+                    print(f"[skip-existing] {oj} config differs {mismatch}; re-running")
+                    results[enc][mode] = run_one(args, enc, mode, oj)
+                else:
+                    print(f"[skip] reusing {oj}")
+                    results[enc][mode] = old_r
             else:
                 results[enc][mode] = run_one(args, enc, mode, oj)
 

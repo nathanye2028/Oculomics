@@ -152,7 +152,14 @@ def main() -> int:
     print(f"[info] ckpt   : {args.ckpt}")
     print(f"[info] config : task={task} seed={seed} size={img_size} gcg={'on:'+variant if use_gcg else 'off'}")
 
-    # Rebuild the EXACT split this checkpoint was trained with.
+    # Rebuild the EXACT split this checkpoint was trained with. That claim only
+    # holds if the checkpoint really was trained on mBRSET: a --dataset brset
+    # checkpoint would silently get a *different dataset's* split here.
+    if ca.get("dataset", "mbrset") != "mbrset":
+        raise SystemExit(f"[fatal] checkpoint was trained on dataset={ca['dataset']!r}, but this "
+                         "script reconstructs splits from labels_mbrset.csv only. Re-run with an "
+                         "mBRSET-trained checkpoint (or extend the script to call "
+                         "brset_dataset.load_any with the recorded dataset).")
     splits = stratified_split(os.path.join(args.root, "labels_mbrset.csv"), task=task,
                               val_frac=0.10, test_frac=0.20, group_col="patient", seed=seed)
     img_dir = os.path.join(args.root, "images")
@@ -222,7 +229,11 @@ def main() -> int:
         quant_pre_process(onnx_fp32, prepped)
 
         if args.calib == "sweep":
-            # Try every calibration method and keep whichever preserves AUROC best.
+            # Try every calibration method; select the winner on VAL, never test.
+            # Selecting on test and then reporting that same test AUROC as the
+            # RQ3 number is model selection on the evaluation set — the reported
+            # quantization cost would be optimistically biased.
+            fp32_val_auroc = float(roc_auc_score(vy, vs))
             best_name, best_auc = None, -1.0
             for nm, cm in _CM.items():
                 cand = os.path.join(args.out_dir, f"model_int8_{nm}.onnx")
@@ -231,16 +242,21 @@ def main() -> int:
                                     quant_format=QuantFormat.QDQ, weight_type=QuantType.QInt8,
                                     activation_type=QuantType.QUInt8, per_channel=True,
                                     calibrate_method=cm)
-                    s_, y_ = onnx_scores(cand, test_loader, tta=args.tta)
+                    s_, y_ = onnx_scores(cand, val_loader, tta=args.tta)
                     a = float(roc_auc_score(y_, s_))
-                    print(f"[calib] {nm:<11} INT8 AUROC={a:.4f}  (FP32 {fp32_auroc:.4f}, "
-                          f"delta {a-fp32_auroc:+.4f})")
+                    print(f"[calib] {nm:<11} INT8 val AUROC={a:.4f}  (FP32 val {fp32_val_auroc:.4f}, "
+                          f"delta {a-fp32_val_auroc:+.4f})")
                     if a > best_auc:
                         best_auc, best_name = a, nm
                         os.replace(cand, onnx_int8)
                 except Exception as e:  # noqa
                     print(f"[calib] {nm:<11} FAILED: {str(e)[:60]}")
-            print(f"[calib] best = {best_name} (AUROC {best_auc:.4f})")
+            int8_ok = best_name is not None
+            if int8_ok:
+                print(f"[calib] best = {best_name} (val AUROC {best_auc:.4f}; "
+                      "test evaluated once below)")
+            else:
+                print("[calib] every calibration method failed")
             res["calib_method"] = best_name
         else:
             res["calib_method"] = args.calib

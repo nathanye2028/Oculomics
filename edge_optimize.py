@@ -15,10 +15,12 @@ the project's engineering hook concrete:
 Pipeline: PyTorch model -> ONNX (`torch.onnx.export`) -> INT8 via ONNX Runtime
 dynamic quantization. ONNX Runtime is the realistic CPU/mobile inference path.
 
-Note: this measures the **efficiency axis**, which is meaningful even with
-current weights. The *accuracy-after-quantization* delta (Dice/AUC drop) needs a
-converged checkpoint — pass one with `--weights` once training is done, and the
-same script reports it.
+Note: this measures the **efficiency axis only** — sizes and CPU latencies.
+The *accuracy-after-quantization* delta lives in ``evaluate_deploy.py`` (real
+calibration data, val-calibrated thresholds); this script's INT8 artifact is
+calibrated on RANDOM NOISE and must never be scored for accuracy. Also remember
+the repo policy: ONNX-CPU latency is not the deployment number — that is
+``export_coreml.py`` on the ANE.
 """
 from __future__ import annotations
 
@@ -34,11 +36,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def build(model_kind: str, num_classes: int, encoder: str = "mobilenetv3",
-          decoder: str = "dense", lateral_channels: int = -1):
+          decoder: str = "dense", lateral_channels: int = -1, use_gcg: bool = True):
     if model_kind == "seg":
         from model_seg import build_model
         return build_model(arch="gcg_unet", num_classes=num_classes, pretrained=False,
-                           use_gcg=True, encoder=encoder, decoder=decoder,
+                           use_gcg=use_gcg, encoder=encoder, decoder=decoder,
                            lateral_channels=None if lateral_channels < 0 else lateral_channels)
     from model import build_classifier
     return build_classifier(num_classes=num_classes, pretrained=False)
@@ -99,8 +101,14 @@ def main() -> int:
             torch.load(args.weights, map_location="cpu", weights_only=False))
         enc, dec = str(cfg["encoder"]), str(cfg["decoder"])
         lat = -1 if cfg["lateral_channels"] is None else int(cfg["lateral_channels"])
-        print(f"[info] arch from checkpoint: encoder={enc} decoder={dec} lateral={lat}")
-    model = build(args.model, nc, encoder=enc, decoder=dec, lateral_channels=lat).eval()
+        ck_args = torch.load(args.weights, map_location="cpu", weights_only=False).get("args", {})
+        use_gcg = not ck_args.get("no_gcg", False)
+        print(f"[info] arch from checkpoint: encoder={enc} decoder={dec} lateral={lat} "
+              f"gcg={'on' if use_gcg else 'off'}")
+    else:
+        use_gcg = True
+    model = build(args.model, nc, encoder=enc, decoder=dec, lateral_channels=lat,
+                  use_gcg=use_gcg).eval()
     if args.weights and os.path.exists(args.weights):
         state = torch.load(args.weights, map_location="cpu")
         model.load_state_dict(state.get("model", state))

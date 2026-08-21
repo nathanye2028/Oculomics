@@ -44,7 +44,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from fundus_utils import fov_bbox, make_rng
+from fundus_utils import dihedral_jitter, fov_bbox, make_rng
 from idrid_dataset import DEFAULT_LESIONS
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -184,7 +184,10 @@ class RetLesionDataset(Dataset):
         crop = int(round(min(H, W) * IDRID_PATCH_FRAC)) if self.scale_match else self.patch_size
         crop = max(32, min(crop, H, W))
 
-        fg = masks.any(axis=0) & (valid.numpy()[:, None, None].any() > 0)
+        # Unannotated channels are all-zero by construction, so masks.any() only
+        # fires on annotated lesions. (The previous `& valid...any()` reduced to
+        # a scalar `& True` — it looked per-channel but wasn't.)
+        fg = masks.any(axis=0)
         if self.fg_bias > 0 and fg.sum() > 0 and rng.random() < self.fg_bias:
             ys, xs = np.where(fg)
             k = int(rng.integers(len(ys)))
@@ -203,10 +206,9 @@ class RetLesionDataset(Dataset):
                               for c in range(masks.shape[0])], axis=0)
 
         if self.augment:
-            if bool(rng.integers(0, 2)):
-                img = img[:, ::-1, :].copy(); masks = masks[:, :, ::-1].copy()
-            if bool(rng.integers(0, 2)):
-                img = img[::-1, :, :].copy(); masks = masks[:, ::-1, :].copy()
+            # Shared dihedral+jitter (fundus_utils), same as every other lesion
+            # loader — rot90 applies since crops are square by construction.
+            img, masks = dihedral_jitter(img, masks, rng)
 
         x = torch.from_numpy(img.astype(np.float32).transpose(2, 0, 1) / 255.0)
         x = (x - IMAGENET_MEAN) / IMAGENET_STD

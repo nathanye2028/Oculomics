@@ -264,7 +264,29 @@ def main() -> int:
             rn = f"{v}_seed{s}"
             rj = os.path.join(args.out_dir, f"{rn}.json")
             if args.skip_existing and os.path.isfile(rj):
-                print(f"\n[{i}/{total}] === {rn} === (reusing existing {rj})", flush=True)
+                # Reuse only if the stored run matches the CURRENT config —
+                # a same-named JSON from an older sweep with different
+                # epochs/datasets/loss would silently pollute the paired stats.
+                with open(rj) as f:
+                    old_r = json.load(f)
+                enc, dec, lat = VARIANTS[v]
+                expect = {"epochs": args.epochs, "datasets": args.datasets,
+                          "lesions": args.lesions, "loss": args.loss,
+                          "encoder": enc, "decoder": dec,
+                          "patch_size": (args.patch_size if args.patch_size > 0 else None),
+                          "use_gcg": not args.no_gcg, "seed": s}
+                mismatch = {k: (old_r.get(k), want) for k, want in expect.items()
+                            if old_r.get(k) != want}
+                if mismatch:
+                    print(f"\n[{i}/{total}] === {rn} === existing {rj} was run with a "
+                          f"DIFFERENT config {mismatch}; re-running.", flush=True)
+                    cmd = build_cmd(args, v, s, rj, rn)
+                    if subprocess.run(cmd).returncode != 0 or not os.path.isfile(rj):
+                        print(f"[fail] {rn}")
+                        failures.append(rn)
+                        continue
+                else:
+                    print(f"\n[{i}/{total}] === {rn} === (reusing existing {rj})", flush=True)
             else:
                 cmd = build_cmd(args, v, s, rj, rn)
                 print(f"\n[{i}/{total}] === {rn} ===\n  {' '.join(cmd)}", flush=True)
@@ -281,8 +303,14 @@ def main() -> int:
                 failures.append(rn)
                 continue
             for les in args.lesions:
-                results[v][les][s] = dice.get(les, float("nan"))
-            means[v][s] = sum(dice[k] for k in args.lesions if k in dice) / len(args.lesions)
+                val = dice.get(les, float("nan"))
+                if val == val:                      # skip NaN (lesion absent from split)
+                    results[v][les][s] = val
+            present = [dice[k] for k in args.lesions if k in dice and dice[k] == dice[k]]
+            if len(present) < len(args.lesions):
+                print(f"[warn] {rn}: only {len(present)}/{len(args.lesions)} lesions scoreable; "
+                      "mean is over the scoreable ones")
+            means[v][s] = sum(present) / max(len(present), 1)
 
     # ---- report ------------------------------------------------------------- #
     split_name = "unknown"

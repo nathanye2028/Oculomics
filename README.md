@@ -15,16 +15,20 @@ PyTorch pipeline for diabetic-retinopathy work on fundus images, built around tw
 
 | File | Role |
 |------|------|
-| `dataset.py` | `MBRSETDataset` — classification labels, transforms, FOV crop, class-weight helpers |
-| `model.py` | `MBRSETClassifier` — MobileNetV3-Small + custom head (multiclass/multilabel/regression) |
-| `train.py` | Classification trainer — CrossEntropy + Adam, val tracking (acc/F1/**kappa**), best-checkpoint, file+CSV logging |
+| `dataset.py` | `MBRSETDataset` — classification labels, transforms, FOV crop, class-weight helpers; serves BOTH mBRSET and (via `brset_dataset.py`) BRSET |
+| `brset_dataset.py` | BRSET→mBRSET schema adapter (`load_brset` / `load_any`) + `--inspect` CSV auditor |
+| `model.py` | `MBRSETClassifier` — MobileNetV3-Small + custom head (multiclass/multilabel/regression), optional GCG |
+| `train_mbrset.py` | Classification trainer — AUROC selection, patient-grouped splits, AMP/EMA/warmup, BRSET→mBRSET transfer via `--external-test-root` |
+| `summarize_xfer.py` | Paired GCG-vs-control statistics over the transfer runs |
+| `train.py` | **Deprecated** — superseded by `train_mbrset.py`; kept for reference only |
 | `test_loader.py`, `test_classifier.py` | One-batch smoke tests for the classification path |
 | `model_seg.py` | `GCGUNet` — mobile-encoder U-Net with GCG-gated skips (`gcg_factory` injectable); `--encoder` / `--decoder` / `--lateral-channels` select the backbone and decoder style |
 | `unet_baseline.py` | Vanilla U-Net — *standard-architecture reference* (NOT the GCG control) |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop in your custom block here |
 | `idrid_dataset.py` | `IDRiDSegDataset` — real IDRiD lesion masks → multi-label `[C,H,W]`, FOV crop, native-res patches |
 | `seg_dataset.py` | RFMiD placeholder-mask loader (plumbing only; no real masks) |
-| `train_idrid.py` | Segmentation trainer/benchmark — train/val/test, focal-Tversky, AMP, gradient accumulation, **DDP**, tiled eval, Dice+IoU |
+| `train_idrid.py` | Segmentation trainer/benchmark — train/val/test, focal-Tversky, AMP, gradient accumulation, **DDP**, tiled eval, Dice+IoU+sens/prec |
+| `losses.py` | `lesion_seg` loss (focal Tversky + focal BCE, via `--loss lesion_seg`) + per-class collapse diagnostics |
 | `run_experiment.py` | Orchestrator: sweeps `{GCG, control} × seeds`, prints mean±std comparison table |
 | `fundus_utils.py` | Shared: seeding, worker RNG, FOV crop, losses, tiled inference |
 | `metrics.py` | Quadratic-weighted kappa, Dice/IoU, AUPRC, CSV/TensorBoard logging |
@@ -115,13 +119,27 @@ Defaults are unchanged (`mobilenetv3` / `dense` / no projection), so every
 checkpoint in `checkpoints/` and `exp_*/` still loads and all prior results stay
 reproducible — `tests/test_models.py` guards this.
 
-## Classification training
+## Classification training & the BRSET → mBRSET transfer experiment
 
 ```bash
-python train.py --task dr_grade --epochs 50 --batch-size 32
-tail -f ~/oculomics_project/logs/train_metrics.log    # metrics persisted to disk
+# in-domain: train and test on mBRSET (patient-grouped 70/10/20)
+python train_mbrset.py --root <mBRSET dir> --task dr_referable --seed 0
+
+# the domain-shift experiment: train on BRSET (tabletop), test on mBRSET (smartphone)
+python train_mbrset.py --dataset brset --root <BRSET> \
+    --external-test-root <mBRSET> --external-test-dataset mbrset \
+    --task dr_referable --seed 0 --results-json exp_xfer/gcg_seed0.json
+
+# after >=3 seeds of gcg + nogcg runs:
+python summarize_xfer.py --dir exp_xfer
 ```
-Best weights → `~/oculomics_project/weights/best_model.pt`.
+
+Recipe notes (2026-08-20): imbalance is corrected once (balanced sampler; the
+old sampler+CE-weights double correction is reachable via `--imbalance both`),
+LR warms up 2 epochs then cosine-decays, AMP is auto-on for CUDA, and
+`--ema-decay 0.999` selects/saves EMA weights. Eval images are full-frame
+resized (no center crop — it discarded the peripheral retina). All of this
+applies identically to the GCG and control arms.
 
 ## Tests
 
@@ -142,5 +160,15 @@ Best weights → `~/oculomics_project/weights/best_model.pt`.
 - First real CUDA/DDP run: watch for a DDP `find_unused_parameters` error and fp16
   loss-scaling on the focal-Tversky loss (both one-line fixes).
 - Microaneurysms (MA) are ~0.05% of pixels — expect low Dice unless trained at high
-  resolution via `--patch-size`.
+  resolution via `--patch-size`. With `--eval-tiled`, add `--eval-tiled-val` so
+  checkpoint *selection* also sees native-resolution MA (whole-image val masks are
+  NEAREST-downsampled and erase most 1–2 px lesions).
+- FGADR's train/val/test partition uses a **fixed** `split_seed=42` (2026-08-20),
+  decoupled from `--seed`, so the test set is identical across seeds and
+  `eval_fgadr.py` matches training-time splits. FGADR results from before this
+  change were measured on per-seed partitions and are not directly comparable.
+- On MPS, `--amp` now runs bf16 (fp16 there had no GradScaler → unscaled gradients,
+  the exact underflow mode that collapses MA).
+- `--cache-images` (train_idrid) keeps decoded IDRiD images in RAM — big patch-mode
+  throughput win on the GPU box; skip it on a small laptop.
 - The GCG block currently benchmarked is a baseline; the custom block is the eventual subject.

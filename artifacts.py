@@ -45,7 +45,9 @@ _LAP = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32).vie
 def focus_score(rgb: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
     """Sharpness = variance of the Laplacian (higher = sharper). Computed on the
     grayscale image within ``mask`` (the field of view), so the black border
-    doesn't dominate. Scaled to 0-255 for interpretable magnitudes."""
+    doesn't dominate. NB: the value is the RAW Laplacian variance (no 0-255
+    scaling); the min_focus threshold was calibrated against this raw value,
+    so do not "fix" the scale without re-calibrating."""
     gray = (rgb.astype(np.float32).mean(axis=2))[None, None]
     lap = F.conv2d(torch.from_numpy(gray), _LAP, padding=1)[0, 0].numpy()
     if mask is not None:

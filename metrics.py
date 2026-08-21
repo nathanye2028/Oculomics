@@ -54,13 +54,43 @@ def dice_iou_from_counts(inter: torch.Tensor, psum: torch.Tensor, tsum: torch.Te
     """Per-lesion Dice and IoU from accumulated counts.
 
     inter = sum(pred*target), psum = sum(pred), tsum = sum(target)  (per channel)
+
+    A lesion absent from BOTH prediction and target over the whole eval set
+    (psum + tsum == 0, e.g. SE missing from a small val split) is scored NaN,
+    not 0 — there was nothing to segment, so a 0 would silently deflate any
+    mean taken over the channels. Average with :func:`mean_present`.
     """
+    absent = (psum + tsum) == 0
     dice = (2 * inter / (psum + tsum).clamp(min=1e-6)).cpu()
     union = (psum + tsum - inter).clamp(min=1e-6)
     iou = (inter / union).cpu()
-    d = {c: dice[i].item() for i, c in enumerate(lesions)}
-    j = {c: iou[i].item() for i, c in enumerate(lesions)}
+    nan = float("nan")
+    d = {c: (nan if absent[i] else dice[i].item()) for i, c in enumerate(lesions)}
+    j = {c: (nan if absent[i] else iou[i].item()) for i, c in enumerate(lesions)}
     return d, j
+
+
+def sens_prec_from_counts(inter: torch.Tensor, psum: torch.Tensor, tsum: torch.Tensor,
+                          lesions: Sequence[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Per-lesion sensitivity (inter/tsum) and precision (inter/psum) from the
+    same accumulated counts as :func:`dice_iou_from_counts`.
+
+    The pair that disambiguates a near-zero Dice: sensitivity ~0 means the model
+    collapsed to all-background; sensitivity high with precision ~0 means it is
+    over-predicting (recoverable by threshold/training). NaN where undefined.
+    """
+    nan = float("nan")
+    sens = {c: (inter[i] / tsum[i]).item() if tsum[i] > 0 else nan
+            for i, c in enumerate(lesions)}
+    prec = {c: (inter[i] / psum[i]).item() if psum[i] > 0 else nan
+            for i, c in enumerate(lesions)}
+    return sens, prec
+
+
+def mean_present(d: Dict[str, float]) -> float:
+    """Mean over the non-NaN values of a per-lesion metric dict."""
+    vals = [v for v in d.values() if v == v]          # NaN != NaN
+    return sum(vals) / len(vals) if vals else float("nan")
 
 
 def binary_average_precision(probs, targets) -> float:

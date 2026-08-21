@@ -105,6 +105,9 @@ def main() -> int:
                 verdict = f"GCG positive in all {ps['n']} seeds but CI includes 0 -> add seeds"
     if failures:
         lines.append(f"\n(!) failed runs: {failures}")
+    if not any(res[c][METRICS[0]] for c in res):
+        print(f"[fatal] every run failed ({failures}); nothing to summarise.", file=sys.stderr)
+        return 1
     lines.append(f"\nverdict (AUROC): {verdict}")
 
     report = "\n".join(lines)
@@ -116,7 +119,7 @@ def main() -> int:
                    "paired": {m: paired_stats(res["gcg"][m], res["nogcg"][m]) for m in METRICS},
                    "failures": failures}, f, indent=2)
     print(f"\n[info] wrote {args.out_dir}/summary.md and summary.json")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

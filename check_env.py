@@ -73,7 +73,7 @@ def main() -> int:
             y = m(x)
         loss = y.float().mean()
         loss.backward()
-        print(f"GCG-U-Net   : forward {tuple(y.shape)} + backward OK  (amp={'on' if use_amp else 'off/mps'})")
+        print(f"GCG-U-Net   : forward {tuple(y.shape)} + backward OK  (amp={'on' if use_amp else 'off'})")
     except Exception as e:  # noqa
         print(f"!! model forward/backward failed on {device}: {e}")
         return 2

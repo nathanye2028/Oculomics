@@ -1,6 +1,11 @@
 """
 train.py
 ========
+.. deprecated:: 2026-08
+   Superseded by ``train_mbrset.py`` (AUROC selection, patient-grouped
+   splits, BRSET->mBRSET transfer). Kept only for reference; nothing in
+   the repo invokes it.
+
 Robust training loop for the mBRSET clinical-label **classifier**
 (:class:`model.MBRSETClassifier` over :class:`dataset.MBRSETDataset`).
 

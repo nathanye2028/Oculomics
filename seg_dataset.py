@@ -79,6 +79,7 @@ class RFMiDSegDataset(Dataset):
         self.images_dir = images_dir
         self.image_size = image_size
         self.masks_dir = masks_dir
+        self._missing_masks: set = set()
         self.mask_mode = mask_mode
         self.augment = augment
         self.fov_crop = fov_crop
@@ -123,6 +124,13 @@ class RFMiDSegDataset(Dataset):
                         r0, r1, c0, c1 = bbox
                         m = Image.fromarray(np.asarray(m)[r0:r1, c0:c1])
                     return m
+            # A silent placeholder here would mean "real masks requested, synthetic
+            # masks trained on" with no sign anything went wrong (e.g. IDRiD-style
+            # '<stem>_MA.tif' names never match '<stem>.<ext>').
+            if fname not in self._missing_masks:
+                self._missing_masks.add(fname)
+                print(f"[warn] seg_dataset: no mask for {fname!r} under {self.masks_dir} "
+                      f"({len(self._missing_masks)} missing so far) — using PLACEHOLDER mask")
         return self._placeholder_mask(img)                # generated from cropped img -> aligned
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -147,5 +155,7 @@ class RFMiDSegDataset(Dataset):
 
         img_t = torch.from_numpy(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
         img_t = (img_t - IMAGENET_MEAN) / IMAGENET_STD
-        mask_t = torch.from_numpy((np.asarray(mask, dtype=np.float32) / 255.0)[None] > 0.5).float()
+        # `> 0` (as in idrid_dataset), NOT `/255 > 0.5`: masks encoded {0,1} or as
+        # red-on-black RGB (L-value ~76) binarise to all-zero under the old rule.
+        mask_t = torch.from_numpy(np.asarray(mask, dtype=np.float32)[None] > 0).float()
         return img_t, mask_t

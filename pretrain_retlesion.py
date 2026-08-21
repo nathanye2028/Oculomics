@@ -105,9 +105,13 @@ def main() -> int:
     full = RetLesionDataset(root, lesions=args.lesions, patch_size=args.patch_size,
                             scale_match=not args.no_scale_match, drop_empty=True,
                             augment=True, seed=args.seed)
-    clean = RetLesionDataset(root, lesions=args.lesions, patch_size=args.patch_size,
-                             scale_match=not args.no_scale_match, drop_empty=True,
-                             augment=False, fg_bias=0.0, seed=args.seed)
+    # The clean (val-transform) view shares full's item list instead of
+    # re-running the ~1,900-mask non-empty scan a second time; only the
+    # per-sample transform flags differ.
+    import copy
+    clean = copy.copy(full)
+    clean.augment = False
+    clean.fg_bias = 0.0
     n = len(full)
     perm = np.random.default_rng(args.seed).permutation(n)
     n_val = max(1, int(round(n * args.val_frac)))

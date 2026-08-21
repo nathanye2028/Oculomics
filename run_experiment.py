@@ -46,7 +46,7 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
     if args.launcher == "torchrun":
         base = ["torchrun", f"--nproc_per_node={args.nproc}",
                 f"--master_port={args.master_port}", TRAINER]
-    cmd = base + [
+    cmd = base + list(cond_flags) + [
         "--arch", "gcg_unet",
         "--seed", str(seed),
         "--epochs", str(args.epochs),
@@ -98,9 +98,19 @@ def aggregate(per_lesion_runs):
     return out
 
 
-# Two-sided t critical values @ 95% by degrees of freedom (n-1); >=10 -> ~normal.
+# Two-sided t critical values @ 95% by degrees of freedom (n-1).
 _TCRIT = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
-          6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262}
+          6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+          12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
+
+
+def _tcrit(df: int) -> float:
+    """Nearest tabulated t value at or below ``df`` (conservative for gaps);
+    ~normal beyond df 30. Using 1.96 from df 10 would be anti-conservative."""
+    if df in _TCRIT:
+        return _TCRIT[df]
+    keys = [k for k in _TCRIT if k <= df]
+    return _TCRIT[max(keys)] if keys and df <= 30 else 1.96
 
 
 def paired_stats(gcg_by_seed: dict, ctrl_by_seed: dict):
@@ -114,7 +124,7 @@ def paired_stats(gcg_by_seed: dict, ctrl_by_seed: dict):
     n = len(deltas)
     md = statistics.mean(deltas) if n else float("nan")
     sd = statistics.stdev(deltas) if n > 1 else 0.0
-    tcrit = _TCRIT.get(n - 1, 1.96)
+    tcrit = _tcrit(n - 1)
     half = tcrit * sd / (n ** 0.5) if n > 1 else 0.0
     lo, hi = md - half, md + half
     return {"seeds": seeds, "deltas": deltas, "n": n, "mean_delta": md, "std_delta": sd,
@@ -175,6 +185,7 @@ def main() -> int:
         args.patch_size = 0
 
     os.makedirs(args.out_dir, exist_ok=True)
+    use_fgadr = "fgadr" in args.datasets
     # Seed-keyed so control/GCG stay aligned per seed even if a run fails.
     # results[cond][lesion][seed] = dice ; means[cond][seed] = mean dice
     results = {c: {les: {} for les in args.lesions} for c, _ in CONDITIONS}
@@ -188,7 +199,7 @@ def main() -> int:
             i += 1
             run_name = f"{cond}_seed{seed}"
             rj = os.path.join(args.out_dir, f"{run_name}.json")
-            cmd = build_cmd(args, flags, seed, rj, run_name) + flags
+            cmd = build_cmd(args, flags, seed, rj, run_name)
             print(f"\n[{i}/{total}] === {run_name} ===\n  {' '.join(cmd)}", flush=True)
             ret = subprocess.run(cmd).returncode
             if ret != 0 or not os.path.exists(rj):
@@ -197,18 +208,33 @@ def main() -> int:
                 continue
             with open(rj) as f:
                 r = json.load(f)
+            # With FGADR in the training mix, its 367-image test split is the
+            # powered comparison; IDRiD's 27 images are too noisy to carry the
+            # verdict (same rationale as run_arch_sweep.pick_metric).
+            dice_src = (r.get("fgadr_test_dice") or r["test_dice"]) if use_fgadr else r["test_dice"]
+            mean_src = (r.get("fgadr_test_mean") if use_fgadr and r.get("fgadr_test_mean") is not None
+                        else r["test_mean"])
             for les in args.lesions:
-                results[cond][les][seed] = r["test_dice"].get(les, float("nan"))
-            means[cond][seed] = r["test_mean"]
+                v = dice_src.get(les, float("nan"))
+                if v == v:                          # skip NaN (lesion absent from split)
+                    results[cond][les][seed] = v
+            means[cond][seed] = mean_src
+
+    # Refuse to summarise nothing: an all-failed sweep must fail the job, not
+    # write a table of NaNs and exit 0 (which a SLURM script reads as success).
+    if not any(means[c] for c, _ in CONDITIONS):
+        print(f"\n[fatal] every run failed ({failures}); nothing to summarise.", file=sys.stderr)
+        return 1
 
     # ---- unpaired comparison table (mean ± std across seeds) ----
     lists = {c: {les: list(results[c][les].values()) for les in args.lesions} for c, _ in CONDITIONS}
     agg = {c: aggregate(lists[c]) for c, _ in CONDITIONS}
     mean_stats = {c: aggregate({"mean": list(means[c].values())})["mean"] for c, _ in CONDITIONS}
 
+    split_label = "FGADR test (367 imgs)" if use_fgadr else "IDRiD test (27 imgs)"
     lines = []
     lines.append(f"\n{'='*68}")
-    lines.append(f"GCG vs CONTROL on IDRiD  (seeds={args.seeds}, epochs={args.epochs})")
+    lines.append(f"GCG vs CONTROL on {split_label}  (seeds={args.seeds}, epochs={args.epochs})")
     lines.append(f"{'='*68}")
     lines.append(f"{'lesion':<8}{'control (no-gcg)':<22}{'GCG':<22}{'delta':>8}")
     for les in args.lesions:
@@ -256,9 +282,10 @@ def main() -> int:
                                    "significant": mp["significant"], "n_positive": mp["n_positive"], "n": mp["n"]},
                    "paired_per_lesion": {les: paired_stats(results["gcg"][les], results["nogcg"][les])["mean_delta"]
                                          for les in args.lesions},
+                   "metric_split": split_label,
                    "seeds": args.seeds, "epochs": args.epochs, "failures": failures}, f, indent=2)
     print(f"\n[info] wrote {args.out_dir}/summary.md and summary.json")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ FGADR dominates the mixture by ~18x, so treat it as the primary training signal
 and IDRiD/e-ophtha as held-out-distribution checks rather than equal partners.
 
 Note both DDR and RFMiD (as mirrored on Kaggle) are *classification* sets with
-no lesion masks — they are used for encoder pretraining (:mod:`pretrain_rfmid`),
+no lesion masks — they are used for encoder pretraining (:mod:`pretrain_encoder`),
 not here.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from fundus_utils import fov_bbox, make_rng, random_patch
+from fundus_utils import dihedral_jitter, fov_bbox, make_rng, random_patch
 from idrid_dataset import DEFAULT_LESIONS, IDRiDSegDataset
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -72,12 +72,32 @@ class EOphthaEXDataset(Dataset):
         self.lesions = list(lesions)
         self.fov_crop = fov_crop
 
-        imgs = {_index_of(f): f for f in os.listdir(self.img_dir)
-                if f.lower().endswith(_IMG_EXTS)}
-        msks = {_index_of(f): f for f in os.listdir(self.msk_dir)
-                if f.lower().endswith(_IMG_EXTS)}
-        keys = sorted(set(imgs) & set(msks) - {None}, key=lambda k: int(k))
+        def _index_files(d: str) -> dict:
+            """{int index: filename}; int keys so 'EX012' and 'EX_GT12' pair."""
+            out = {}
+            for f in os.listdir(d):
+                if not f.lower().endswith(_IMG_EXTS):
+                    continue
+                k = _index_of(f)
+                if k is None:
+                    continue
+                k = int(k)              # '012' and '12' must collide, not diverge
+                if k in out:
+                    print(f"[warn] e-ophtha: index {k} appears twice in {d} "
+                          f"({out[k]!r} vs {f!r}); keeping the first")
+                    continue
+                out[k] = f
+            return out
+
+        imgs = _index_files(self.img_dir)
+        msks = _index_files(self.msk_dir)
+        keys = sorted(set(imgs) & set(msks))
         self.pairs: List[Tuple[str, str]] = [(imgs[k], msks[k]) for k in keys]
+        unpaired = (set(imgs) ^ set(msks))
+        if unpaired:
+            print(f"[warn] e-ophtha: {len(unpaired)} file(s) had no partner and were "
+                  f"dropped (indices {sorted(unpaired)[:5]}...). If this is more than "
+                  "a couple, the image<->mask pairing rule is wrong for this mirror.")
 
         # Only EX is annotated here.
         self.valid = torch.tensor(
@@ -183,9 +203,10 @@ class MultiLesionSegDataset(Dataset):
             masks = np.stack([np.asarray(Image.fromarray(masks[c]).resize(size, Image.NEAREST))
                               for c in range(masks.shape[0])], axis=0)
 
-        if self.augment and bool(rng.integers(0, 2)):
-            img_np = img_np[:, ::-1, :].copy()
-            masks = masks[:, :, ::-1].copy()
+        if self.augment:
+            # e-ophtha has 47 images — the same "one flip is far too weak"
+            # argument as IDRiD's 43. Shared dihedral+jitter (fundus_utils).
+            img_np, masks = dihedral_jitter(img_np, masks, rng)
 
         x, m = self._to_tensors(img_np, masks)
         return x, m, valid.clone()

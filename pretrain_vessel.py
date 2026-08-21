@@ -179,6 +179,8 @@ def main() -> int:
     csv_log.close()
 
     print(f"\nbest vessel Dice {best:.4f}  ->  {args.out}")
+    print("      (selection-biased: chosen on the same split it is reported on;"
+          " fine for an init, do not quote as a result)")
     print(f"next:  python run_experiment.py --seeds 0 1 2 --epochs 200 --patch-size 512 "
           f"--eval-tiled --init-weights {args.out}")
     return 0

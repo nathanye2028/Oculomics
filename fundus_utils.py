@@ -82,6 +82,7 @@ def seed_everything(seed: int = 42, deterministic: bool = True,
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    _reset_main_process_draws()      # make_rng's num_workers=0 sequence replays
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     # Precision, independent of determinism: TF32 silently zeroes the smallest
@@ -109,17 +110,37 @@ def seed_worker(worker_id: int) -> None:
     random.seed(base)
 
 
+_MAIN_PROCESS_DRAWS = iter(range(2 ** 62))   # per-process draw counter, see make_rng
+
+
+def _reset_main_process_draws() -> None:
+    """Restart make_rng's main-process draw counter (called by seed_everything,
+    so re-seeding a run replays the exact same augmentation sequence)."""
+    global _MAIN_PROCESS_DRAWS
+    _MAIN_PROCESS_DRAWS = iter(range(2 ** 62))
+
+
 def make_rng(base_seed: int, index: int) -> np.random.Generator:
     """Per-call RNG keyed on (worker base seed, dataset base seed, sample index).
 
     In a worker process ``torch.initial_seed()`` differs per worker *and* per
     epoch, so augmentation is diverse across workers and epochs while staying
-    reproducible for a fixed global seed. In the main process it falls back to
-    the dataset's base seed + index.
+    reproducible for a fixed global seed.
+
+    In the main process (``num_workers=0``) ``torch.initial_seed()`` is constant
+    across epochs, so keying on it alone would replay the *identical* patch,
+    flip and jitter for every sample every epoch — silently erasing augmentation
+    diversity on exactly the debug/MPS runs that use 0 workers. A per-process
+    draw counter makes every fetch distinct while staying reproducible for a
+    fixed seed (fetch order is deterministic under seeded shuffling).
     """
     info = torch.utils.data.get_worker_info()
-    worker_seed = int(torch.initial_seed()) if info is not None else int(base_seed)
-    ss = np.random.SeedSequence([worker_seed % (2 ** 32), int(base_seed), int(index)])
+    if info is not None:
+        worker_seed = int(torch.initial_seed()) % (2 ** 32)
+        ss = np.random.SeedSequence([worker_seed, int(base_seed), int(index)])
+    else:
+        ss = np.random.SeedSequence([int(base_seed), int(index),
+                                     next(_MAIN_PROCESS_DRAWS) % (2 ** 32)])
     return np.random.default_rng(ss)
 
 
@@ -201,6 +222,38 @@ def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75, smooth=1
     return _masked_mean((1.0 - t).clamp(min=1e-6) ** gamma, has)
 
 
+def dihedral_jitter(img: np.ndarray, masks: np.ndarray, rng: np.random.Generator,
+                    jitter: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    """Joint label-preserving augmentation shared by ALL lesion loaders.
+
+    Flips + 90-degree rotations (the dihedral group; 8x effective data) plus
+    optional brightness/contrast jitter. A fundus has no canonical orientation,
+    so every element is label-preserving. Factored here because IDRiD's 43-image
+    docstring argument — "a single flip is far too weak" — applies equally to
+    e-ophtha's 47 images, and inconsistent augmentation across sources merged
+    into one training set quietly biases the mixture.
+
+    ``img`` [H,W,3] uint8, ``masks`` [C,H,W]. The rotation is skipped for
+    non-square inputs (shape must survive for batch collation); RNG draw count
+    is identical either way, so seeds stay comparable.
+    """
+    if bool(rng.integers(0, 2)):
+        img = img[:, ::-1, :]; masks = masks[:, :, ::-1]
+    if bool(rng.integers(0, 2)):
+        img = img[::-1, :, :]; masks = masks[:, ::-1, :]
+    k = int(rng.integers(0, 4))
+    if k and img.shape[0] == img.shape[1]:
+        img = np.rot90(img, k, axes=(0, 1))
+        masks = np.rot90(masks, k, axes=(1, 2))
+    img = np.ascontiguousarray(img)
+    masks = np.ascontiguousarray(masks)
+    if jitter and bool(rng.integers(0, 2)):
+        a = float(rng.uniform(0.85, 1.15))     # contrast
+        b = float(rng.uniform(-18, 18))        # brightness
+        img = np.clip(img.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
+    return img, masks
+
+
 # --------------------------------------------------------------------------- #
 # High-resolution patching
 # --------------------------------------------------------------------------- #
@@ -252,6 +305,7 @@ def tiled_predict(
     tile_batch: int = 8,
     fg_map: Optional[torch.Tensor] = None,
     autocast: bool = True,
+    n_classes: Optional[int] = None,
 ) -> torch.Tensor:
     """Full-resolution inference by stitching tiles. Built for scale.
 
@@ -276,7 +330,12 @@ def tiled_predict(
     xs = _tile_starts(W, tile, overlap)
     coords = [(y, x) for y in ys for x in xs]
     if fg_map is not None:
-        coords = [(y, x) for (y, x) in coords if bool(fg_map[y:y + tile, x:x + tile].any())]
+        # Queue every tile's .any() on-device, then transfer ONCE: calling
+        # bool(...) per tile would force a GPU->CPU sync per tile (dozens of
+        # round-trips per image before any compute starts).
+        flags = torch.stack([fg_map[y:y + tile, x:x + tile].any()
+                             for (y, x) in coords]).cpu().tolist()
+        coords = [c for c, f in zip(coords, flags) if f]
 
     image = image.to(device, non_blocking=True)
     n_lesions = None
@@ -296,5 +355,7 @@ def tiled_predict(
             prob_sum[:, y:y + tile, x:x + tile] += probs[j]
             weight[:, y:y + tile, x:x + tile] += 1
     if prob_sum is None:                          # whole image was background
-        return torch.zeros(1, H, W, device=device)
+        # Honour the model's channel count — a [1,H,W] zeros here would
+        # broadcast silently into callers' [C]-shaped accumulators.
+        return torch.zeros(n_classes if n_classes else 1, H, W, device=device)
     return prob_sum / weight.clamp(min=1e-6)

@@ -69,7 +69,7 @@ from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS, IMAGENET_MEAN, IMAGE
 from fundus_utils import (  # noqa: E402
     seed_everything, seed_worker, focal_tversky_loss, tversky_loss, tiled_predict,
 )
-from metrics import dice_iou_from_counts, CSVLogger  # noqa: E402
+from metrics import dice_iou_from_counts, sens_prec_from_counts, mean_present, CSVLogger  # noqa: E402
 
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
 
@@ -114,13 +114,25 @@ def make_loss(name: str):
             lg, t, alpha=0.7, beta=0.3, gamma=0.75, valid=valid)
     if name == "tversky":
         return lambda lg, t, valid=None: tversky_loss(lg, t, alpha=0.7, beta=0.3, valid=valid)
+    if name == "lesion_seg":
+        # Focal Tversky + focal BCE (losses.py): region overlap that survives
+        # extreme imbalance, plus a per-pixel gradient that behaves early in
+        # training before any overlap exists.
+        from losses import lesion_seg_loss
+        return lambda lg, t, valid=None: lesion_seg_loss(lg, t, valid=valid)
     if name == "dice_bce":
         def _dice_bce(lg, t, valid=None):
-            if valid is not None:                 # zero-out unannotated channels
-                w = valid.to(lg.dtype)[:, :, None, None]
-                lg, t = lg * w, t * w
-            bce = F.binary_cross_entropy_with_logits(lg, t)
             p = torch.sigmoid(lg); dims = (0, 2, 3)
+            if valid is not None:
+                # Mask PROBABILITIES, not logits: a zeroed logit is sigmoid=0.5,
+                # which pads the Dice denominator of the *annotated* samples in
+                # the batch and adds a constant log(2)/pixel to BCE.
+                w = valid.to(lg.dtype)[:, :, None, None]
+                bce_map = F.binary_cross_entropy_with_logits(lg, t, reduction="none")
+                bce = (bce_map * w).sum() / w.expand_as(bce_map).sum().clamp(min=1.0)
+                p, t = p * w, t * w
+            else:
+                bce = F.binary_cross_entropy_with_logits(lg, t)
             num = 2 * (p * t).sum(dims) + 1.0
             den = p.sum(dims) + t.sum(dims) + 1.0
             return bce + (1.0 - num / den).mean()
@@ -164,13 +176,29 @@ class _NoValid(torch.utils.data.Dataset):
         return self.ds.load_full(i)
 
 
+def shard_for_eval(ds):
+    """Non-padded per-rank eval shard.
+
+    ``DistributedSampler`` pads the index list so every rank gets an equal share,
+    which double-counts samples in the all-reduced Dice counts (on IDRiD's ~11
+    val images with 4 GPUs that is a ~9% distortion of the selection metric).
+    Counts-based eval tolerates uneven shards — there is no gradient sync to
+    keep in lockstep — so a plain strided subset is both correct and simpler.
+    """
+    if not is_dist():
+        return ds
+    return Subset(ds, list(range(dist.get_rank(), len(ds), dist.get_world_size())))
+
+
 @torch.no_grad()
 def evaluate_whole(model, loader, lesions, device):
-    """Per-lesion Dice + IoU over a loader (whole-image, resized). Fast; for val selection.
+    """Per-lesion Dice + IoU + sensitivity/precision over a loader (whole-image,
+    resized). Fast; for val selection.
 
-    Under DDP the loader is sharded per rank; counts are summed across ranks so
-    every rank computes the same global metrics (and agrees on the best epoch).
-    Returns (dice_dict, iou_dict).
+    Under DDP the loader must be built over :func:`shard_for_eval` (never a
+    padded ``DistributedSampler``); counts are summed across ranks so every rank
+    computes the same global metrics (and agrees on the best epoch).
+    Returns (dice_dict, iou_dict, sens_dict, prec_dict).
     """
     model.eval()
     C = len(lesions)
@@ -178,13 +206,22 @@ def evaluate_whole(model, loader, lesions, device):
     psum = torch.zeros(C, device=device)
     tsum = torch.zeros(C, device=device)
     for imgs, masks in loader:
-        imgs, masks = imgs.to(device), masks.to(device)
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
         pred = (torch.sigmoid(model(imgs)) > 0.5).float()
         inter += (pred * masks).sum(dim=(0, 2, 3))
         psum += pred.sum(dim=(0, 2, 3))
         tsum += masks.sum(dim=(0, 2, 3))
     all_reduce_sum(inter, psum, tsum)
-    return dice_iou_from_counts(inter, psum, tsum, lesions)
+    return (*dice_iou_from_counts(inter, psum, tsum, lesions),
+            *sens_prec_from_counts(inter, psum, tsum, lesions))
+
+
+def _load_full_of(ds, i):
+    """``load_full`` through any nesting of Subsets (eval shards, val splits)."""
+    if isinstance(ds, Subset):
+        return _load_full_of(ds.dataset, ds.indices[i])
+    return ds.load_full(i)
 
 
 class _NativeFull(torch.utils.data.Dataset):
@@ -201,7 +238,7 @@ class _NativeFull(torch.utils.data.Dataset):
         return len(self.ds)
 
     def __getitem__(self, i):
-        img_np, masks = self.ds.load_full(i)                     # [H,W,3], [C,H,W] uint8
+        img_np, masks = _load_full_of(self.ds, i)[:2]            # [H,W,3], [C,H,W] uint8
         img = torch.from_numpy(np.ascontiguousarray(img_np.transpose(2, 0, 1)))
         return img, torch.from_numpy(np.ascontiguousarray(masks))
 
@@ -224,10 +261,10 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
     psum = torch.zeros(C, device=device)
     tsum = torch.zeros(C, device=device)
     mean, std = IMAGENET_MEAN.to(device), IMAGENET_STD.to(device)
-    nf = _NativeFull(dataset)
-    # Under DDP, shard images across ranks (each GPU tiles a subset) then sum counts.
-    sampler = DistributedSampler(nf, shuffle=False) if is_dist() else None
-    loader = DataLoader(nf, batch_size=1, sampler=sampler, num_workers=num_workers,
+    # Under DDP, shard images across ranks (each GPU tiles a subset) then sum
+    # counts. Non-padded shard: see shard_for_eval.
+    nf = _NativeFull(shard_for_eval(dataset))
+    loader = DataLoader(nf, batch_size=1, num_workers=num_workers,
                         collate_fn=_take_one, worker_init_fn=seed_worker,
                         pin_memory=(device.type == "cuda"))
     for img_u8, masks_u8 in loader:
@@ -235,14 +272,15 @@ def evaluate_tiled(model, dataset, lesions, device, tile, overlap, tile_batch=16
         fg_map = img_u8.amax(dim=0) > 12               # field-of-view pixels (skip black tiles)
         img = (img_u8.float().div_(255.0) - mean) / std
         prob = tiled_predict(model, img, tile, overlap, device,
-                             tile_batch=tile_batch, fg_map=fg_map)
+                             tile_batch=tile_batch, fg_map=fg_map, n_classes=C)
         pred = (prob > 0.5).float()
         target = masks_u8.to(device, non_blocking=True).float()
         inter += (pred * target).sum(dim=(1, 2))
         psum += pred.sum(dim=(1, 2))
         tsum += target.sum(dim=(1, 2))
     all_reduce_sum(inter, psum, tsum)
-    return dice_iou_from_counts(inter, psum, tsum, lesions)
+    return (*dice_iou_from_counts(inter, psum, tsum, lesions),
+            *sens_prec_from_counts(inter, psum, tsum, lesions))
 
 
 def build(args, num_classes, device):
@@ -268,7 +306,7 @@ def build(args, num_classes, device):
         desc = f"GCG-U-Net ({args.encoder}/{args.decoder}-decoder) gcg={variant}"
         desc += " [imagenet]" if imagenet else " [SCRATCH — no pretraining]"
         # In-domain init: overwrite the ImageNet encoder with one pretrained on
-        # RFMiD fundus images (see pretrain_rfmid.py). Fundus features transfer
+        # RFMiD fundus images (see pretrain_encoder.py). Fundus features transfer
         # better than natural-image features to a 54-image segmentation task.
         if getattr(args, "init_encoder", None):
             ck = torch.load(args.init_encoder, map_location="cpu")
@@ -316,6 +354,12 @@ def main() -> int:
     p.add_argument("--patch-size", type=int, default=0, help=">0 -> native-res patch training.")
     p.add_argument("--fg-bias", type=float, default=0.7, help="Prob a train patch is lesion-centred.")
     p.add_argument("--eval-tiled", action="store_true", help="Score test at native res via tiling.")
+    p.add_argument("--eval-tiled-val", action="store_true",
+                   help="Also select the best checkpoint on TILED native-res val. Without "
+                        "this, selection runs on whole-image resize, where NEAREST-"
+                        "downsampled masks erase most 1-2px microaneurysms — the selected "
+                        "epoch can be materially non-optimal for exactly the lesion the "
+                        "final tiled test reports. Costs one tiled pass over val per epoch.")
     p.add_argument("--tile-overlap", type=int, default=0,
                    help="Tile overlap. 0 = fewest tiles / fastest (measured 1.3x vs 64); "
                         ">0 smooths seams at the cost of extra forwards.")
@@ -332,7 +376,11 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine"])
     p.add_argument("--warmup-epochs", type=int, default=0)
-    p.add_argument("--loss", default="focal_tversky", choices=["focal_tversky", "tversky", "dice_bce"])
+    p.add_argument("--loss", default="focal_tversky",
+                   choices=["focal_tversky", "tversky", "dice_bce", "lesion_seg"],
+                   help="'lesion_seg' = focal Tversky + focal BCE (losses.py); the BCE "
+                        "term gives a usable per-pixel gradient before any region "
+                        "overlap exists, which matters most for MA.")
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--nondeterministic", action="store_true",
                    help="Allow non-deterministic cuDNN kernels (faster, not reproducible).")
@@ -344,6 +392,11 @@ def main() -> int:
                         "a pre-fix run or to measure the speed/accuracy trade deliberately.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--cache-images", action="store_true",
+                   help="Cache decoded FOV-cropped IDRiD images in RAM (masks bit-packed). "
+                        "Removes the full 4288x2848 decode from every patch fetch — the "
+                        "dominant per-item cost. ~1.6GB per DataLoader worker; use on the "
+                        "GPU box, not a small laptop.")
     p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
     p.add_argument("--base", type=int, default=32)
     p.add_argument("--no-gcg", action="store_true")
@@ -426,10 +479,12 @@ def main() -> int:
     # Train view: augmented + (optionally) native-res patches. Val/test: whole image (clean).
     train_full = IDRiDSegDataset(root, split="train", image_size=args.image_size,
                                  lesions=args.lesions, fov_crop=True, patch_size=patch,
-                                 fg_bias=args.fg_bias, augment=True, seed=args.seed)
+                                 fg_bias=args.fg_bias, augment=True, seed=args.seed,
+                                 cache_images=args.cache_images)
     val_full = IDRiDSegDataset(root, split="train", image_size=args.image_size,
                                lesions=args.lesions, fov_crop=True, patch_size=None,
-                               augment=False, seed=args.seed)
+                               augment=False, seed=args.seed,
+                               cache_images=args.cache_images)
     test_ds = IDRiDSegDataset(root, split="test", image_size=args.image_size,
                               lesions=args.lesions, fov_crop=True, patch_size=None,
                               augment=False, seed=args.seed)
@@ -494,6 +549,11 @@ def main() -> int:
             raise SystemExit("--val-source fgadr requires 'fgadr' in --datasets")
         val_source = "idrid"
     if "retlesion" in args.datasets:
+        if patch is None:
+            log("[warn] retlesion in whole-image mode: IDRiD/FGADR contribute full-"
+                "retina resizes while retlesion contributes ~15%-of-retina crops — "
+                "the same lesion at incompatible scales. Prefer --patch-size with "
+                "this source.")
         from retlesion_dataset import RetLesionDataset, download_retlesion
         rl_root = args.retlesion_root or download_retlesion()
         rl = RetLesionDataset(rl_root, lesions=args.lesions,
@@ -515,16 +575,19 @@ def main() -> int:
     log(f"[info] ckpt   : {ckpt_path}")
 
     # Under DDP, shard the data across ranks so each GPU sees a different subset.
+    # Training uses DistributedSampler (padding is harmless there); eval uses
+    # shard_for_eval, because sampler padding double-counts into Dice counts.
     g = torch.Generator(); g.manual_seed(args.seed)
     train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed, drop_last=True) if ddp else None
-    val_sampler = DistributedSampler(val_ds, shuffle=False) if ddp else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=(train_sampler is None), sampler=train_sampler,
                               num_workers=args.num_workers, drop_last=True,
                               worker_init_fn=seed_worker, generator=g,
+                              persistent_workers=(args.num_workers > 0),
                               pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, sampler=val_sampler,
+    val_loader = DataLoader(shard_for_eval(val_ds), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, worker_init_fn=seed_worker,
+                            persistent_workers=(args.num_workers > 0),
                             pin_memory=(device.type == "cuda"))
 
     model, desc = build(args, C, device)
@@ -553,10 +616,13 @@ def main() -> int:
     accum = max(1, args.accum_steps)
     eff_batch = args.batch_size * accum * world
     amp_on = args.amp and device.type in ("cuda", "mps")
-    amp_dtype = torch.float16
+    # MPS has no GradScaler, so fp16 there would backprop UNSCALED — exactly the
+    # small-gradient underflow that collapses MA (see --allow-tf32 help). bf16
+    # keeps fp32's exponent range and needs no loss scaling.
+    amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and device.type == "cuda"))
     log(f"[info] batch  : physical={args.batch_size} x accum={accum} x gpus={world} "
-        f"-> effective={eff_batch}   amp={'on(fp16)' if amp_on else 'off'}")
+        f"-> effective={eff_batch}   amp={'on(' + str(amp_dtype).split('.')[-1] + ')' if amp_on else 'off'}")
 
     def optimizer_step():
         if scaler.is_enabled():
@@ -577,7 +643,9 @@ def main() -> int:
         steps = len(train_loader)
         opt.zero_grad(set_to_none=True)
         for i, (imgs, masks, valid) in enumerate(train_loader):
-            imgs, masks, valid = imgs.to(device), masks.to(device), valid.to(device)
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            valid = valid.to(device, non_blocking=True)
             is_step = ((i + 1) % accum == 0) or (i + 1 == steps)
             # During accumulation, skip DDP's gradient all-reduce except on the
             # step that actually updates -> avoids redundant cross-GPU traffic.
@@ -587,13 +655,25 @@ def main() -> int:
                     loss = loss_fn(model(imgs), masks, valid) / accum
                 scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
             nb += 1
-            running += loss.item() * accum
+            # On-device accumulation: .item() here would force a GPU sync every
+            # micro-batch, serialising CPU and GPU.
+            running = running + loss.detach() * accum
             if is_step:
                 optimizer_step()
+        running = float(running)
 
-        val_dice, val_iou = evaluate_whole(module, val_loader, args.lesions, device)  # all-reduced inside
-        mean_val = sum(val_dice.values()) / len(val_dice)
-        per = "  ".join(f"{k}={v:.3f}" for k, v in val_dice.items())
+        if args.eval_tiled_val:
+            val_dice, val_iou, val_sens, val_prec = evaluate_tiled(
+                module, val_ds, args.lesions, device, patch or args.image_size,
+                args.tile_overlap, tile_batch=args.tile_batch,
+                num_workers=args.num_workers)                  # all-reduced inside
+        else:
+            val_dice, val_iou, val_sens, val_prec = evaluate_whole(
+                module, val_loader, args.lesions, device)      # all-reduced inside
+        mean_val = mean_present(val_dice)
+        # Dice alone cannot distinguish "predicts nothing" from "predicts
+        # everything"; sensitivity next to it diagnoses collapse (losses.py).
+        per = "  ".join(f"{k}={v:.3f}/s{val_sens[k]:.2f}" for k, v in val_dice.items())
         flag = ""
         if mean_val > best_val:                     # identical on all ranks (reduced metric)
             best_val, best_epoch, since_best = mean_val, epoch, 0
@@ -612,6 +692,8 @@ def main() -> int:
                    "val_mean_dice": round(mean_val, 5),
                    "lr": round(opt.param_groups[0]["lr"], 6)}
             row.update({f"val_dice_{k}": round(v, 5) for k, v in val_dice.items()})
+            row.update({f"val_sens_{k}": round(v, 5) for k, v in val_sens.items()})
+            row.update({f"val_prec_{k}": round(v, 5) for k, v in val_prec.items()})
             csv_log.log(row)
         if sched is not None:
             sched.step()
@@ -631,29 +713,31 @@ def main() -> int:
             tile = patch or args.image_size
             return evaluate_tiled(module, ds, args.lesions, device, tile, args.tile_overlap,
                                   tile_batch=args.tile_batch, num_workers=args.num_workers)
-        sampler = DistributedSampler(ds, shuffle=False) if ddp else None
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, sampler=sampler,
+        loader = DataLoader(shard_for_eval(ds), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, worker_init_fn=seed_worker)
         return evaluate_whole(module, loader, args.lesions, device)
 
-    def report(name, dice, iou):
-        md = sum(dice.values()) / len(dice)
-        mi = sum(iou.values()) / len(iou)
+    def report(name, dice, iou, sens, prec):
+        md, mi = mean_present(dice), mean_present(iou)
         log(f"\n=== TEST — {name} (best checkpoint) ===")
         log(f"  Dice [mean={md:.3f}]   " + "  ".join(f"{k}={v:.3f}" for k, v in dice.items()))
         log(f"  IoU  [mean={mi:.3f}]   " + "  ".join(f"{k}={v:.3f}" for k, v in iou.items()))
+        log("  Sens/Prec              " + "  ".join(f"{k}={sens[k]:.3f}/{prec[k]:.3f}"
+                                                    for k in dice))
         return md, mi
 
-    test_dice, test_iou = score(test_ds)
-    mean_test, mean_iou = report(f"IDRiD ({len(test_ds)} imgs)", test_dice, test_iou)
+    test_dice, test_iou, test_sens, test_prec = score(test_ds)
+    mean_test, mean_iou = report(f"IDRiD ({len(test_ds)} imgs)", test_dice, test_iou,
+                                 test_sens, test_prec)
 
     # FGADR's own split: matched-distribution and large enough for stable
     # per-lesion numbers. IDRiD's 27 images then read as an out-of-distribution
     # generalisation check. They answer different questions — report both.
-    fgadr_dice = fgadr_iou = None
+    fgadr_dice = fgadr_iou = fgadr_sens = fgadr_prec = None
     if fgadr_test_ds is not None:
-        fgadr_dice, fgadr_iou = score(fgadr_test_ds)
-        report(f"FGADR ({len(fgadr_test_ds)} imgs)", fgadr_dice, fgadr_iou)
+        fgadr_dice, fgadr_iou, fgadr_sens, fgadr_prec = score(fgadr_test_ds)
+        report(f"FGADR ({len(fgadr_test_ds)} imgs)", fgadr_dice, fgadr_iou,
+               fgadr_sens, fgadr_prec)
         log("\n[note] IDRiD is the out-of-distribution check here (27 images, noisy); "
             "FGADR is the matched-distribution number.")
 
@@ -685,10 +769,11 @@ def main() -> int:
                 "init_encoder": args.init_encoder, "init_weights": args.init_weights,
                 "test_dice": test_dice, "test_mean": mean_test,
                 "test_iou": test_iou, "test_iou_mean": mean_iou,
+                "test_sens": test_sens, "test_prec": test_prec,
                 "fgadr_test_dice": fgadr_dice,
-                "fgadr_test_mean": (sum(fgadr_dice.values()) / len(fgadr_dice)
-                                    if fgadr_dice else None),
+                "fgadr_test_mean": mean_present(fgadr_dice) if fgadr_dice else None,
                 "fgadr_test_iou": fgadr_iou,
+                "fgadr_test_sens": fgadr_sens, "fgadr_test_prec": fgadr_prec,
                 "best_val": best_val, "best_epoch": best_epoch,
             }, f, indent=2)
         log(f"[info] wrote results -> {args.results_json}")
