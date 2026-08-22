@@ -48,7 +48,9 @@ Training recipe notes (2026-08-20)
   reachable as ``--imbalance both`` but double-corrects: with a 5% positive
   class the positives were effectively ~10x over-weighted.
 * ``--warmup-epochs 2`` (linear) before cosine decay; AMP auto-on for CUDA;
-  channels_last + non-blocking H2D on CUDA. All of it applies identically to
+  non-blocking H2D on CUDA (channels_last only with --nondeterministic — see
+  the comment in main(): deterministic cuDNN depthwise NHWC is ~10x slower). All
+  of it applies identically to
   the GCG and control arms, so the contrast is unaffected.
 * ``--ema-decay 0.999`` enables weight EMA; the EMA weights are what get
   validated, selected and checkpointed (they are what would ship).
@@ -66,9 +68,13 @@ import json
 import os
 import sys
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
+
+warnings.filterwarnings("ignore", message=".*epoch parameter in `scheduler.step\(\)`.*")
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -138,8 +144,6 @@ def load_teacher(path: str, device: torch.device, num_classes: int, task: str):
     t.eval().to(device)
     for p in t.parameters():
         p.requires_grad_(False)
-    if device.type == "cuda":
-        t = t.to(memory_format=torch.channels_last)
     return t, bk, a, ck.get("val", {})
 
 
@@ -165,8 +169,6 @@ def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0) -> nn.Modul
         b.train()
     for i, batch in enumerate(loader):
         x = batch["image"].to(device, non_blocking=True)
-        if device.type == "cuda":
-            x = x.to(memory_format=torch.channels_last)
         m(x)
         if max_batches and i + 1 >= max_batches:
             break
@@ -354,7 +356,13 @@ def main() -> int:
                              backbone=args.backbone,
                              backbone_kwargs=backbone_kwargs_for(args.backbone, args.image_size)
                              ).to(device)
-    if device.type == "cuda":
+    # channels_last ONLY when cuDNN is allowed to be non-deterministic: with fp16
+    # NHWC inputs the depthwise convs are routed to cuDNN, whose *deterministic*
+    # depthwise backward is extremely slow (measured ~10x on the A100 run of
+    # 2026-08-22). In the default deterministic mode, NCHW hits PyTorch's fast
+    # native depthwise kernel instead.
+    use_cl = device.type == "cuda" and args.nondeterministic
+    if use_cl:
         model = model.to(memory_format=torch.channels_last)
     print(f"[info] model  : {args.backbone}, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params")
 
@@ -381,7 +389,8 @@ def main() -> int:
 
     use_amp = args.amp if args.amp is not None else (device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
-    print(f"[info] amp    : {'on' if use_amp else 'off'}  imbalance={args.imbalance}")
+    print(f"[info] amp    : {'on' if use_amp else 'off'}  channels_last={'on' if use_cl else 'off'}  "
+          f"imbalance={args.imbalance}")
 
     cw = train_ds.class_weights().to(device) if use_loss_w else None
     crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
@@ -406,7 +415,7 @@ def main() -> int:
         for batch in train_loader:
             x = batch["image"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
-            if device.type == "cuda":
+            if use_cl:
                 x = x.to(memory_format=torch.channels_last)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
