@@ -22,6 +22,7 @@
 # Override any of these via the environment, e.g. SIZE=384 EPOCHS=30 bash run_kd_xfer.sh 0
 set -euo pipefail
 cd "$(dirname "$0")"
+export PYTHONUNBUFFERED=1    # epoch lines must reach `tee` live, not at process exit
 
 B=${B:-/data/users4/nshaik3/Datasets/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1}
 M=${M:-/data/users4/nshaik3/Datasets/mBRSET/physionet.org/files/mbrset/1.0}
@@ -39,6 +40,7 @@ WORKERS=${WORKERS:-8}
 KD_ALPHA=${KD_ALPHA:-0.7}
 KD_TEMP=${KD_TEMP:-4.0}
 FEAT_W=${FEAT_W:-0.0}            # >0 adds cosine feature matching on top of logit KD
+AMP=${AMP:-}                     # "" = trainer default; "--no-amp" / "--amp" to force
 EXTRA=${EXTRA:-}                 # extra flags for BOTH student arms, e.g. "--ema-decay 0.999"
 TEACHER_EXTRA=${TEACHER_EXTRA:-} # extra flags for the teacher only
 TRAIN_DATASET=${TRAIN_DATASET:-brset}   # schema of $B (brset); mbrset only for local smoke tests
@@ -51,13 +53,13 @@ mkdir -p "$OUT" "$CK"
 
 COMMON=(--dataset "$TRAIN_DATASET" --root "$B" --external-test-root "$M" --external-test-dataset mbrset
         --task dr_referable --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS"
-        --bn-adapt --ckpt-dir "$CK")
+        --bn-adapt --ckpt-dir "$CK" $AMP)
 
 run() {  # run <name> <flags...>
   local name=$1; shift
   if [ -f "$OUT/$name.json" ]; then echo "[skip] $name (exists)"; return 0; fi
   echo; echo "=== $name   $(date) ==="
-  .venv/bin/python train_mbrset.py "${COMMON[@]}" --run-name "$name" \
+  .venv/bin/python -u train_mbrset.py "${COMMON[@]}" --run-name "$name" \
       --results-json "$OUT/$name.json" "$@"
 }
 

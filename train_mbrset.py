@@ -287,6 +287,8 @@ def main() -> int:
                         "images (NO labels) and score again -> 'external_bnadapt'. AdaBN.")
     p.add_argument("--bn-adapt-batches", type=int, default=0,
                    help="Limit adaptation to the first N external batches (0 = all).")
+    p.add_argument("--log-every", type=int, default=100,
+                   help="Print a step-progress line every N training steps (0 = off).")
     p.add_argument("--ckpt-dir", default="ck_mbrset")
     p.add_argument("--run-name", default=None)
     p.add_argument("--results-json", default=None)
@@ -409,9 +411,11 @@ def main() -> int:
 
     best_auroc, best_epoch, since = -1.0, -1, 0
     print(f"\n=== training up to {args.epochs} epochs (val AUROC selects best) ===")
+    import time
     for epoch in range(1, args.epochs + 1):
         model.train()
         run, nb = 0.0, 0
+        t_ep = time.time()
         for batch in train_loader:
             x = batch["image"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
@@ -441,6 +445,10 @@ def main() -> int:
             # Accumulate on-device; a per-step .item() would force a GPU sync
             # every iteration on a model this small.
             run = run + loss.detach(); nb += 1
+            if args.log_every and nb % args.log_every == 0:
+                el = time.time() - t_ep
+                print(f"    step {nb}/{len(train_loader)}  loss={float(run)/nb:.4f}  "
+                      f"{nb*args.batch_size/el:.0f} img/s  ({el:.0f}s)", flush=True)
         run = float(run) / max(nb, 1)                 # one sync per epoch
         # Selection/checkpointing use the EMA weights when enabled: they are the
         # weights that would ship, so they are the ones that must win selection.
@@ -465,7 +473,8 @@ def main() -> int:
         else:
             since += 1
         print(f"  epoch {epoch:3d}/{args.epochs}  loss={run:.4f}  "
-              f"val_AUROC={vm['auroc']:.4f} acc={vm['acc']:.3f} kappa={vm['kappa']:.3f}{tag}")
+              f"val_AUROC={vm['auroc']:.4f} acc={vm['acc']:.3f} kappa={vm['kappa']:.3f}"
+              f"  [{time.time()-t_ep:.0f}s]{tag}", flush=True)
         csv_log.log({"epoch": epoch, "train_loss": round(run, 5),
                      **{f"val_{k}": round(v, 5) for k, v in vm.items() if k != "n"}})
         sched.step()
