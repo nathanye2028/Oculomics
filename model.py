@@ -55,6 +55,8 @@ class MBRSETClassifier(nn.Module):
     dropout     : dropout prob in the head.
     head_hidden : hidden width of the head MLP (default 256).
     freeze_backbone : train only the head (linear-probe).
+    backbone    : 'mobilenetv3_small' (default, the deployable model) or
+                  'timm:<name>' for a large teacher to distil from.
     """
 
     def __init__(
@@ -69,8 +71,48 @@ class MBRSETClassifier(nn.Module):
         freeze_backbone: bool = False,
         use_gcg: bool = False,
         gcg_variant: str = "baseline",
+        backbone: str = "mobilenetv3_small",
+        backbone_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
+        self.backbone_name = backbone
+        self.regression = regression
+        self.multilabel = multilabel
+        if regression:
+            out_dim = 1
+        else:
+            if num_classes is None:
+                raise ValueError("num_classes required for classification (or set regression=True).")
+            out_dim = int(num_classes)
+        self.num_classes = None if regression else out_dim
+
+        # ---- alternative backbones (teachers for distillation) ------------ #
+        # ``backbone="timm:<name>"`` swaps the MobileNetV3 trunk for any timm
+        # model (e.g. timm:convnext_small.fb_in22k_ft_in1k,
+        # timm:vit_base_patch14_dinov2.lvd142m). These are NOT mobile models;
+        # they exist to be distilled into the default one (train_mbrset.py
+        # --teacher). GCG is a MobileNetV3-specific mid/deep gate and is not
+        # applied here. The head is identical, so the checkpoint format is.
+        if backbone != "mobilenetv3_small":
+            if not backbone.startswith("timm:"):
+                raise ValueError(f"unknown backbone {backbone!r}; use 'mobilenetv3_small' or 'timm:<name>'")
+            import timm
+            self.backbone = timm.create_model(backbone[len("timm:"):], pretrained=pretrained,
+                                              num_classes=0, in_chans=in_channels,
+                                              **(backbone_kwargs or {}))
+            self.features = None
+            self.gcg = None
+            self.use_gcg = False
+            head_in = int(self.backbone.num_features)
+            self.feat_dim = head_in
+            self.head = nn.Sequential(
+                nn.Flatten(1), nn.Dropout(p=dropout), nn.Linear(head_in, head_hidden),
+                nn.Hardswish(inplace=True), nn.Dropout(p=dropout), nn.Linear(head_hidden, out_dim))
+            if freeze_backbone:
+                for p in self.backbone.parameters():
+                    p.requires_grad_(False)
+            return
+
         from torchvision.models import mobilenet_v3_small
 
         weights = None
@@ -120,16 +162,7 @@ class MBRSETClassifier(nn.Module):
         # The mid feature is concatenated whether or not it is gated, so the
         # control differs from GCG ONLY by the gating block (apples-to-apples).
         head_in = feat_dim + mid_ch
-
-        self.regression = regression
-        self.multilabel = multilabel
-        if regression:
-            out_dim = 1
-        else:
-            if num_classes is None:
-                raise ValueError("num_classes required for classification (or set regression=True).")
-            out_dim = int(num_classes)
-        self.num_classes = None if regression else out_dim
+        self.feat_dim = head_in            # pooled-embedding width (for distillation)
 
         # Custom classification head.
         self.head = nn.Sequential(
@@ -145,7 +178,10 @@ class MBRSETClassifier(nn.Module):
             for p in self.features.parameters():
                 p.requires_grad_(False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Pooled pre-head embedding [B, feat_dim] — what distillation matches."""
+        if self.features is None:                         # timm backbone
+            return self.backbone(x)                       # num_classes=0 -> pooled feats
         mid = None
         for i, blk in enumerate(self.features):
             x = blk(x)
@@ -154,12 +190,19 @@ class MBRSETClassifier(nn.Module):
         deep = x                                          # stride-32 semantic feature
         if self.gcg is not None:
             mid = self.gcg(mid, deep)                     # deep context gates mid
-        pooled = torch.cat([self.pool(deep).flatten(1),
-                            F.adaptive_avg_pool2d(mid, 1).flatten(1)], dim=1)
-        logits = self.head(pooled)
+        return torch.cat([self.pool(deep).flatten(1),
+                          F.adaptive_avg_pool2d(mid, 1).flatten(1)], dim=1)
+
+    def forward_with_feat(self, x: torch.Tensor):
+        """(logits, embedding) in one pass — avoids a second forward under KD."""
+        feat = self.embed(x)
+        logits = self.head(feat)
         if self.regression:
-            return logits.squeeze(-1)     # [B]
-        return logits                     # [B, num_classes]
+            logits = logits.squeeze(-1)
+        return logits, feat
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_feat(x)[0]   # [B, num_classes] (or [B] for regression)
 
     # ------------------------------------------------------------------ #
     @classmethod

@@ -134,6 +134,22 @@ python train_mbrset.py --dataset brset --root <BRSET> \
 python summarize_xfer.py --dir exp_xfer
 ```
 
+### Distillation + test-time BN adaptation (2026-08-22)
+
+The 5-seed transfer result (mBRSET AUROC ≈0.81, gap ≈−0.14, GCG null) says the
+gap is a *distribution* problem, so the two levers added are (a) a large
+fundus-competent teacher distilled into the unchanged mobile student and (b)
+label-free AdaBN on the target images. `run_kd_xfer.sh` runs the whole paired
+design (ctrl / teacher / kd per seed, all with `--bn-adapt`):
+
+```bash
+bash run_kd_xfer.sh 0 1 2            # on the GPU box, inside tmux
+python summarize_xfer.py --dir exp_kd --treatment kd --control ctrl
+```
+
+The deployed `kd` model is architecturally identical to `ctrl` (same params,
+same Core ML latency); only its training signal differs.
+
 Recipe notes (2026-08-20): imbalance is corrected once (balanced sampler; the
 old sampler+CE-weights double correction is reachable via `--imbalance both`),
 LR warms up 2 epochs then cosine-decays, AMP is auto-on for CUDA, and

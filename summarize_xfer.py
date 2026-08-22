@@ -84,7 +84,7 @@ def main() -> int:
         return 2
     unpaired = (set(runs[args.treatment]) ^ set(runs[args.control]))
     L = [f"\n{'='*76}",
-         "BRSET -> mBRSET TRANSFER: GCG vs control",
+         f"BRSET -> mBRSET TRANSFER: {args.treatment} vs {args.control}",
          f"  paired seeds={seeds}" + (f"   (dropped unpaired: {sorted(unpaired)})" if unpaired else ""),
          f"{'='*76}"]
 
@@ -122,6 +122,32 @@ def main() -> int:
                  f"{st['n_positive']}/{st['n']} seeds+  {verdict}")
         L.append(f"  {'':<16} {note}")
 
+    # ---- test-time BN adaptation (present when runs used --bn-adapt) ------- #
+    have_bn = all(runs[c][s].get("external_bnadapt") for c in (args.control, args.treatment)
+                  for s in seeds)
+    bn_stats = None
+    if have_bn:
+        L += ["", "-" * 76,
+              "TEST-TIME BN ADAPTATION (label-free AdaBN on mBRSET images; report separately):",
+              f"  {'condition':<10}{'zero-shot':<18}{'BN-adapted':<18}{'adapt effect (paired)':<24}"]
+        per_bn = {}
+        for cond in (args.control, args.treatment):
+            zs = [runs[cond][s]["external"]["auroc"] for s in seeds]
+            ad = [runs[cond][s]["external_bnadapt"]["auroc"] for s in seeds]
+            per_bn[cond] = dict(zip(seeds, ad))
+            eff = paired_stats(dict(zip(seeds, ad)), dict(zip(seeds, zs)))
+            zm, zsd = agg(zs); am, asd = agg(ad)
+            lo, hi = eff["ci95"]
+            L.append(f"  {cond:<10}{f'{zm:.4f}+/-{zsd:.4f}':<18}{f'{am:.4f}+/-{asd:.4f}':<18}"
+                     f"{eff['mean_delta']:+.4f} [{lo:+.4f},{hi:+.4f}] "
+                     f"{'SIG' if eff['significant'] else 'n.s.'}")
+        bn_stats = paired_stats(per_bn[args.treatment], per_bn[args.control])
+        lo, hi = bn_stats["ci95"]
+        L.append(f"  {args.treatment}-{args.control} on BN-adapted AUROC: "
+                 f"delta={bn_stats['mean_delta']:+.4f}  95%CI[{lo:+.4f},{hi:+.4f}]  "
+                 f"{bn_stats['n_positive']}/{bn_stats['n']} seeds+  "
+                 f"{'SIGNIFICANT' if bn_stats['significant'] else 'inconclusive'}")
+
     # ---- secondary metrics, flagged as prevalence-sensitive ----------------- #
     L += ["", "-" * 76,
           "Secondary metrics on mBRSET (prevalence-sensitive -- context only, not evidence):",
@@ -142,7 +168,9 @@ def main() -> int:
     with open(os.path.join(args.dir, "summary.json"), "w") as f:
         json.dump({"seeds": seeds, "per_condition": per,
                    "paired_external_auroc": {**ext_stats, "ci95": list(ext_stats["ci95"])},
-                   "paired_domain_gap": {**gap_stats, "ci95": list(gap_stats["ci95"])}},
+                   "paired_domain_gap": {**gap_stats, "ci95": list(gap_stats["ci95"])},
+                   "paired_external_bnadapt": ({**bn_stats, "ci95": list(bn_stats["ci95"])}
+                                               if bn_stats else None)},
                   f, indent=2)
     print(f"\n[info] wrote {args.dir}/summary.md and summary.json")
     return 0

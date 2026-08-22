@@ -107,6 +107,73 @@ class ModelEMA:
                 v.copy_(msd[k])
 
 
+def vit_like(backbone: str) -> bool:
+    return any(k in backbone for k in ("vit", "deit", "dinov2", "eva"))
+
+
+def backbone_kwargs_for(backbone: str, image_size: int) -> dict:
+    """timm ViT-style models need the input size at construction; convnets don't."""
+    return {"img_size": image_size} if (backbone.startswith("timm:") and vit_like(backbone)) else {}
+
+
+def load_teacher(path: str, device: torch.device, num_classes: int, task: str):
+    """Rebuild a train_mbrset.py checkpoint as a frozen teacher.
+
+    The checkpoint records its own backbone / gcg / image_size, so the student
+    run only names the file. Task and class count must match the student's —
+    distilling a dr_grade teacher into a dr_referable student is meaningless.
+    """
+    ck = torch.load(path, map_location="cpu")
+    a = ck.get("args", {})
+    if a.get("task", task) != task:
+        raise SystemExit(f"[fatal] teacher {path} was trained for task {a.get('task')!r}, "
+                         f"student is {task!r}")
+    bk = a.get("backbone", "mobilenetv3_small")
+    t = MBRSETClassifier(num_classes=num_classes, pretrained=False,
+                         use_gcg=not a.get("no_gcg", False),
+                         gcg_variant=a.get("gcg_variant", "baseline"),
+                         backbone=bk,
+                         backbone_kwargs=backbone_kwargs_for(bk, int(a.get("image_size", 224))))
+    t.load_state_dict(ck["model"])
+    t.eval().to(device)
+    for p in t.parameters():
+        p.requires_grad_(False)
+    if device.type == "cuda":
+        t = t.to(memory_format=torch.channels_last)
+    return t, bk, a, ck.get("val", {})
+
+
+@torch.no_grad()
+def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0) -> nn.Module:
+    """AdaBN: re-estimate BatchNorm running statistics on UNLABELLED target
+    images. Returns a deep copy; the input model is untouched.
+
+    Label-free and transductive: only the images flow through, in eval mode for
+    every non-BN layer (dropout off), with BN layers in cumulative-average mode
+    so the result is the exact mean/var over the batches seen, independent of
+    batch order. Nothing else in the network changes. This is the cheapest
+    domain-adaptation baseline there is, and for a tabletop->smartphone shift —
+    which is mostly colour/illumination/blur statistics — it is often most of
+    the available gain. Report it separately from the un-adapted number.
+    """
+    import copy
+    m = copy.deepcopy(model).eval()
+    bns = [b for b in m.modules() if isinstance(b, nn.modules.batchnorm._BatchNorm)]
+    for b in bns:
+        b.reset_running_stats()
+        b.momentum = None            # cumulative average over all adaptation batches
+        b.train()
+    for i, batch in enumerate(loader):
+        x = batch["image"].to(device, non_blocking=True)
+        if device.type == "cuda":
+            x = x.to(memory_format=torch.channels_last)
+        m(x)
+        if max_batches and i + 1 >= max_batches:
+            break
+    m.eval()
+    return m
+
+
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -197,6 +264,27 @@ def main() -> int:
     p.add_argument("--no-gcg", action="store_true")
     p.add_argument("--gcg-variant", default="baseline")
     p.add_argument("--no-pretrained", action="store_true")
+    # ---- knowledge distillation (teacher -> the mobile student) ---------- #
+    p.add_argument("--backbone", default="mobilenetv3_small",
+                   help="'mobilenetv3_small' (the deployable model) or 'timm:<name>' for a "
+                        "large TEACHER, e.g. timm:convnext_small.fb_in22k_ft_in1k or "
+                        "timm:vit_base_patch14_dinov2.lvd142m. Teachers are trained with "
+                        "this same script, then named via --teacher on the student run.")
+    p.add_argument("--teacher", default=None,
+                   help="Checkpoint of a teacher trained by this script (same --task, same "
+                        "--seed so the patient split matches). Enables distillation: "
+                        "loss = (1-a)*CE + a*T^2*KL(student||teacher) [+ feature term].")
+    p.add_argument("--kd-alpha", type=float, default=0.7, help="Weight on the KD term.")
+    p.add_argument("--kd-temp", type=float, default=4.0, help="Distillation temperature.")
+    p.add_argument("--distill-feat-weight", type=float, default=0.0,
+                   help=">0 adds a cosine feature-matching term between the student's pooled "
+                        "embedding (linearly projected) and the teacher's.")
+    # ---- test-time BatchNorm adaptation (label-free) ---------------------- #
+    p.add_argument("--bn-adapt", action="store_true",
+                   help="After the external test, re-estimate BN statistics on the external "
+                        "images (NO labels) and score again -> 'external_bnadapt'. AdaBN.")
+    p.add_argument("--bn-adapt-batches", type=int, default=0,
+                   help="Limit adaptation to the first N external batches (0 = all).")
     p.add_argument("--ckpt-dir", default="ck_mbrset")
     p.add_argument("--run-name", default=None)
     p.add_argument("--results-json", default=None)
@@ -262,10 +350,27 @@ def main() -> int:
     ext_loader = dl(ext_ds, shuffle=False) if ext_ds is not None else None
 
     model = MBRSETClassifier(num_classes=C, pretrained=not args.no_pretrained,
-                             use_gcg=not args.no_gcg, gcg_variant=args.gcg_variant).to(device)
+                             use_gcg=not args.no_gcg, gcg_variant=args.gcg_variant,
+                             backbone=args.backbone,
+                             backbone_kwargs=backbone_kwargs_for(args.backbone, args.image_size)
+                             ).to(device)
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
-    print(f"[info] model  : MobileNetV3-Small, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params")
+    print(f"[info] model  : {args.backbone}, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params")
+
+    # ---- teacher for distillation ---------------------------------------- #
+    teacher, proj = None, None
+    if args.teacher:
+        teacher, t_backbone, t_args, t_val = load_teacher(args.teacher, device, C, args.task)
+        if int(t_args.get("seed", args.seed)) != args.seed:
+            print(f"[warn] teacher seed {t_args.get('seed')} != student seed {args.seed}: "
+                  "the patient splits differ, so the teacher may have trained on images in "
+                  "this run's in-domain test split. Use matching seeds for a clean number.")
+        print(f"[info] teacher: {t_backbone} from {args.teacher}  "
+              f"(teacher val AUROC {t_val.get('auroc', float('nan')):.4f}; "
+              f"alpha={args.kd_alpha} T={args.kd_temp} feat_w={args.distill_feat_weight})")
+        if args.distill_feat_weight > 0:
+            proj = nn.Linear(model.feat_dim, teacher.feat_dim).to(device)
 
     # Optional EMA shadow of the weights: the averaged model is what gets
     # evaluated and checkpointed, so downstream loading is unchanged. Float
@@ -280,7 +385,8 @@ def main() -> int:
 
     cw = train_ds.class_weights().to(device) if use_loss_w else None
     crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    params = list(model.parameters()) + (list(proj.parameters()) if proj is not None else [])
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     warm = max(0, min(args.warmup_epochs, args.epochs - 1))
     cos = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs - warm))
     if warm > 0:
@@ -304,7 +410,21 @@ def main() -> int:
                 x = x.to(memory_format=torch.channels_last)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                loss = crit(model(x), y)
+                if teacher is None:
+                    loss = crit(model(x), y)
+                else:
+                    s_logits, s_feat = model.forward_with_feat(x)
+                    with torch.no_grad():
+                        t_logits, t_feat = teacher.forward_with_feat(x)
+                    Tt = args.kd_temp
+                    # KL in fp32: softmax at T=4 on fp16 logits is lossy.
+                    kd = F.kl_div(F.log_softmax(s_logits.float() / Tt, dim=1),
+                                  F.softmax(t_logits.float() / Tt, dim=1),
+                                  reduction="batchmean") * (Tt * Tt)
+                    loss = (1.0 - args.kd_alpha) * crit(s_logits, y) + args.kd_alpha * kd
+                    if proj is not None:
+                        cos = F.cosine_similarity(proj(s_feat.float()), t_feat.float(), dim=1)
+                        loss = loss + args.distill_feat_weight * (1.0 - cos).mean()
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
             if ema is not None:
@@ -363,6 +483,19 @@ def main() -> int:
         print("    NB: one seed. Run >=3 and report mean+/-std, and check the class")
         print("    prevalence of both sets before attributing this gap to the images.")
 
+    em_adapt = None
+    if ext_loader is not None and args.bn_adapt:
+        adapted = adapt_bn(model, ext_loader, device, max_batches=args.bn_adapt_batches)
+        em_adapt = evaluate(adapted, ext_loader, device, C)
+        print(f"\n=== EXTERNAL TEST after BN adaptation (label-free AdaBN on "
+              f"{args.external_test_dataset} images) ===")
+        print(f"  AUROC={em_adapt['auroc']:.4f}  acc={em_adapt['acc']:.4f}  "
+              f"macroF1={em_adapt['f1']:.4f}  kappa={em_adapt['kappa']:.4f}  n={em_adapt['n']}")
+        print(f"  BN-adapt effect: {em['auroc']:.4f} -> {em_adapt['auroc']:.4f}   "
+              f"delta={em_adapt['auroc'] - em['auroc']:+.4f}  (paired within this run)")
+        print("  NB: uses the external IMAGES (never labels) to re-estimate BN stats;")
+        print("      report it as 'test-time adapted', separately from the zero-shot number.")
+
     if args.results_json:
         with open(args.results_json, "w") as f:
             json.dump({"task": args.task, "use_gcg": not args.no_gcg,
@@ -374,6 +507,11 @@ def main() -> int:
                        "external_dataset": args.external_test_dataset if em else None,
                        "external": em, "n_external": len(ext_ds) if ext_ds is not None else 0,
                        "domain_gap_auroc": (em["auroc"] - tm["auroc"]) if em else None,
+                       "external_bnadapt": em_adapt,
+                       "backbone": args.backbone, "teacher": args.teacher,
+                       "kd": ({"alpha": args.kd_alpha, "temp": args.kd_temp,
+                               "feat_weight": args.distill_feat_weight} if args.teacher else None),
+                       "params_m": round(sum(q.numel() for q in model.parameters()) / 1e6, 4),
                        "args": vars(args)}, f, indent=2)
         print(f"[info] wrote {args.results_json}")
     return 0
