@@ -80,7 +80,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import MBRSETDataset, stratified_split      # noqa: E402
+from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
@@ -287,6 +287,11 @@ def main() -> int:
                         "images (NO labels) and score again -> 'external_bnadapt'. AdaBN.")
     p.add_argument("--bn-adapt-batches", type=int, default=0,
                    help="Limit adaptation to the first N external batches (0 = all).")
+    p.add_argument("--gpu-aug", dest="gpu_aug", action="store_true", default=None,
+                   help="Run the photometric/blur/erasing augmentation on the GPU per batch "
+                        "instead of in CPU workers (default: on for CUDA). Same ops and "
+                        "ranges; lifts the CPU-bound ~145 img/s cap.")
+    p.add_argument("--no-gpu-aug", dest="gpu_aug", action="store_false")
     p.add_argument("--log-every", type=int, default=100,
                    help="Print a step-progress line every N training steps (0 = off).")
     p.add_argument("--ckpt-dir", default="ck_mbrset")
@@ -307,9 +312,12 @@ def main() -> int:
     # Patient-grouped, label-stratified 70/10/20 split (no patient leakage).
     splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
                               test_frac=0.20, group_col="patient", seed=args.seed)
+    gpu_aug = args.gpu_aug if args.gpu_aug is not None else (device.type == "cuda")
     mk = lambda df, sp, d=img_dir: MBRSETDataset(csv=df, images_dir=d, task=args.task,
                                                  split=sp, image_size=args.image_size,
-                                                 drop_missing_files=True, fov_crop=True)
+                                                 drop_missing_files=True, fov_crop=True,
+                                                 device_aug=(gpu_aug and sp == "train"))
+    dev_aug = DeviceAug() if gpu_aug else None
     train_ds, val_ds, test_ds = mk(splits["train"], "train"), mk(splits["val"], "val"), mk(splits["test"], "val")
     C = train_ds.num_classes
 
@@ -392,7 +400,7 @@ def main() -> int:
     use_amp = args.amp if args.amp is not None else (device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
     print(f"[info] amp    : {'on' if use_amp else 'off'}  channels_last={'on' if use_cl else 'off'}  "
-          f"imbalance={args.imbalance}")
+          f"gpu_aug={'on' if gpu_aug else 'off'}  imbalance={args.imbalance}")
 
     cw = train_ds.class_weights().to(device) if use_loss_w else None
     crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
@@ -419,6 +427,8 @@ def main() -> int:
         for batch in train_loader:
             x = batch["image"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
+            if dev_aug is not None:
+                x = dev_aug(x)                        # fp32, before autocast
             if use_cl:
                 x = x.to(memory_format=torch.channels_last)
             opt.zero_grad(set_to_none=True)
