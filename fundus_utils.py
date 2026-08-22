@@ -83,6 +83,7 @@ def seed_everything(seed: int = 42, deterministic: bool = True,
     np.random.seed(seed)
     torch.manual_seed(seed)
     _reset_main_process_draws()      # make_rng's num_workers=0 sequence replays
+    _quiet_nnpack()
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     # Precision, independent of determinism: TF32 silently zeroes the smallest
@@ -102,9 +103,20 @@ def seed_everything(seed: int = 42, deterministic: bool = True,
             pass
 
 
+def _quiet_nnpack() -> None:
+    """Don't let CPU convs (e.g. torchvision GaussianBlur in workers) probe
+    NNPACK: on CPUs without it every worker prints 'Could not initialize
+    NNPACK! Reason: Unsupported hardware.' and then falls back anyway."""
+    try:
+        torch.backends.nnpack.set_flags(False)
+    except Exception:          # older/newer torch without the flag: harmless
+        pass
+
+
 def seed_worker(worker_id: int) -> None:
     """DataLoader ``worker_init_fn``: derive numpy/random seeds from torch's
     per-worker base seed so each worker is seeded differently yet deterministically."""
+    _quiet_nnpack()
     base = torch.initial_seed() % (2 ** 32)
     np.random.seed(base)
     random.seed(base)
