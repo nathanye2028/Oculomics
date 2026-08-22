@@ -8,9 +8,9 @@
 #
 # Per seed it trains THREE models on the same patient split (same --seed), all
 # scored zero-shot on mBRSET and again after label-free AdaBN (--bn-adapt):
-#   ctrl_seed<s>     MobileNetV3-Small student, no teacher        (the control)
+#   ctrl_seed<s>     mobile student ($STUDENT; MobileNetV3-Small default), no teacher
 #   teacher_seed<s>  large timm backbone (ImageNet-22k ConvNeXt-S by default)
-#   kd_seed<s>       MobileNetV3-Small student distilled from teacher_seed<s>
+#   kd_seed<s>       same student architecture, distilled from teacher_seed<s>
 # ctrl and kd are identical in every way except the distillation term, so
 # summarize_xfer.py's paired kd-minus-ctrl is attributable to distillation; the
 # BN-adapt effect is paired within each run. The deployed model (kd) has the
@@ -27,6 +27,10 @@ B=${B:-/data/users4/nshaik3/Datasets/BRSET/physionet.org/files/brazilian-ophthal
 M=${M:-/data/users4/nshaik3/Datasets/mBRSET/physionet.org/files/mbrset/1.0}
 OUT=${OUT:-exp_kd}
 CK=${CK:-ck_kd}
+TEACHER_CK=${TEACHER_CK:-$CK}    # where teachers live. Point a 2nd sweep (different
+                                 # STUDENT, same seeds) at the 1st sweep's dir to reuse them.
+STUDENT=${STUDENT:-mobilenetv3_small}   # the deployable model (ctrl AND kd). e.g.
+                                         # timm:mobilenetv4_conv_small.e2400_r224_in1k
 TEACHER=${TEACHER:-timm:convnext_small.fb_in22k_ft_in1k}   # or timm:vit_base_patch14_dinov2.lvd142m
 TEACHER_LR=${TEACHER_LR:-1e-4}
 SIZE=${SIZE:-224}
@@ -59,11 +63,19 @@ run() {  # run <name> <flags...>
 
 for s in "${SEEDS[@]}"; do
   # 1) control: the deployable student, no teacher
-  run "ctrl_seed$s"    --seed "$s" $EXTRA
+  run "ctrl_seed$s"    --seed "$s" --backbone "$STUDENT" $EXTRA
   # 2) teacher: large backbone, same split. GCG flags are ignored for timm backbones.
-  run "teacher_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR" $TEACHER_EXTRA
+  #    Reused (not retrained) if TEACHER_CK already holds it from another sweep —
+  #    legitimate because the same seed gives the same patient split.
+  if [ -f "$TEACHER_CK/teacher_seed$s.pt" ] && [ ! -f "$OUT/teacher_seed$s.json" ]; then
+    echo "[reuse] teacher $TEACHER_CK/teacher_seed$s.pt (trained by another sweep)"
+  else
+    mkdir -p "$TEACHER_CK"
+    run "teacher_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR" \
+                         --ckpt-dir "$TEACHER_CK" $TEACHER_EXTRA
+  fi
   # 3) student distilled from that teacher (same seed => same patient split)
-  run "kd_seed$s"      --seed "$s" --teacher "$CK/teacher_seed$s.pt" \
+  run "kd_seed$s"      --seed "$s" --backbone "$STUDENT" --teacher "$TEACHER_CK/teacher_seed$s.pt" \
                        --kd-alpha "$KD_ALPHA" --kd-temp "$KD_TEMP" \
                        --distill-feat-weight "$FEAT_W" $EXTRA
 done

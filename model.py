@@ -103,7 +103,15 @@ class MBRSETClassifier(nn.Module):
             self.features = None
             self.gcg = None
             self.use_gcg = False
-            head_in = int(self.backbone.num_features)
+            # Probe the real pooled width: timm's num_features is the PRE-head
+            # width, and e.g. MobileNetV4 has a conv head after pooling
+            # (960 -> 1280), so trusting num_features mis-sizes the head.
+            probe = int((backbone_kwargs or {}).get("img_size", 224))
+            with torch.no_grad():
+                was_training = self.backbone.training
+                self.backbone.eval()
+                head_in = int(self.backbone(torch.zeros(1, in_channels, probe, probe)).shape[1])
+                self.backbone.train(was_training)
             self.feat_dim = head_in
             self.head = nn.Sequential(
                 nn.Flatten(1), nn.Dropout(p=dropout), nn.Linear(head_in, head_hidden),
