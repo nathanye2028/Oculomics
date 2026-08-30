@@ -46,6 +46,7 @@ TEACHER_EXTRA=${TEACHER_EXTRA:-} # extra flags for the teacher only
 TRAIN_DATASET=${TRAIN_DATASET:-brset}   # schema of $B (brset); mbrset only for local smoke tests
 
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
+export OUT    # the teacher-ceiling printout below reads it from the environment
 mkdir -p "$OUT" "$CK"
 [ -d "$B" ] || { echo "[fatal] BRSET root not found: $B"; exit 1; }
 [ -d "$M" ] || { echo "[fatal] mBRSET root not found: $M"; exit 1; }
