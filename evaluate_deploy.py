@@ -121,8 +121,16 @@ def bench_onnx(path, x_np, runs=20):
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Deployment evaluation: FP32 vs INT8 accuracy, latency, operating point.")
-    p.add_argument("--root", required=True, help="mBRSET 1.0 dir.")
-    p.add_argument("--ckpt", required=True, help="Trained checkpoint (e.g. ck_mbrset8/gcg_seed0.pt).")
+    p.add_argument("--root", required=True,
+                   help="Root of the dataset the checkpoint was TRAINED on (mBRSET dir, or "
+                        "BRSET dir for a --dataset brset checkpoint; auto-detected from the "
+                        "checkpoint's recorded args).")
+    p.add_argument("--ckpt", required=True, help="Trained checkpoint (e.g. ck_kd_v4_384/kd_seed1.pt).")
+    p.add_argument("--external-root", default=None,
+                   help="Optional second dataset (e.g. mBRSET for a BRSET-trained checkpoint): "
+                        "reports the deployment operating point on the TARGET domain, with the "
+                        "threshold still calibrated on the in-domain VAL split.")
+    p.add_argument("--external-dataset", default="mbrset", choices=["mbrset", "brset"])
     p.add_argument("--target-sens", type=float, default=0.85,
                    help="Screening sensitivity to calibrate the threshold for (on VAL).")
     p.add_argument("--tta", action="store_true", help="Horizontal-flip test-time augmentation.")
@@ -146,25 +154,25 @@ def main() -> int:
     img_size = int(ca.get("image_size", 224))
     use_gcg = not ca.get("no_gcg", False)
     variant = ca.get("gcg_variant", "baseline")
+    backbone = ca.get("backbone", "mobilenetv3_small")
+    train_dataset = ca.get("dataset", "mbrset")
     seed_everything(seed)
     device = pick_device()
 
     print(f"[info] ckpt   : {args.ckpt}")
-    print(f"[info] config : task={task} seed={seed} size={img_size} gcg={'on:'+variant if use_gcg else 'off'}")
+    print(f"[info] config : task={task} seed={seed} size={img_size} backbone={backbone} "
+          f"gcg={'on:'+variant if use_gcg else 'off'} trained_on={train_dataset}")
 
-    # Rebuild the EXACT split this checkpoint was trained with. That claim only
-    # holds if the checkpoint really was trained on mBRSET: a --dataset brset
-    # checkpoint would silently get a *different dataset's* split here.
-    if ca.get("dataset", "mbrset") != "mbrset":
-        raise SystemExit(f"[fatal] checkpoint was trained on dataset={ca['dataset']!r}, but this "
-                         "script reconstructs splits from labels_mbrset.csv only. Re-run with an "
-                         "mBRSET-trained checkpoint (or extend the script to call "
-                         "brset_dataset.load_any with the recorded dataset).")
-    splits = stratified_split(os.path.join(args.root, "labels_mbrset.csv"), task=task,
-                              val_frac=0.10, test_frac=0.20, group_col="patient", seed=seed)
-    img_dir = os.path.join(args.root, "images")
-    mk = lambda df: MBRSETDataset(csv=df, images_dir=img_dir, task=task, split="val",
-                                  image_size=img_size, drop_missing_files=True, fov_crop=True)
+    # Rebuild the EXACT split this checkpoint was trained with, from the dataset
+    # it was trained on — load_any resolves mBRSET vs BRSET layouts and applies
+    # brset_dataset's schema/value re-encoding, matching train_mbrset.py.
+    from brset_dataset import load_any
+    src_data = load_any(args.root, train_dataset)
+    splits = stratified_split(src_data["df"], task=task, val_frac=0.10,
+                              test_frac=0.20, group_col="patient", seed=seed)
+    mk = lambda df, d=src_data["images_dir"]: MBRSETDataset(
+        csv=df, images_dir=d, task=task, split="val",
+        image_size=img_size, drop_missing_files=True, fov_crop=True)
     val_ds, test_ds = mk(splits["val"]), mk(splits["test"])
     C = test_ds.num_classes
     if C != 2:
@@ -174,8 +182,20 @@ def main() -> int:
     val_loader, test_loader = dl(val_ds), dl(test_ds)
     print(f"[info] splits : val={len(val_ds)} test={len(test_ds)} (patient-grouped, from seed {seed})")
 
+    ext_loader = None
+    if args.external_root:
+        ext = load_any(args.external_root, args.external_dataset)
+        ext_ds = MBRSETDataset(csv=ext["df"], images_dir=ext["images_dir"], task=task,
+                               split="val", image_size=img_size,
+                               drop_missing_files=True, fov_crop=True)
+        ext_loader = dl(ext_ds)
+        print(f"[info] extern : {args.external_dataset} @ {args.external_root} n={len(ext_ds)}")
+
+    from train_mbrset import backbone_kwargs_for
     model = MBRSETClassifier(num_classes=C, pretrained=False,
-                             use_gcg=use_gcg, gcg_variant=variant).to(device)
+                             use_gcg=use_gcg, gcg_variant=variant,
+                             backbone=backbone,
+                             backbone_kwargs=backbone_kwargs_for(backbone, img_size)).to(device)
     model.load_state_dict(ck["model"])
 
     # ---------- FP32 ----------
@@ -187,6 +207,19 @@ def main() -> int:
     fp32_op = binary_report(ts, ty, thr)
     print(f"\n[info] threshold calibrated on VAL for sensitivity>={args.target_sens}: "
           f"{thr:.4f}  (val sens={vsens:.3f} spec={vspec:.3f})")
+
+    ext_report = None
+    if ext_loader is not None:
+        es, ey = torch_scores(model, ext_loader, device, tta=args.tta)
+        ext_auroc = float(roc_auc_score(ey, es))
+        ext_report = {"auroc": ext_auroc, **binary_report(es, ey, thr), "n": int(len(ey))}
+        print(f"\n=== TARGET-DOMAIN operating point ({args.external_dataset}, threshold from "
+              "in-domain VAL) ===")
+        print(f"  AUROC={ext_auroc:.4f}  sens={ext_report['sensitivity']:.3f}  "
+              f"spec={ext_report['specificity']:.3f}  ppv={ext_report['ppv']:.3f}  "
+              f"npv={ext_report['npv']:.3f}  (n={len(ey)})")
+        print("  NB: the threshold was chosen on source-domain val; a threshold shift is part")
+        print("      of the domain gap and belongs in the report, not hidden by re-tuning.")
 
     # ---------- export + INT8 ----------
     fp32_pt = os.path.join(args.out_dir, "model_fp32.pt")
@@ -200,7 +233,9 @@ def main() -> int:
     model.to(device)
 
     res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
-           "use_gcg": use_gcg, "tta": args.tta, "n_test": int(len(ty))}
+           "use_gcg": use_gcg, "backbone": backbone, "train_dataset": train_dataset,
+           "tta": args.tta, "n_test": int(len(ty)), "external": ext_report,
+           "external_dataset": args.external_dataset if ext_report else None}
 
     int8_ok = True
     try:
