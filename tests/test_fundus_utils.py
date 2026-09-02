@@ -1,9 +1,25 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 from fundus_utils import (fov_bbox, crop_to_fov, focal_tversky_loss, tversky_loss,
-                          random_patch, make_rng, tiled_predict, seed_everything)
+                          random_patch, make_rng, pick_device, tiled_predict,
+                          seed_everything, seed_worker)
+
+
+class _DrawDataset(Dataset):
+    """Yields (index, first make_rng draw). Module-level on purpose: macOS
+    DataLoader workers are spawned, so the class must be importable by name."""
+
+    def __init__(self, n: int, seed: int) -> None:
+        self.n, self.seed = n, seed
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i: int):
+        return i, float(make_rng(self.seed, i).random())
 
 
 def test_fov_bbox_and_crop():
@@ -51,6 +67,38 @@ def test_make_rng_reproducible_yet_diverse():
     b1 = make_rng(42, 3).random()
     b2 = make_rng(42, 3).random()
     assert (a1, a2) == (b1, b2)
+
+
+def _draws_per_index(seed: int, epochs: int = 3, n: int = 6):
+    """{index: [draw per epoch]} through 2 PERSISTENT workers, as train_idrid
+    builds its loader. Persistent workers keep torch.initial_seed() fixed for
+    the whole run, which is exactly the case that used to collapse to one draw."""
+    seed_everything(seed)
+    g = torch.Generator(); g.manual_seed(seed)
+    loader = DataLoader(_DrawDataset(n, seed), batch_size=1, shuffle=True,
+                        num_workers=2, persistent_workers=True,
+                        worker_init_fn=seed_worker, generator=g)
+    out = {i: [] for i in range(n)}
+    for _ in range(epochs):
+        for idx, draw in loader:
+            out[int(idx)].append(float(draw))
+    return out
+
+
+def test_make_rng_diverse_across_epochs_with_persistent_workers():
+    draws = _draws_per_index(seed=7, epochs=3)
+    for i, vals in draws.items():
+        assert len(vals) == 3
+        assert len(set(vals)) == 3, f"index {i}: persistent worker replayed {vals}"
+    # Still reproducible: same seed, same shuffle -> same worker/index/draw order.
+    assert _draws_per_index(seed=7, epochs=3) == draws
+
+
+def test_pick_device_explicit_and_fallback():
+    assert pick_device("cpu").type == "cpu"
+    assert pick_device().type in ("cuda", "mps", "cpu")
+    # DDP never lands on MPS (no backend) — only cuda:<rank> or cpu.
+    assert pick_device(local_rank=0, ddp=True).type in ("cuda", "cpu")
 
 
 def test_tiled_predict_shape():

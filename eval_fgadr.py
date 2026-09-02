@@ -33,7 +33,7 @@ import argparse
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch
@@ -43,8 +43,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fgadr_dataset import (                        # noqa: E402
     FGADRSegDataset, IMAGENET_MEAN, IMAGENET_STD,
 )
-from fundus_utils import tiled_predict             # noqa: E402
-from metrics import dice_iou_from_counts           # noqa: E402
+from fundus_utils import tiled_predict, pick_device                    # noqa: E402
+from metrics import dice_iou_from_counts, sens_prec_from_counts        # noqa: E402
 
 # Overlay colours per lesion (RGB), chosen to stay distinguishable when blended.
 _COLOURS = {
@@ -52,16 +52,6 @@ _COLOURS = {
     "EX": (64, 224, 96), "SE": (96, 160, 255),
     "IRMA": (224, 96, 224), "NV": (255, 255, 96),
 }
-
-
-def pick_device(explicit: Optional[str] = None) -> torch.device:
-    if explicit:
-        return torch.device(explicit)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def load_model(path: str, device: torch.device, arch: str, use_gcg: "bool | None"):
@@ -82,6 +72,26 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: "bool | None
         print(f"[warn] checkpoint records no lesion list; assuming {lesions}")
 
     ck_args = ck.get("args", {}) if isinstance(ck, dict) else {}
+    state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
+
+    if arch == "baseline":
+        # The vanilla U-Net (train_idrid.py --arch baseline) is not built by
+        # model_seg.build_model; it has its own factory and a `base` width the
+        # checkpoint's recorded args carry.
+        from unet_baseline import build_baseline
+        base = int(ck_args.get("base", 32))
+        print(f"[info] arch: baseline U-Net (base={base}) — no GCG")
+        net = build_baseline(num_classes=len(lesions), base=base)
+        missing, unexpected = net.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise SystemExit(f"[fatal] baseline U-Net key mismatch: {len(missing)} missing "
+                             f"(e.g. {list(missing)[:3]}), {len(unexpected)} unexpected "
+                             f"(e.g. {list(unexpected)[:3]}). Is --arch right for this "
+                             "checkpoint?")
+        if isinstance(ck, dict) and "epoch" in ck:
+            print(f"[info] checkpoint epoch {ck['epoch']}")
+        return net.eval().to(device), list(lesions)
+
     if use_gcg is None:
         use_gcg = not ck_args.get("no_gcg", False)
         print(f"[info] gcg from checkpoint: {'on' if use_gcg else 'off'}")
@@ -89,6 +99,20 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: "bool | None
         raise SystemExit(f"[fatal] checkpoint was trained with no_gcg={ck_args['no_gcg']} "
                          f"but the CLI requests use_gcg={use_gcg}. Drop the flag to use "
                          f"the recorded setting, or pass a matching checkpoint.")
+
+    # Which gate: the checkpoint records --gcg-variant. Building the default
+    # GuidedContextGating for an 'attention'/'cbam'/'se' checkpoint would fail
+    # the key check below with a message that does not say why.
+    variant = ck_args.get("gcg_variant") or "baseline"
+    gcg_factory = None
+    if use_gcg and variant != "baseline":
+        from gcg_blocks import GCG_VARIANTS
+        if variant not in GCG_VARIANTS:
+            raise SystemExit(f"[fatal] checkpoint records gcg_variant={variant!r}, which is "
+                             f"not in gcg_blocks.GCG_VARIANTS {sorted(GCG_VARIANTS)}")
+        gcg_factory = GCG_VARIANTS[variant]
+    if use_gcg:
+        print(f"[info] gcg variant from checkpoint: {variant}")
 
     from model_seg import arch_cfg_from_checkpoint, build_model
     # The checkpoint records which encoder/decoder it was trained with; honour it
@@ -98,13 +122,13 @@ def load_model(path: str, device: torch.device, arch: str, use_gcg: "bool | None
     print(f"[info] arch from checkpoint: encoder={cfg['encoder']} decoder={cfg['decoder']} "
           f"lateral={cfg['lateral_channels']}")
     net = build_model(arch=arch, num_classes=len(lesions), pretrained=False,
-                      use_gcg=use_gcg, **cfg)
-    state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
+                      use_gcg=use_gcg, gcg_factory=gcg_factory, **cfg)
     missing, unexpected = net.load_state_dict(state, strict=False)
     gcg_mismatch = [k for k in list(missing) + list(unexpected) if "gcg" in k.lower()]
     if gcg_mismatch:
-        raise SystemExit(f"[fatal] GCG parameter mismatch between checkpoint and built model "
-                         f"(e.g. {gcg_mismatch[:3]}). Scoring would use randomly-initialised "
+        raise SystemExit(f"[fatal] GCG parameter mismatch between checkpoint and the built "
+                         f"model (gcg_variant={variant!r}, use_gcg={use_gcg}; e.g. "
+                         f"{gcg_mismatch[:3]}). Scoring would use randomly-initialised "
                          f"gates; refusing.")
     if missing:
         print(f"[warn] {len(missing)} missing keys, e.g. {missing[:3]}")
@@ -149,7 +173,9 @@ def main() -> int:
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--limit", type=int, default=None, help="Evaluate only the first N images.")
     p.add_argument("--thresh", type=float, default=0.5)
-    p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"])
+    p.add_argument("--arch", default="gcg_unet", choices=["baseline", "gcg_unet"],
+                   help="'baseline' = the vanilla U-Net from unet_baseline.py (its width is "
+                        "read from the checkpoint). Gating flags do not apply to it.")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--no-gcg", dest="gcg", action="store_false",
                    help="Force gating OFF (default: read from the checkpoint).")
@@ -217,21 +243,24 @@ def main() -> int:
             print(f"\r  {i+1}/{n} images ({time.time()-t0:.0f}s)", end="", flush=True)
     print()
 
+    # Same count->metric helpers as train_idrid.py, so this script reproduces a
+    # run's recorded numbers exactly. Sensitivity with no GT pixels (tsum==0)
+    # and precision with no predicted pixels (psum==0) are NaN, not 0: a
+    # clamped 0/eps would read as "collapsed" for a lesion that was merely
+    # absent from a --limit subset, and would deflate the column mean.
     dice, iou = dice_iou_from_counts(inter, psum, tsum, lesions)
-    sens = (inter / tsum.clamp(min=1e-6))
-    prec = (inter / psum.clamp(min=1e-6))
+    sens, prec = sens_prec_from_counts(inter, psum, tsum, lesions)
 
     print(f"\n=== FGADR {args.split} — {n} images @ thresh {args.thresh} ===")
     print(f"{'lesion':<7}{'dice':>8}{'IoU':>8}{'sens':>8}{'prec':>8}{'imgs w/o lesion':>18}")
     print("-" * 57)
     for i, c in enumerate(lesions):
-        print(f"{c:<7}{dice[c]:>8.4f}{iou[c]:>8.4f}{sens[i]:>8.4f}{prec[i]:>8.4f}"
+        print(f"{c:<7}{dice[c]:>8.4f}{iou[c]:>8.4f}{sens[c]:>8.4f}{prec[c]:>8.4f}"
               f"{int(empty_gt[i]):>13}/{n:<4}")
     print("-" * 57)
-    # nanmean: dice_iou_from_counts scores a lesion absent from both pred and GT
-    # as NaN (unscoreable), not 0 — averaging in a 0 would deflate the mean.
+    # nanmean throughout: NaN means "unscoreable here", and must not count as 0.
     print(f"{'mean':<7}{np.nanmean(list(dice.values())):>8.4f}{np.nanmean(list(iou.values())):>8.4f}"
-          f"{sens.mean():>8.4f}{prec.mean():>8.4f}")
+          f"{np.nanmean(list(sens.values())):>8.4f}{np.nanmean(list(prec.values())):>8.4f}")
 
     # Interpretation hints — the failure modes Dice alone hides.
     for i, c in enumerate(lesions):
@@ -247,9 +276,9 @@ def main() -> int:
             print(f"[diag] {c}: predicted {int(psum[i])} px but ZERO overlap with the "
                   f"{int(tsum[i])} px of ground truth — not collapsed, just wrong "
                   "everywhere. Expected from an undertrained model.")
-        elif sens[i] > 0.9 and prec[i] < 0.05:
+        elif sens[c] > 0.9 and prec[c] < 0.05:
             print(f"[diag] {c}: over-predicting {ratio:.0f}x the true lesion area "
-                  f"(sens {sens[i]:.2f}, prec {prec[i]:.3f}) — expected early in "
+                  f"(sens {sens[c]:.2f}, prec {prec[c]:.3f}) — expected early in "
                   "training; recovers as it sharpens.")
     if args.save_overlays:
         print(f"\n[ok] overlays in {args.save_overlays}/ (left = ground truth, right = prediction)")

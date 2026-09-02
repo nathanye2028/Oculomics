@@ -39,6 +39,13 @@ Scaling to large batches / multiple GPUs
 ----------------------------------------
 Effective batch = ``batch_size * accum_steps * num_gpus``.
 
+Accumulation is exactly gradient-equivalent to one large batch only for
+per-pixel losses (BCE / focal BCE, which are means over pixels). The Tversky
+terms pool tp/fp/fn over the whole batch *before* dividing, so accumulating
+``accum_steps`` micro-batches is a mean of per-micro-batch Tversky losses, not
+the Tversky of the union — close, but not identical, and noisier for the
+sparsest lesion (MA) where a micro-batch can hold zero positives.
+
   * One GPU, big effective batch via accumulation + fp16:
         python train_idrid.py --amp --batch-size 8 --accum-steps 4
   * Multi-GPU (DistributedDataParallel) via torchrun — batch shards across GPUs:
@@ -53,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 
 from contextlib import nullcontext
@@ -67,11 +75,36 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS, IMAGENET_MEAN, IMAGENET_STD  # noqa: E402
 from fundus_utils import (  # noqa: E402
-    seed_everything, seed_worker, focal_tversky_loss, tversky_loss, tiled_predict,
+    seed_everything, seed_worker, focal_tversky_loss, tversky_loss, tiled_predict, pick_device,
 )
+from fgadr_dataset import DEFAULT_SPLIT_SEED, DEFAULT_VAL_FRAC, DEFAULT_TEST_FRAC  # noqa: E402
 from metrics import dice_iou_from_counts, sens_prec_from_counts, mean_present, CSVLogger  # noqa: E402
 
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
+
+# Per-source salt added to --seed before it reaches each loader's make_rng.
+# make_rng keys on (seed, index), so without this IDRiD image k and FGADR image
+# k would draw the IDENTICAL flip / rotation / jitter / crop-offset stream
+# every epoch — correlated augmentation across sources that a mixed batch has
+# no way to notice. IDRiD stays at offset 0 so IDRiD-only runs reproduce
+# pre-salt results bit-for-bit. Offsets are far apart so no plausible --seed
+# range makes two sources collide.
+SOURCE_SEED_OFFSET = {"idrid": 0, "eophtha": 10_007, "fgadr": 20_011, "retlesion": 30_013}
+
+
+def git_commit() -> "str | None":
+    """Short hash of the checked-out commit, or None (not a repo / no git).
+
+    Best-effort; recorded in results so a number can be traced to code."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=os.path.dirname(os.path.abspath(__file__)),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip() or None
+    except Exception:                       # noqa: BLE001 - never fail a run over this
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -92,14 +125,6 @@ def all_reduce_sum(*tensors):
     if is_dist():
         for t in tensors:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-
-def pick_device(local_rank: int, ddp: bool) -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{local_rank}" if ddp else "cuda")
-    if torch.backends.mps.is_available() and not ddp:
-        return torch.device("mps")        # MPS has no DDP backend -> CPU under torchrun
-    return torch.device("cpu")
 
 
 def make_loss(name: str):
@@ -337,8 +362,9 @@ def main() -> int:
                    help="Training sources. IDRiD is always the val/test set. "
                         "'eophtha' adds 47 EX-only images; 'retlesion' adds ~1.4k "
                         "MA + ~0.5k cotton-wool-spot annotated images; 'fgadr' adds "
-                        "1475 fully-annotated (MA/HE/EX/SE) images and is scored on "
-                        "its own 367-image test split in addition to IDRiD's.")
+                        "1290 fully-annotated (MA/HE/EX/SE) train images, selects on "
+                        "its 185-image val split and is scored on its own 367-image "
+                        "test split in addition to IDRiD's (fixed split_seed=42).")
     p.add_argument("--eophtha-root", default=None)
     p.add_argument("--retlesion-root", default=None)
     p.add_argument("--fgadr-root", default=None,
@@ -366,7 +392,11 @@ def main() -> int:
     p.add_argument("--tile-batch", type=int, default=8, help="Tiles per forward pass (CUDA win; modest on MPS).")
     p.add_argument("--batch-size", type=int, default=2, help="PHYSICAL micro-batch held in memory.")
     p.add_argument("--accum-steps", type=int, default=1,
-                   help="Gradient accumulation: effective batch = batch-size * accum-steps.")
+                   help="Gradient accumulation: effective batch = batch-size * accum-steps. "
+                        "Gradient-equivalent to one large batch ONLY for per-pixel losses "
+                        "(BCE terms); the pooled Tversky term is averaged over micro-batches "
+                        "instead of computed on their union, so accum=4 x batch=2 is not "
+                        "numerically the same run as batch=8.")
     p.add_argument("--amp", action="store_true",
                    help="Mixed precision (fp16) -> less memory, faster matmuls.")
     p.add_argument("--epochs", type=int, default=120,
@@ -445,6 +475,21 @@ def main() -> int:
                    help="If set, rank 0 writes test metrics + config as JSON here.")
     args = p.parse_args()
 
+    # Fail here, not after 120 epochs. Tiled eval slides a `tile x tile` window
+    # at NATIVE resolution; a model trained on whole-image resizes has only ever
+    # seen the retina downscaled to --image-size, so scoring it on native-res
+    # crops of --image-size pixels evaluates a model on inputs at ~7x the scale
+    # it learned (IDRiD is ~3400px across the FOV). The number it produces
+    # describes nothing that was trained. Train with --patch-size to use it.
+    if (args.eval_tiled or args.eval_tiled_val) and args.patch_size <= 0:
+        raise SystemExit(
+            "[fatal] --eval-tiled / --eval-tiled-val require --patch-size > 0. "
+            "Tiled evaluation stitches native-resolution tiles the size of the "
+            "training patch; a whole-image-trained model (patch_size=0) has never "
+            "seen native-resolution input, so tiling it scores the wrong model. "
+            "Either drop --eval-tiled (whole-image eval at --image-size, the mode "
+            "this model was trained in) or train with --patch-size.")
+
     # --- distributed init (no-op unless launched with torchrun) ---
     rank, world, local_rank = ddp_info()
     ddp = world > 1
@@ -460,7 +505,7 @@ def main() -> int:
 
     seed_everything(args.seed, deterministic=not args.nondeterministic,
                     allow_tf32=args.allow_tf32)                                     # same on every rank -> identical init & data split
-    device = pick_device(local_rank, ddp)
+    device = pick_device(local_rank=local_rank, ddp=ddp)
     run_name = args.run_name or default_run_name(args)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(args.ckpt_dir, f"{run_name}.pt")
@@ -512,26 +557,28 @@ def main() -> int:
         eo = MultiLesionSegDataset(idrid_root=None, eophtha_root=eo_root, split="train",
                                    image_size=args.image_size, lesions=args.lesions,
                                    patch_size=patch, fg_bias=args.fg_bias,
-                                   augment=True, seed=args.seed)
+                                   augment=True,
+                                   seed=args.seed + SOURCE_SEED_OFFSET["eophtha"])
         if len(eo):
             train_ds = torch.utils.data.ConcatDataset([train_ds, eo])
             extra_counts["eophtha(EX-only)"] = len(eo)
-    # FGADR: 1475 fully-annotated train images (~27x IDRiD's 54). It dominates the
-    # mixture, so it also gets scored on its own held-out split below — an IDRiD-only
-    # metric over 27 images would be too noisy to attribute changes to.
+    # FGADR: 1290 fully-annotated train images (~30x IDRiD's 43). It dominates the
+    # mixture, so it also gets scored on its own 367-image held-out split below —
+    # an IDRiD-only metric over 27 images would be too noisy to attribute changes to.
     fgadr_test_ds = None
     if "fgadr" in args.datasets:
         from fgadr_dataset import FGADRSegDataset
+        fg_seed = args.seed + SOURCE_SEED_OFFSET["fgadr"]     # see SOURCE_SEED_OFFSET
         fg = FGADRSegDataset(args.fgadr_root, split="train", image_size=args.image_size,
                              lesions=args.lesions, fov_crop=True, patch_size=patch,
-                             fg_bias=args.fg_bias, augment=True, seed=args.seed)
+                             fg_bias=args.fg_bias, augment=True, seed=fg_seed)
         if len(fg):
             train_ds = torch.utils.data.ConcatDataset([train_ds, fg])
             extra_counts["fgadr"] = len(fg)
         fgadr_test_ds = _NoValid(FGADRSegDataset(
             args.fgadr_root, split="test", image_size=args.image_size,
             lesions=args.lesions, fov_crop=True, patch_size=None,
-            augment=False, seed=args.seed))
+            augment=False, seed=fg_seed))
 
         # Model selection: prefer FGADR's val split. IDRiD's ~11 held-out images
         # cannot reliably rank checkpoints once training is ~97% FGADR, and a bad
@@ -540,7 +587,7 @@ def main() -> int:
             val_ds = _NoValid(FGADRSegDataset(
                 args.fgadr_root, split="val", image_size=args.image_size,
                 lesions=args.lesions, fov_crop=True, patch_size=None,
-                augment=False, seed=args.seed))
+                augment=False, seed=fg_seed))
             val_source = "fgadr"
         else:
             val_source = "idrid"
@@ -559,7 +606,8 @@ def main() -> int:
         rl = RetLesionDataset(rl_root, lesions=args.lesions,
                               patch_size=patch or args.image_size,
                               scale_match=True, drop_empty=True,
-                              fg_bias=args.fg_bias, augment=True, seed=args.seed)
+                              fg_bias=args.fg_bias, augment=True,
+                              seed=args.seed + SOURCE_SEED_OFFSET["retlesion"])
         if len(rl):
             train_ds = torch.utils.data.ConcatDataset([train_ds, rl])
             extra_counts[f"retlesion{rl.counts()}"] = len(rl)
@@ -573,6 +621,24 @@ def main() -> int:
     log(f"[info] train  : {'patch '+str(patch)+'px native-res' if patch else 'whole-image '+str(args.image_size)+'px'}"
         f"   eval={'tiled native-res' if args.eval_tiled else 'whole-image '+str(args.image_size)+'px'}")
     log(f"[info] ckpt   : {ckpt_path}")
+
+    # Everything a reader needs to reproduce or audit this run that vars(args)
+    # does not already say: the FGADR partition it was scored on, the eval
+    # geometry, the loader regime (persistent workers change make_rng's draw
+    # sequence), and the code revision. Written into both the checkpoint and
+    # the results JSON so neither can be orphaned from its provenance.
+    run_meta = {
+        "git_commit": git_commit(),
+        "fgadr_split_seed": DEFAULT_SPLIT_SEED,
+        "fgadr_val_frac": DEFAULT_VAL_FRAC, "fgadr_test_frac": DEFAULT_TEST_FRAC,
+        "val_frac": args.val_frac, "val_source": val_source,
+        "eval_tiled": args.eval_tiled, "eval_tiled_val": args.eval_tiled_val,
+        "tile_overlap": args.tile_overlap, "tile_batch": args.tile_batch,
+        "accum_steps": max(1, args.accum_steps), "fg_bias": args.fg_bias,
+        "num_workers": args.num_workers, "persistent_workers": args.num_workers > 0,
+        "source_seed_offsets": {k: v for k, v in SOURCE_SEED_OFFSET.items() if k in args.datasets},
+        "world_size": world,
+    }
 
     # Under DDP, shard the data across ranks so each GPU sees a different subset.
     # Training uses DistributedSampler (padding is harmless there); eval uses
@@ -664,7 +730,7 @@ def main() -> int:
 
         if args.eval_tiled_val:
             val_dice, val_iou, val_sens, val_prec = evaluate_tiled(
-                module, val_ds, args.lesions, device, patch or args.image_size,
+                module, val_ds, args.lesions, device, patch,   # patch > 0 enforced at parse
                 args.tile_overlap, tile_batch=args.tile_batch,
                 num_workers=args.num_workers)                  # all-reduced inside
         else:
@@ -680,7 +746,7 @@ def main() -> int:
             if is_main:                             # only rank 0 writes the checkpoint
                 torch.save({"model": module.state_dict(), "epoch": epoch, "val_mean_dice": mean_val,
                             "val_dice": val_dice, "val_iou": val_iou, "lesions": args.lesions,
-                            "arch": desc, "args": vars(args)}, ckpt_path)
+                            "arch": desc, "args": vars(args), **run_meta}, ckpt_path)
             flag = "  <- best (saved)"
         else:
             since_best += 1
@@ -710,8 +776,9 @@ def main() -> int:
     def score(ds):
         """Score a held-out set with the configured eval mode (tiled or whole)."""
         if args.eval_tiled:
-            tile = patch or args.image_size
-            return evaluate_tiled(module, ds, args.lesions, device, tile, args.tile_overlap,
+            # patch is guaranteed non-None here: --eval-tiled without
+            # --patch-size is rejected at argument parsing (see the SystemExit).
+            return evaluate_tiled(module, ds, args.lesions, device, patch, args.tile_overlap,
                                   tile_batch=args.tile_batch, num_workers=args.num_workers)
         loader = DataLoader(shard_for_eval(ds), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, worker_init_fn=seed_worker)
@@ -763,10 +830,13 @@ def main() -> int:
                 "seed": args.seed, "epochs": args.epochs,
                 "image_size": args.image_size, "patch_size": patch,
                 "lr": args.lr, "loss": args.loss, "lesions": args.lesions,
-                "datasets": args.datasets, "val_source": val_source,
+                "datasets": args.datasets,
                 "allow_tf32": args.allow_tf32, "amp": args.amp,
+                "batch_size": args.batch_size,
+                "effective_batch": args.batch_size * max(1, args.accum_steps) * world,
                 "pretrained": not getattr(args, "no_pretrained", False),
                 "init_encoder": args.init_encoder, "init_weights": args.init_weights,
+                **run_meta,                       # split seed, eval geometry, loader regime, commit
                 "test_dice": test_dice, "test_mean": mean_test,
                 "test_iou": test_iou, "test_iou_mean": mean_iou,
                 "test_sens": test_sens, "test_prec": test_prec,

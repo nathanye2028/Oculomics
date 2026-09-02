@@ -20,9 +20,10 @@ Current sources
 ---------------
 * **IDRiD**    54 train / 27 test, masks for MA, HE, EX, SE   (valid = all)
 * **e-ophtha** 47 images, masks for EX only                   (valid = EX)
-* **FGADR**    1474 train / 368 test, masks for MA, HE, EX, SE (valid = all)
+* **FGADR**    1290 train / 185 val / 367 test (grade-stratified, split_seed=42),
+               masks for MA, HE, EX, SE                       (valid = all)
 
-FGADR dominates the mixture by ~18x, so treat it as the primary training signal
+FGADR dominates the mixture by ~24x, so treat it as the primary training signal
 and IDRiD/e-ophtha as held-out-distribution checks rather than equal partners.
 
 Note both DDR and RFMiD (as mirrored on Kaggle) are *classification* sets with

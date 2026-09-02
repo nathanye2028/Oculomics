@@ -31,7 +31,7 @@ nvidia-smi
 # Separate out-dir so earlier results are never clobbered.
 .venv/bin/python run_experiment.py \
     --seeds 0 1 2 3 4 \
-    --epochs 200 --patch-size 512 --eval-tiled --pretrained \
+    --epochs 200 --patch-size 512 --eval-tiled \
     --out-dir experiments_pretrained5 --ckpt-dir checkpoints_pretrained5
 
 echo "done=$(date)  ->  experiments_pretrained5/summary.md"

@@ -50,6 +50,56 @@ def file_mb(path: str) -> float:
     return os.path.getsize(path) / 1e6
 
 
+def int8_quant_settings() -> dict:
+    """The quantize_static settings this repo has learned it needs — one place,
+    so the test exercises what production runs.
+
+    * QDQ format (not dynamic/QOperator) so it fuses to QLinearConv, which the
+      CPU EP implements; dynamic quant emits ConvInteger, unsupported for convs.
+    * QInt8 weights + QUInt8 activations: the asymmetric-activation pairing the
+      CPU EP kernels are fastest at, and what evaluate_deploy.py also uses.
+    * per_channel=True is REQUIRED for MobileNetV3 (depthwise convs); with a
+      single per-tensor scale a trained model dropped from AUROC 1.00 -> 0.68.
+    """
+    from onnxruntime.quantization import QuantType, QuantFormat
+    return {"quant_format": QuantFormat.QDQ,
+            "weight_type": QuantType.QInt8,
+            "activation_type": QuantType.QUInt8,
+            "per_channel": True}
+
+
+def noise_calibration_reader(input_name: str, shape, n: int = 8):
+    """Calibration reader over Gaussian noise: fine for the efficiency axis
+    (sizes/latency), NEVER for accuracy — see the module docstring."""
+    from onnxruntime.quantization import CalibrationDataReader
+
+    class _Calib(CalibrationDataReader):
+        def __init__(self):
+            self._it = iter([{input_name: np.random.randn(*shape).astype(np.float32)}
+                             for _ in range(n)])
+
+        def get_next(self):
+            return next(self._it, None)
+
+    return _Calib()
+
+
+def quantize_int8_static(onnx_fp32: str, onnx_int8: str, calib_reader,
+                         prepped: str = None, **overrides) -> str:
+    """FP32 ONNX -> INT8 static PTQ with :func:`int8_quant_settings`.
+
+    Runs ONNX Runtime's ``quant_pre_process`` (shape inference + constant
+    folding, which the quantizer needs to see through MobileNet's reshape /
+    hardswish patterns) into ``prepped`` first. Returns ``onnx_int8``.
+    """
+    from onnxruntime.quantization import quantize_static
+    from onnxruntime.quantization.shape_inference import quant_pre_process
+    prepped = prepped or os.path.splitext(onnx_fp32)[0] + ".prep.onnx"
+    quant_pre_process(onnx_fp32, prepped)
+    quantize_static(prepped, onnx_int8, calib_reader, **{**int8_quant_settings(), **overrides})
+    return onnx_int8
+
+
 def bench_torch(model, x, runs: int) -> float:
     """Mean CPU latency (ms/frame) for a torch model."""
     model.eval()
@@ -127,35 +177,20 @@ def main() -> int:
 
     # --- ONNX export (FP32) ---
     onnx_fp32 = os.path.join(args.out_dir, f"{args.model}_fp32.onnx")
+    # dynamo=False pins the TorchScript exporter; torch >= 2.9 flips the
+    # default and the dynamo graph is not what quant_pre_process was tuned on.
     torch.onnx.export(model, x, onnx_fp32, input_names=["input"], output_names=["logits"],
-                      opset_version=13, dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}})
+                      opset_version=13, dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+                      dynamo=False)
     lat_onnx = bench_onnx(onnx_fp32, x_np, args.runs)
 
-    # --- INT8 static PTQ (ONNX Runtime, QDQ format) ---
-    # QDQ (not dynamic/QOperator) so it fuses to QLinearConv, which the CPU EP
-    # implements — dynamic quant emits ConvInteger, unsupported for conv nets.
+    # --- INT8 static PTQ (ONNX Runtime, QDQ format; see int8_quant_settings) ---
     onnx_int8 = os.path.join(args.out_dir, f"{args.model}_int8.onnx")
     int8_ok = True
     try:
-        from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantType, QuantFormat
-        from onnxruntime.quantization.shape_inference import quant_pre_process
-
-        class _Calib(CalibrationDataReader):
-            def __init__(self, name, shape, n=8):
-                self._it = iter([{name: np.random.randn(*shape).astype(np.float32)} for _ in range(n)])
-
-            def get_next(self):
-                return next(self._it, None)
-
-        prepped = os.path.join(args.out_dir, f"{args.model}_fp32.prep.onnx")
-        quant_pre_process(onnx_fp32, prepped)
-        # per_channel=True is REQUIRED for MobileNetV3 (depthwise convs); with a
-        # single per-tensor scale a trained model dropped from AUROC 1.00 -> 0.68.
-        quantize_static(prepped, onnx_int8, _Calib("input", (1, C_in, H, W)),
-                        quant_format=QuantFormat.QDQ,
-                        weight_type=QuantType.QInt8,
-                        activation_type=QuantType.QUInt8,
-                        per_channel=True)
+        quantize_int8_static(onnx_fp32, onnx_int8,
+                             noise_calibration_reader("input", (1, C_in, H, W)),
+                             prepped=os.path.join(args.out_dir, f"{args.model}_fp32.prep.onnx"))
         lat_int8 = bench_onnx(onnx_int8, x_np, args.runs)
     except Exception as e:  # noqa
         int8_ok = False

@@ -72,11 +72,6 @@ logger = logging.getLogger(__name__)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Channel statistics computed on mBRSET fundus crops (see src/data_loader.py).
-# Prefer these over ImageNet stats when training from scratch.
-MBRSET_MEAN = (0.5896, 0.2989, 0.1108)
-MBRSET_STD = (0.2854, 0.1591, 0.0701)
-
 
 # ----------------------------------------------------------------------------- #
 # Label specifications
@@ -610,9 +605,17 @@ def stratified_split(
     df = df.loc[~_isnan_vector(y)].reset_index(drop=True)
     y = y[~np.isnan(y)]
 
-    groups = df[group_col].to_numpy() if group_col and group_col in df.columns else np.arange(len(df))
+    # A requested group column that is absent is an error, not a fallback: the
+    # per-image split below would let both eyes of a patient straddle train and
+    # test, and the only symptom would be an inflated test score.
+    if group_col and group_col not in df.columns:
+        raise ValueError(
+            f"stratified_split: group_col={group_col!r} is not a column of the CSV "
+            f"(columns: {sorted(df.columns)}). Pass group_col=None to split per image "
+            f"deliberately; a patient-grouped split cannot be silently downgraded.")
 
-    if group_col and group_col in df.columns:
+    if group_col:
+        groups = df[group_col].to_numpy()
         # Hold out test by patient, then val by patient from the remainder.
         n_splits = max(2, int(round(1.0 / max(test_frac, 1e-6))))
         sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -631,7 +634,6 @@ def stratified_split(
 
     # No grouping -> plain stratified splits.
     df_tv, df_test = train_test_split(df, test_size=test_frac, stratify=y, random_state=seed)
-    y_tv = y[df_tv.index.to_numpy()] if False else None  # noqa: keep simple below
     df_train, df_val = train_test_split(
         df_tv, test_size=val_frac / (1.0 - test_frac),
         stratify=df_tv[list(spec.source_cols)[0]], random_state=seed,

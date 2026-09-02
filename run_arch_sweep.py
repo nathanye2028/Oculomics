@@ -60,7 +60,9 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_experiment import aggregate, paired_stats          # noqa: E402
+from run_experiment import (                                # noqa: E402
+    aggregate, paired_stats, add_tiled_val_args, resolve_eval_tiled_val,
+)
 
 TRAINER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_idrid.py")
 BASELINE = "baseline"
@@ -140,6 +142,8 @@ def build_cmd(args, label, seed, results_json, run_name):
         cmd += ["--image-size", str(args.image_size)]
     if args.eval_tiled:
         cmd += ["--eval-tiled"]
+    if resolve_eval_tiled_val(args):
+        cmd += ["--eval-tiled-val"]
     if args.amp:
         cmd += ["--amp"]
     if args.init_encoder:
@@ -176,7 +180,9 @@ def main() -> int:
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=0)
-    p.add_argument("--eval-tiled", action="store_true")
+    p.add_argument("--eval-tiled", action="store_true",
+                   help="Score test at native resolution via tiling. Requires --patch-size.")
+    add_tiled_val_args(p)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-3)
@@ -217,6 +223,13 @@ def main() -> int:
 
     variants = [BASELINE] + [v for v in args.variants if v != BASELINE]
     os.makedirs(args.out_dir, exist_ok=True)
+    if args.eval_tiled and args.patch_size <= 0:
+        # The trainer rejects this per run; say it once here instead of N times.
+        print("[fatal] --eval-tiled requires --patch-size > 0 (tiled eval of a "
+              "whole-image-trained model scores the wrong model).", file=sys.stderr)
+        return 2
+    print(f"[info] tiled eval: test={'on' if args.eval_tiled else 'off'} "
+          f"val={'on' if resolve_eval_tiled_val(args) else 'off'}")
 
     # ---- cost table: no GPU, no training, always printed ------------------- #
     print(f"\n{'='*74}\nARCHITECTURE COST (untrained; {args.image_size if args.patch_size <= 0 else args.patch_size}px)"

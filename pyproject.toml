@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oculomics"
+version = "0.1.0"
+description = "On-device diabetic-retinopathy screening from fundus photographs: GCG U-Net segmentation + BRSET->mBRSET classification transfer"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Nathan Ye" }]
+# 3.9 is what the Mac's Xcode CLT ships and what .venv uses; 3.13 is the GPU
+# cluster. 3.14 has no torch / coremltools wheels yet. requirements.txt carries
+# the pins (with per-version markers); this range is enforced by check_env.py.
+requires-python = ">=3.9,<3.14"
+
+[tool.setuptools]
+# Flat layout with many top-level modules: stop setuptools' auto-discovery from
+# erroring on `pip install -e .`. The scripts are run directly, not imported as
+# an installed package.
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning:torch.onnx.*",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"

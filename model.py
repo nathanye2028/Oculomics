@@ -91,11 +91,21 @@ class MBRSETClassifier(nn.Module):
         # model (e.g. timm:convnext_small.fb_in22k_ft_in1k,
         # timm:vit_base_patch14_dinov2.lvd142m). These are NOT mobile models;
         # they exist to be distilled into the default one (train_mbrset.py
-        # --teacher). GCG is a MobileNetV3-specific mid/deep gate and is not
-        # applied here. The head is identical, so the checkpoint format is.
+        # --teacher). GCG is a MobileNetV3-specific mid/deep gate and cannot be
+        # applied here, so use_gcg=True is an error (below), not a silent
+        # downgrade. The head is identical, so the checkpoint format is.
         if backbone != "mobilenetv3_small":
             if not backbone.startswith("timm:"):
                 raise ValueError(f"unknown backbone {backbone!r}; use 'mobilenetv3_small' or 'timm:<name>'")
+            if use_gcg:
+                # Refuse rather than silently build an ungated model: a run that
+                # asked for GCG and got none would be recorded as a GCG arm, and
+                # the paired GCG-vs-control contrast would be comparing two
+                # identical controls.
+                raise ValueError(
+                    f"use_gcg=True is not supported for timm backbone {backbone!r}: GCG is a "
+                    f"MobileNetV3-specific mid/deep gate. Pass --no-gcg (use_gcg=False) for "
+                    f"timm: backbones.")
             import timm
             self.backbone = timm.create_model(backbone[len("timm:"):], pretrained=pretrained,
                                               num_classes=0, in_chans=in_channels,
@@ -150,12 +160,18 @@ class MBRSETClassifier(nn.Module):
         self.use_gcg = use_gcg
         # Probe the backbone once to find the LAST block at stride 16 and its
         # channel count (varies across torchvision versions -> never hardcode).
+        # The probe runs in eval mode: a fresh nn.Module is in train mode, and a
+        # train-mode forward would fold this all-zeros batch into the pretrained
+        # ImageNet BatchNorm running stats before the first real image is seen.
         with torch.no_grad():
+            was_training = self.features.training
+            self.features.eval()
             probe = torch.zeros(1, in_channels, 224, 224)
             sizes = []
             for i, blk in enumerate(self.features):
                 probe = blk(probe)
                 sizes.append((i, probe.shape[1], probe.shape[-1]))
+            self.features.train(was_training)
             final_hw = sizes[-1][2]
             mids = [(i, c) for i, c, hw in sizes if hw == final_hw * 2]
             self._mid_idx, mid_ch = mids[-1] if mids else (len(sizes) - 2, sizes[-2][1])

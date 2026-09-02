@@ -93,6 +93,15 @@ LESION_FOLDERS: Dict[str, str] = {
 FULL_COVERAGE = ("MA", "HE", "EX", "SE")
 GRADING_CSV = "DR_Seg_Grading_Label.csv"
 
+# The partition every FGADR number in this repo is scored on: 1290 train /
+# 185 val / 367 test. Named constants so train_idrid.py can record them in its
+# results JSON / checkpoint — a result file that does not say which partition
+# it was scored on is not reproducible. Fixed since 2026-08-20; earlier FGADR
+# numbers used a run-seed-coupled split and are not comparable.
+DEFAULT_SPLIT_SEED = 42
+DEFAULT_VAL_FRAC = 0.1
+DEFAULT_TEST_FRAC = 0.2
+
 
 def resolve_seg_root(root: Optional[str] = None) -> str:
     """Locate the ``Seg-set`` dir, tolerating a couple of nesting variants."""
@@ -131,9 +140,9 @@ def read_grades(seg_root: str) -> Dict[str, int]:
 def stratified_split(
     files: Sequence[str],
     grades: Dict[str, int],
-    val_frac: float = 0.1,
-    test_frac: float = 0.2,
-    seed: int = 42,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    test_frac: float = DEFAULT_TEST_FRAC,
+    seed: int = DEFAULT_SPLIT_SEED,
 ) -> Tuple[List[str], List[str], List[str]]:
     """Split filenames into (train, val, test), stratified on DR grade.
 
@@ -211,10 +220,10 @@ class FGADRSegDataset(Dataset):
         patch_size: Optional[int] = None,
         fg_bias: float = 0.7,
         augment: bool = False,
-        val_frac: float = 0.1,
-        test_frac: float = 0.2,
+        val_frac: float = DEFAULT_VAL_FRAC,
+        test_frac: float = DEFAULT_TEST_FRAC,
         seed: int = 42,
-        split_seed: int = 42,
+        split_seed: int = DEFAULT_SPLIT_SEED,
     ) -> None:
         super().__init__()
         for code in lesions:
@@ -232,6 +241,7 @@ class FGADRSegDataset(Dataset):
         self.fg_bias = fg_bias
         self.augment = augment
         self.seed = seed
+        self.split_seed, self.val_frac, self.test_frac = split_seed, val_frac, test_frac
 
         self.img_dir = os.path.join(self.root, "Original_Images")
         all_files = sorted(f for f in os.listdir(self.img_dir) if f.lower().endswith(".png"))

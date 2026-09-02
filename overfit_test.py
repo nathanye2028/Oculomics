@@ -42,18 +42,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from idrid_dataset import IDRiDSegDataset, DEFAULT_LESIONS  # noqa: E402
-from fundus_utils import seed_everything, focal_tversky_loss  # noqa: E402
+from fundus_utils import seed_everything, focal_tversky_loss, pick_device  # noqa: E402
 from model_seg import ENCODER_NAMES  # noqa: E402
 
 KAGGLE_SLUG = "aaryapatel98/indian-diabetic-retinopathy-image-dataset"
-
-
-def pick_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 @torch.no_grad()
@@ -114,9 +106,10 @@ def main() -> int:
     # default OFF, i.e. full fp32, which is the reference every Dice number in
     # this repo should be comparable against.
     p.add_argument("--amp", action="store_true",
-                   help="Train under fp16 autocast + GradScaler, exactly as train_idrid.py "
-                        "does. fp16 has the same 10-bit mantissa as TF32, so if TF32 broke "
-                        "an encoder's MA channel this is the next thing to rule out.")
+                   help="Train under autocast exactly as train_idrid.py does: fp16 + "
+                        "GradScaler on CUDA, bf16 (no scaler) on MPS. fp16 has the same "
+                        "10-bit mantissa as TF32, so if TF32 broke an encoder's MA channel "
+                        "this is the next thing to rule out.")
     p.add_argument("--allow-tf32", action="store_true",
                    help="Re-enable TF32 convs on Ampere+. Known to collapse MA Dice to "
                         "0.000 on mobilenetv4_m; kept so the failure stays reproducible.")
@@ -153,12 +146,16 @@ def main() -> int:
     print(f"[info] model: {desc}, {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # Mirror train_idrid.py exactly: fp16 autocast, GradScaler only on CUDA.
+    # Mirror train_idrid.py exactly: fp16 autocast + GradScaler on CUDA; bf16 on
+    # MPS, which has no GradScaler — fp16 there would backprop UNSCALED and
+    # underflow exactly the small MA gradients this test exists to watch.
     amp_on = args.amp and device.type in ("cuda", "mps")
+    amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and device.type == "cuda"))
     if args.amp and not amp_on:
         print(f"[warn] --amp ignored on device {device.type} (cuda/mps only)")
-    print(f"[info] precision: amp={'on(fp16)' if amp_on else 'off'}  tf32={args.allow_tf32}")
+    amp_label = "on(" + str(amp_dtype).split(".")[-1] + ")" if amp_on else "off"
+    print(f"[info] precision: amp={amp_label}  tf32={args.allow_tf32}")
 
     model.train()
     init_loss = None
@@ -170,7 +167,7 @@ def main() -> int:
     skipped = 0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_on):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_on):
             logits = model(imgs)
             loss = focal_tversky_loss(logits, masks)
         scaler.scale(loss).backward()
@@ -226,7 +223,8 @@ def main() -> int:
             json.dump({
                 "encoder": args.encoder, "decoder": args.decoder,
                 "lateral_channels": args.lateral_channels,
-                "amp": bool(amp_on), "allow_tf32": bool(args.allow_tf32),
+                "amp": bool(amp_on), "amp_dtype": str(amp_dtype).split(".")[-1] if amp_on else None,
+                "allow_tf32": bool(args.allow_tf32),
                 "device": device.type, "seed": args.seed, "steps": args.steps,
                 "lesions": args.lesions,
                 "dice": {l: dice[l] for l in args.lesions},

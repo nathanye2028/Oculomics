@@ -12,12 +12,21 @@
       "cwd": "${workspaceFolder}"
     },
     {
-      "name": "train.py (classifier)",
+      "name": "train_mbrset.py (classifier, mBRSET in-domain)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/train.py",
+      "program": "${workspaceFolder}/train_mbrset.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--task", "dr_grade", "--epochs", "50", "--batch-size", "32"],
+      "args": [
+        "--root",
+        "${env:MBRSET_ROOT}",
+        "--task",
+        "dr_referable",
+        "--epochs",
+        "25",
+        "--seed",
+        "0"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -27,8 +36,18 @@
       "request": "launch",
       "program": "${workspaceFolder}/train_idrid.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--arch", "gcg_unet", "--amp", "--patch-size", "512",
-               "--epochs", "200", "--eval-tiled", "--batch-size", "8"],
+      "args": [
+        "--arch",
+        "gcg_unet",
+        "--amp",
+        "--patch-size",
+        "512",
+        "--epochs",
+        "200",
+        "--eval-tiled",
+        "--batch-size",
+        "8"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -38,8 +57,18 @@
       "request": "launch",
       "program": "${workspaceFolder}/run_experiment.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--seeds", "0", "1", "2", "--epochs", "200",
-               "--patch-size", "512", "--eval-tiled", "--amp"],
+      "args": [
+        "--seeds",
+        "0",
+        "1",
+        "2",
+        "--epochs",
+        "200",
+        "--patch-size",
+        "512",
+        "--eval-tiled",
+        "--amp"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -49,9 +78,20 @@
       "request": "launch",
       "module": "torch.distributed.run",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--nproc_per_node=4", "${workspaceFolder}/train_idrid.py",
-               "--arch", "gcg_unet", "--amp", "--patch-size", "512",
-               "--epochs", "200", "--eval-tiled", "--batch-size", "16"],
+      "args": [
+        "--nproc_per_node=4",
+        "${workspaceFolder}/train_idrid.py",
+        "--arch",
+        "gcg_unet",
+        "--amp",
+        "--patch-size",
+        "512",
+        "--epochs",
+        "200",
+        "--eval-tiled",
+        "--batch-size",
+        "16"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -79,7 +119,12 @@
       "request": "launch",
       "program": "${workspaceFolder}/overfit_test.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--steps", "400", "--patch-size", "256"],
+      "args": [
+        "--steps",
+        "400",
+        "--patch-size",
+        "256"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -89,8 +134,14 @@
       "request": "launch",
       "program": "${workspaceFolder}/eval_fgadr.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt",
-               "--limit", "40", "--save-overlays", "out/overlays"],
+      "args": [
+        "--checkpoint",
+        "checkpoints/gcg_seed0.pt",
+        "--limit",
+        "40",
+        "--save-overlays",
+        "out/overlays"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -100,7 +151,13 @@
       "request": "launch",
       "program": "${workspaceFolder}/eval_fgadr.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt", "--tiled", "--tile", "512"],
+      "args": [
+        "--checkpoint",
+        "checkpoints/gcg_seed0.pt",
+        "--tiled",
+        "--tile",
+        "512"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -110,8 +167,14 @@
       "request": "launch",
       "program": "${workspaceFolder}/export_coreml.py",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--checkpoint", "checkpoints/gcg_seed0.pt", "--classes", "4",
-               "--image-size", "512"],
+      "args": [
+        "--checkpoint",
+        "checkpoints/gcg_seed0.pt",
+        "--classes",
+        "4",
+        "--image-size",
+        "512"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     },
@@ -121,7 +184,10 @@
       "request": "launch",
       "module": "pytest",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["tests/", "-v"],
+      "args": [
+        "tests/",
+        "-v"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}"
     }

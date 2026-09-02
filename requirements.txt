@@ -1,6 +1,12 @@
-# Runtime dependencies for dataset.py (mBRSET PyTorch Dataset).
-# Install into a virtualenv:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-numpy==2.0.2
+# Runtime dependencies. Supported Python: 3.9-3.13 (see pyproject.toml).
+#   macOS:  /usr/bin/python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#           (the Mac's default `python3` may be 3.14, which has no torch wheels yet)
+#   Linux GPU box: bash setup_remote.sh   |   Docker: see Dockerfile
+#
+# numpy 2.0.x has wheels for 3.9-3.12 only; 3.13 needs >=2.1. Both are numpy 2,
+# so array semantics are identical.
+numpy==2.0.2; python_version < "3.13"
+numpy>=2.1,<3; python_version >= "3.13"
 pandas==2.3.3
 pillow==11.3.0
 scikit-learn==1.6.1
@@ -8,13 +14,13 @@ torch==2.8.0
 torchvision==0.23.0
 
 # Modern encoders for model_seg.build_encoder: MobileNetV4 (mobilenetv4_*) and
-# EfficientViT (efficientvit_*). The default 'mobilenetv3' encoder comes from
-# torchvision and does NOT need this — timm is only required if you pass
-# --encoder something-else. Pinned because MobileNetV4 landed in timm 1.0.3 and
-# an unpinned install is free to drag torch backwards (see the executorch note).
+# EfficientViT (efficientvit_*), and every `--backbone timm:<name>` in
+# train_mbrset.py (the deployed V4-Small student and the ConvNeXt teacher).
+# Pinned because MobileNetV4 landed in timm 1.0.3 and an unpinned install is
+# free to drag torch backwards (see the executorch note).
 timm==1.0.19
 
-# Used only by test_loader.py to fetch the Kaggle smoke-test dataset.
+# Used only by tests/ and the IDRiD auto-download (kagglehub).
 kagglehub==0.3.13
 
 # Required by torchrun (multi-GPU DDP launcher) on Python 3.9.
@@ -23,21 +29,21 @@ importlib_metadata
 # Test suite.
 pytest>=7.0
 
-# Phase 3 — edge optimization (ONNX export + INT8 quantization, edge_optimize.py).
+# Phase 3 — edge optimization (ONNX export + INT8 quantization, edge_optimize.py,
+# evaluate_deploy.py).
 onnx
 onnxruntime
 
-# Core ML export for on-device iOS inference (export_coreml.py). macOS only.
+# Core ML export for on-device iOS inference (export_coreml.py). macOS only —
+# the marker keeps it off the Linux cluster. coremltools 9.0 prints
+# "Torch 2.8.0 has not been tested" on import; export has been verified to work.
 # NB: do NOT add executorch on Python 3.9 — pip resolves it to executorch 0.3.0
 # and downgrades torch 2.8 -> 2.4. It needs a separate 3.10+ environment.
-coremltools==9.0
+coremltools==9.0; sys_platform == "darwin"
 
 # Connected-component analysis in fgadr_dataset.lesion_retention.
-# Deliberately NOT pinned: scikit-learn already requires scipy, and this repo
-# runs on Python 3.9 (macOS dev) and 3.13 (GPU cluster). Pinning 1.13.1 — the
-# newest release with 3.9 wheels — leaves 3.13 with no wheel at all, so pip
-# falls back to a source build that needs OpenBLAS headers and fails, taking
-# the whole requirements install (including timm) down with it.
+# Deliberately NOT pinned: scikit-learn already requires scipy, and pinning the
+# newest 3.9-wheel release (1.13.1) leaves 3.13 with a source build.
 scipy>=1.13
 
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.

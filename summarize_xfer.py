@@ -2,8 +2,11 @@
 """
 summarize_xfer.py
 =================
-Paired GCG-vs-control comparison for the **BRSET -> mBRSET transfer** runs
-written by ``train_mbrset.py --external-test-root``.
+Paired treatment-vs-control comparison for the **BRSET -> mBRSET transfer**
+runs written by ``train_mbrset.py --external-test-root``. The two conditions are
+named with ``--treatment`` / ``--control`` (default gcg vs nogcg; run_kd_xfer.sh
+uses kd vs ctrl) and files must be named ``<condition>_seed<n>.json`` — the seed
+is what pairs them.
 
 Which number is the result
 --------------------------
@@ -16,14 +19,17 @@ and it can move for the wrong reason: a variant that improves in-domain more
 than out-of-domain *widens* the gap while being strictly better on both. Never
 report a narrowed gap as a win without showing external AUROC went up too.
 
-AUROC is rank-based and largely prevalence-invariant, so the ~3x referable-rate
-difference between BRSET (5.5%) and mBRSET (17.6%) does not by itself move it.
-Accuracy, macro-F1 and kappa DO shift with prevalence and are reported here only
-for completeness -- do not quote their deltas as evidence about image quality.
+AUROC is rank-based and largely prevalence-invariant, so a referable-rate
+difference between BRSET and mBRSET (roughly 3x for dr_referable) does not by
+itself move it. Accuracy, macro-F1 and kappa DO shift with prevalence and are
+reported here only for completeness -- do not quote their deltas as evidence
+about image quality. The prevalences printed at the bottom come from the runs'
+own ``test_pos`` / ``external_pos`` counts, not from a constant.
 
 Usage
 -----
-    python summarize_xfer.py --dir exp_xfer
+    python summarize_xfer.py --dir exp_xfer                        # gcg vs nogcg
+    python summarize_xfer.py --dir exp_kd --treatment kd --control ctrl
 """
 from __future__ import annotations
 
@@ -65,11 +71,32 @@ def agg(vals):
     return statistics.mean(vals), (statistics.pstdev(vals) if len(vals) > 1 else 0.0)
 
 
+def _prevalences(runs, conds, seeds):
+    """(in-domain test prevalence, external prevalence) from the first run that
+    recorded ``test_pos`` / ``external_pos`` with ``n_test`` / ``n_external``;
+    None if no run has them (binary tasks only -- the trainer writes null
+    otherwise)."""
+    for c in conds:
+        for s in seeds:
+            r = runs[c][s]
+            tp, ep = r.get("test_pos"), r.get("external_pos")
+            nt, ne = r.get("n_test") or 0, r.get("n_external") or 0
+            if tp is not None and ep is not None and nt > 0 and ne > 0:
+                return tp / nt, ep / ne
+    return None
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="Paired GCG-vs-control on the transfer runs.")
-    p.add_argument("--dir", default="exp_xfer")
-    p.add_argument("--treatment", default="gcg")
-    p.add_argument("--control", default="nogcg")
+    p = argparse.ArgumentParser(
+        description="Paired <treatment>-vs-<control> comparison of BRSET -> mBRSET transfer "
+                    "runs. Result files in --dir must be named <condition>_seed<n>.json "
+                    "(as written by run_xfer.sh / run_kd_xfer.sh); runs are paired by seed.")
+    p.add_argument("--dir", default="exp_xfer",
+                   help="Directory of <condition>_seed<n>.json files from train_mbrset.py.")
+    p.add_argument("--treatment", default="gcg",
+                   help="Condition name (the <condition> file prefix) of the treatment arm.")
+    p.add_argument("--control", default="nogcg",
+                   help="Condition name of the control arm; paired per seed with --treatment.")
     args = p.parse_args()
 
     runs = load(args.dir)
@@ -123,9 +150,15 @@ def main() -> int:
         L.append(f"  {'':<16} {note}")
 
     # ---- test-time BN adaptation (present when runs used --bn-adapt) ------- #
-    have_bn = all(runs[c][s].get("external_bnadapt") for c in (args.control, args.treatment)
-                  for s in seeds)
+    # Say WHICH runs lack it rather than dropping the table silently: a missing
+    # block usually means one arm was run without --bn-adapt, or it hit a
+    # BN-free backbone (train_mbrset.py records external_bnadapt=null then).
+    no_bn = [f"{c}_seed{s}" for c in (args.control, args.treatment) for s in seeds
+             if not runs[c][s].get("external_bnadapt")]
+    have_bn = not no_bn
     bn_stats = None
+    if no_bn:
+        print(f"[skip] BN-adaptation table: no external_bnadapt in {no_bn}", file=sys.stderr)
     if have_bn:
         L += ["", "-" * 76,
               "TEST-TIME BN ADAPTATION (label-free AdaBN on mBRSET images; report separately):",
@@ -158,8 +191,17 @@ def main() -> int:
         cm, csd = agg(cv); tm, tsd = agg(tv)
         L.append(f"  {m:<10}{f'{cm:.4f}+/-{csd:.4f}':<22}{f'{tm:.4f}+/-{tsd:.4f}':<22}{tm-cm:+.4f}")
 
-    L += ["", "NB: BRSET is 5.5% referable and mBRSET 17.6%. AUROC is rank-based and does",
-          "    not move on prevalence alone; accuracy/F1/kappa do. Quote the AUROC delta."]
+    # Prevalence from the runs themselves (train_mbrset.py records positive
+    # counts for binary tasks); older JSONs lack the counts, so the sentence is
+    # omitted rather than filled with a number from some other dataset/task.
+    prev = _prevalences(runs, (args.control, args.treatment), seeds)
+    if prev is not None:
+        L += ["", f"NB: the in-domain test split is {prev[0]:.1%} positive and mBRSET {prev[1]:.1%}.",
+              "    AUROC is rank-based and does not move on prevalence alone;",
+              "    accuracy/F1/kappa do. Quote the AUROC delta."]
+    else:
+        L += ["", "NB: AUROC is rank-based and does not move on prevalence alone;",
+              "    accuracy/F1/kappa do. Quote the AUROC delta."]
 
     out = "\n".join(L)
     print(out)

@@ -161,10 +161,16 @@ def _normalise_quality(s: pd.Series) -> pd.Series:
 
 
 def _flip_12(s: pd.Series) -> pd.Series:
-    """BRSET quality-parameter convention 1=adequate / 2=inadequate -> 1/0."""
+    """BRSET quality-parameter convention 1=adequate / 2=inadequate -> 1/0.
+
+    A dict ``map`` rather than ``(s == 1)``: the comparison turns a missing cell
+    into False -> 0.0, i.e. an ungraded image silently becomes a confident
+    "inadequate" label. ``map`` leaves NaN as NaN, so ``MBRSETDataset``'s
+    ``drop_missing_labels`` removes the row instead.
+    """
     vals = set(pd.unique(s.dropna()))
     if vals and vals <= {1, 2, 1.0, 2.0}:
-        return (s == 1).astype(float)
+        return s.map({1: 1.0, 2: 0.0}).astype(float)
     return s
 
 
@@ -178,10 +184,13 @@ def _normalise_artifacts(s: pd.Series) -> pd.Series:
 
     Get this backwards and the label is not merely wrong, it is anti-correlated
     with the truth — the model learns to call clean images artifacted.
+
+    NaN stays NaN (see :func:`_flip_12`): ``(s == 2)`` would turn every
+    unlabelled row into a confident "no artifacts".
     """
     vals = set(pd.unique(s.dropna()))
     if vals and vals <= {1, 2, 1.0, 2.0}:
-        return (s == 2).astype(float)
+        return s.map({1: 0.0, 2: 1.0}).astype(float)
     if s.dtype == object:
         m = s.astype(str).str.strip().str.lower()
         return m.map({"yes": 1.0, "no": 0.0}).astype(float)

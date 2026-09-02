@@ -5,8 +5,10 @@ Shared utilities for the fundus pipeline:
 
 * **Reproducibility** — ``seed_everything``, a DataLoader ``seed_worker`` hook,
   and ``make_rng`` for per-sample augmentation RNG that is *both* reproducible
-  and actually diverse across workers (fixes the "all workers share one seed"
-  bug).
+  and actually diverse across workers AND epochs (fixes the "all workers share
+  one seed" bug and the persistent-worker "same draw every epoch" bug).
+* **Device selection** — ``pick_device`` (CUDA > MPS > CPU), so every script
+  agrees on the fallback order.
 * **Fundus preprocessing** — ``fov_bbox`` / ``crop_to_fov`` to strip the black
   border, and ``circular_fov_mask``.
 * **Imbalance-aware losses** — ``tversky_loss`` / ``focal_tversky_loss`` for
@@ -122,38 +124,68 @@ def seed_worker(worker_id: int) -> None:
     random.seed(base)
 
 
-_MAIN_PROCESS_DRAWS = iter(range(2 ** 62))   # per-process draw counter, see make_rng
+# Per-process draw counter, see make_rng. The name is historical: it was first
+# needed in the main process (num_workers=0), but it is now mixed in by every
+# process — a spawned/forked DataLoader worker re-imports this module and so
+# starts its own counter at 0.
+_MAIN_PROCESS_DRAWS = iter(range(2 ** 62))
 
 
 def _reset_main_process_draws() -> None:
-    """Restart make_rng's main-process draw counter (called by seed_everything,
-    so re-seeding a run replays the exact same augmentation sequence)."""
+    """Restart make_rng's draw counter (called by seed_everything, so re-seeding
+    a run replays the exact same augmentation sequence)."""
     global _MAIN_PROCESS_DRAWS
     _MAIN_PROCESS_DRAWS = iter(range(2 ** 62))
 
 
 def make_rng(base_seed: int, index: int) -> np.random.Generator:
-    """Per-call RNG keyed on (worker base seed, dataset base seed, sample index).
+    """Per-call RNG keyed on (worker base seed, dataset base seed, sample index,
+    per-process draw count).
 
-    In a worker process ``torch.initial_seed()`` differs per worker *and* per
-    epoch, so augmentation is diverse across workers and epochs while staying
-    reproducible for a fixed global seed.
+    Two ways of keying on ``torch.initial_seed()`` alone silently replay the
+    *identical* patch, flip and jitter for every sample every epoch — erasing
+    augmentation diversity without any visible symptom:
 
-    In the main process (``num_workers=0``) ``torch.initial_seed()`` is constant
-    across epochs, so keying on it alone would replay the *identical* patch,
-    flip and jitter for every sample every epoch — silently erasing augmentation
-    diversity on exactly the debug/MPS runs that use 0 workers. A per-process
-    draw counter makes every fetch distinct while staying reproducible for a
-    fixed seed (fetch order is deterministic under seeded shuffling).
+    * **Main process** (``num_workers=0``): ``torch.initial_seed()`` is constant
+      across epochs — exactly the debug/MPS runs that use 0 workers.
+    * **Persistent workers** (``persistent_workers=True``, which train_idrid.py
+      uses whenever ``num_workers>0``): a worker's ``torch.initial_seed()`` is
+      fixed for the life of the worker, and the worker lives for the whole run.
+      Only non-persistent workers get a fresh base seed per epoch. Reproduced
+      before this fix: 4 epochs x 2 persistent workers -> 1 distinct
+      augmentation draw per image.
+
+    So every process mixes in its own draw counter. Each worker re-imports this
+    module and therefore owns a counter starting at 0, which makes every fetch
+    distinct while staying reproducible for a fixed seed: which worker fetches
+    which index, in what order, is deterministic under seeded shuffling.
     """
     info = torch.utils.data.get_worker_info()
+    draw = next(_MAIN_PROCESS_DRAWS) % (2 ** 32)
     if info is not None:
         worker_seed = int(torch.initial_seed()) % (2 ** 32)
-        ss = np.random.SeedSequence([worker_seed, int(base_seed), int(index)])
+        ss = np.random.SeedSequence([worker_seed, int(base_seed), int(index), draw])
     else:
-        ss = np.random.SeedSequence([int(base_seed), int(index),
-                                     next(_MAIN_PROCESS_DRAWS) % (2 ** 32)])
+        ss = np.random.SeedSequence([int(base_seed), int(index), draw])
     return np.random.default_rng(ss)
+
+
+def pick_device(explicit: Optional[str] = None, local_rank: int = 0,
+                ddp: bool = False) -> torch.device:
+    """CUDA > MPS > CPU, shared by every script so the fallback order is one fact.
+
+    ``explicit`` (e.g. ``"cpu"``) short-circuits the probe. Under DDP the CUDA
+    device is the process's ``local_rank``; MPS is skipped there because it has
+    no DDP backend, so a torchrun launch on a Mac lands on CPU rather than
+    crashing at ``init_process_group``.
+    """
+    if explicit:
+        return torch.device(explicit)
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{local_rank}" if ddp else "cuda")
+    if torch.backends.mps.is_available() and not ddp:
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,10 @@ Example
     tail -f ~/oculomics_project/logs/train_metrics.log
 """
 from __future__ import annotations
+# LEGACY: moved to legacy/ on 2026-09-01 (superseded; kept for reference only).
+# The shim below lets it still import the repo modules from the parent dir.
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import argparse
 import logging

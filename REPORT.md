@@ -10,7 +10,9 @@ and the deployment tooling that turns those numbers into an on-device claim.
 
 **Headline.** The model's zero-shot AUROC on 4,884 never-seen smartphone images
 rose from **0.813 → 0.882** (control) and **0.909** with label-free test-time
-adaptation, the tabletop→smartphone domain gap shrank from **−0.144 → −0.090**,
+adaptation (transductive AdaBN: BatchNorm statistics re-estimated on the same
+unlabelled mBRSET images that are then scored; the exported Core ML model is the
+zero-shot network unless exported with `--bn-stats adapted`), the tabletop→smartphone domain gap shrank from **−0.144 → −0.090**,
 and the deployed network runs in **0.7 ms on the Apple Neural Engine** at 384 px.
 
 ---
@@ -114,8 +116,8 @@ segmentation track; the classifier had always been V3-Small); **(4)** 384 px.
   the student); `embed()` / `forward_with_feat()` expose the pooled embedding.
   The head width is probed by a forward pass because timm's `num_features` is
   the pre-head width (MobileNetV4: 960 vs the real 1280).
-* `train_mbrset.py` — `--teacher <ckpt>`: loss = (1−α)·CE + α·T²·KL(student ‖
-  teacher), α = 0.7, T = 4, optional cosine feature matching; teacher
+* `train_mbrset.py` — `--teacher <ckpt>`: loss = (1−α)·CE + α·T²·KL(teacher ‖
+  student) (the standard Hinton form), α = 0.7, T = 4, optional cosine feature matching; teacher
   architecture/size/gating read from its checkpoint, task mismatch fatal, seed
   mismatch warned (different patient split = leakage). `--bn-adapt`: AdaBN on a
   deep copy — BN layers in cumulative-average mode, everything else in eval —
@@ -210,9 +212,9 @@ A 2.8 M-parameter student with test-time adaptation recovers ~93 % of a
 
 ### 5.4 What is claimable
 
-* **Robust:** the recipe + resolution + V4 backbone effect. Every one of the
-  fifteen V4 runs lands 0.85–0.92 zero-shot against an old baseline of
-  0.80–0.82.
+* **Robust:** the recipe + resolution + V4 backbone effect. Fourteen of the
+  fifteen V4 runs land 0.85–0.92 zero-shot (kd_seed3: 0.849) against an old
+  baseline of 0.80–0.82.
 * **Significant:** AdaBN on the control, +0.0143 with a CI excluding zero.
 * **Trend, not a claim:** distillation — positive in 4/5 seeds on both
   readouts, not significant at n = 5. Seeds 5–6 are queued; the BN-adapted
@@ -232,13 +234,19 @@ A 2.8 M-parameter student with test-time adaptation recovers ~93 % of a
 | Apple Neural Engine (this Mac) | **0.7 ms** | 0.6 / 0.8 ms |
 | CPU only | 2.8 ms | 2.7 / 3.5 ms |
 
-Core ML vs PyTorch max abs difference 1.2 × 10⁻⁴. ONNX INT8 (val-selected
+Core ML vs PyTorch max abs difference 1.2 × 10⁻⁴ (one random-noise input —
+a smoke check; the real-image pass/fail check is
+`export_coreml.py --verify-images <dir>`). ONNX INT8 (val-selected
 calibration) quantises the V4 to 3.1 MB from 11.3 MB fp32. The Mac ANE is an
-upper-bound proxy; an Xcode Core ML performance report on an iPhone gives the
-literal device number.
+*optimistic* proxy — the network is memory-bandwidth-bound and a Mac has far more
+bandwidth than an iPhone — so read 0.7 ms as a lower bound on device latency; an
+Xcode Core ML performance report on an iPhone gives the literal device number.
 
 Chosen checkpoint for deployment: `ck_kd_v4_384/kd_seed1.pt`, selected by
-in-domain val AUROC (0.9979), not by its mBRSET score. Report the 5-seed mean ±
+in-domain val AUROC (0.9979), not by its mBRSET score. Its `.mlpackage` carries
+source-domain BN statistics (zero-shot 0.8945 for this seed); the 0.9189
+AdaBN figure needs `--bn-stats adapted`, and AdaBN on-device would require
+re-estimating BN statistics from the phone's own unlabelled captures. Report the 5-seed mean ±
 std as the science and this checkpoint's numbers as the shipped model.
 
 ## 7. Open items
@@ -260,6 +268,14 @@ std as the science and this checkpoint's numbers as the shipped model.
 
 ## 8. Reproduction
 
+One command (env vars for the credentialed data; stages selectable):
+
+```bash
+B=<BRSET root> M=<mBRSET root> bash reproduce.sh          # or: make reproduce B=... M=...
+```
+
+What it runs, by hand:
+
 ```bash
 # paired design, V4 student, 384 px, GPU 0 (and V3 student on GPU 1)
 SIZE=384 WORKERS=5 STUDENT=timm:mobilenetv4_conv_small.e2400_r224_in1k \
@@ -275,7 +291,7 @@ python evaluate_deploy.py --root <BRSET> --ckpt ck_kd_v4_384/kd_seed1.pt \
   --external-root <mBRSET> --target-sens 0.90 --calib sweep
 ```
 
-Data: BRSET and mBRSET (PhysioNet) at
-`/data/users4/nshaik3/Datasets/{BRSET,mBRSET}` on `arctrdgndev101`; FGADR under
+Data: BRSET and mBRSET (PhysioNet), passed as `B=`/`M=` (on the lab box they
+live under `/data/users4/nshaik3/Datasets/{BRSET,mBRSET}` on `arctrdgndev101`); FGADR under
 the IIAI research-use agreement (non-redistributable; cite Zhou et al.,
 arXiv:2008.09772).

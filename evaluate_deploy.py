@@ -52,10 +52,20 @@ def pick_device() -> torch.device:
 
 
 def operating_point(scores, labels, target_sens=None):
-    """Threshold chosen on VAL. Either the lowest threshold meeting a target
-    sensitivity (screening style) or Youden's J."""
+    """Threshold chosen on VAL. Either the HIGHEST threshold that still meets a
+    target sensitivity (screening style: give up as little specificity as the
+    sensitivity floor allows) or Youden's J.
+
+    roc_curve returns thresholds in decreasing order, so tpr is non-decreasing
+    along the array and the first index with tpr >= target is the largest
+    threshold satisfying it. drop_intermediate=False is load-bearing: the
+    default prunes collinear ROC points, which can drop exactly the threshold
+    that first reaches the target and hand back a lower one (less specificity
+    than the data allows). Falls back to Youden's J if the target is
+    unreachable.
+    """
     from sklearn.metrics import roc_curve
-    fpr, tpr, thr = roc_curve(labels, scores)
+    fpr, tpr, thr = roc_curve(labels, scores, drop_intermediate=False)
     if target_sens is not None:
         ok = np.where(tpr >= target_sens)[0]
         i = int(ok[0]) if len(ok) else int(np.argmax(tpr - fpr))
@@ -106,17 +116,27 @@ def onnx_scores(path, loader, tta=False):
     return np.concatenate(S), np.concatenate(Y)
 
 
-def bench_onnx(path, x_np, runs=20):
+LATENCY_NOTE = ("ONNX Runtime CPU proxy on the evaluation machine; NOT device latency. "
+                "The deployment number is export_coreml.py on the ANE / an Xcode report.")
+
+
+def bench_onnx(path, x_np, runs=20, warmup=5):
+    """Per-call CPU latency in ms as {p10, median, p90}: the median is the
+    number to read (a mean is dragged around by scheduler hiccups), matching
+    export_coreml.py's protocol."""
     import onnxruntime as ort
     so = ort.SessionOptions(); so.intra_op_num_threads = os.cpu_count() or 1
     sess = ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
     n = sess.get_inputs()[0].name
-    for _ in range(3):
+    for _ in range(warmup):
         sess.run(None, {n: x_np})
-    t = time.perf_counter()
+    times = []
     for _ in range(runs):
+        t = time.perf_counter()
         sess.run(None, {n: x_np})
-    return (time.perf_counter() - t) / runs * 1000.0
+        times.append((time.perf_counter() - t) * 1000.0)
+    return {"p10": float(np.percentile(times, 10)), "median": float(np.median(times)),
+            "p90": float(np.percentile(times, 90))}
 
 
 def main() -> int:
@@ -152,22 +172,33 @@ def main() -> int:
     task = ca.get("task", "dr_referable")
     seed = int(ca.get("seed", 0))
     img_size = int(ca.get("image_size", 224))
-    use_gcg = not ca.get("no_gcg", False)
+    # Newer checkpoints/results record use_gcg directly; older ones only no_gcg.
+    if "use_gcg" in ca:
+        use_gcg = bool(ca["use_gcg"])
+    elif str(ca.get("backbone", "")).startswith("timm:"):
+        use_gcg = False   # pre-2026-09-01 timm checkpoints never had a gate, whatever no_gcg says
+    else:
+        use_gcg = not ca.get("no_gcg", False)
     variant = ca.get("gcg_variant", "baseline")
     backbone = ca.get("backbone", "mobilenetv3_small")
     train_dataset = ca.get("dataset", "mbrset")
+    # The checkpoint's recorded --image-ext: BRSET file names may lack an
+    # extension and train_mbrset.py appended this one; using a different one
+    # here would silently drop every image via drop_missing_files.
+    image_ext = ca.get("image_ext", ".jpg")
     seed_everything(seed)
     device = pick_device()
 
     print(f"[info] ckpt   : {args.ckpt}")
     print(f"[info] config : task={task} seed={seed} size={img_size} backbone={backbone} "
-          f"gcg={'on:'+variant if use_gcg else 'off'} trained_on={train_dataset}")
+          f"use_gcg={use_gcg}{' variant='+variant if use_gcg else ''} "
+          f"trained_on={train_dataset} image_ext={image_ext}")
 
     # Rebuild the EXACT split this checkpoint was trained with, from the dataset
     # it was trained on — load_any resolves mBRSET vs BRSET layouts and applies
     # brset_dataset's schema/value re-encoding, matching train_mbrset.py.
     from brset_dataset import load_any
-    src_data = load_any(args.root, train_dataset)
+    src_data = load_any(args.root, train_dataset, image_ext=image_ext)
     splits = stratified_split(src_data["df"], task=task, val_frac=0.10,
                               test_frac=0.20, group_col="patient", seed=seed)
     mk = lambda df, d=src_data["images_dir"]: MBRSETDataset(
@@ -184,7 +215,7 @@ def main() -> int:
 
     ext_loader = None
     if args.external_root:
-        ext = load_any(args.external_root, args.external_dataset)
+        ext = load_any(args.external_root, args.external_dataset, image_ext=image_ext)
         ext_ds = MBRSETDataset(csv=ext["df"], images_dir=ext["images_dir"], task=task,
                                split="val", image_size=img_size,
                                drop_missing_files=True, fov_crop=True)
@@ -227,15 +258,21 @@ def main() -> int:
     onnx_int8 = os.path.join(args.out_dir, "model_int8.onnx")
     torch.save(model.state_dict(), fp32_pt)
     dummy = torch.randn(1, 3, img_size, img_size)
+    # dynamo=False pins the TorchScript exporter: torch >= 2.9 flips the default
+    # to the dynamo exporter, whose graph differs enough to change what
+    # quant_pre_process / quantize_static see.
     torch.onnx.export(model.cpu().eval(), dummy, onnx_fp32, input_names=["input"],
                       output_names=["logits"], opset_version=13,
-                      dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}})
+                      dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+                      dynamo=False)
     model.to(device)
 
     res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
            "use_gcg": use_gcg, "backbone": backbone, "train_dataset": train_dataset,
+           "image_ext": image_ext,
            "tta": args.tta, "n_test": int(len(ty)), "external": ext_report,
-           "external_dataset": args.external_dataset if ext_report else None}
+           "external_dataset": args.external_dataset if ext_report else None,
+           "latency_note": LATENCY_NOTE}
 
     int8_ok = True
     try:
@@ -287,9 +324,16 @@ def main() -> int:
                 except Exception as e:  # noqa
                     print(f"[calib] {nm:<11} FAILED: {str(e)[:60]}")
             int8_ok = best_name is not None
+            # The winner was os.replace'd into model_int8.onnx as it was found;
+            # whatever is still under a per-method name lost. Delete those so
+            # nobody later scores a loser by picking the wrong file.
+            for nm in _CM:
+                loser = os.path.join(args.out_dir, f"model_int8_{nm}.onnx")
+                if os.path.isfile(loser):
+                    os.remove(loser)
             if int8_ok:
                 print(f"[calib] best = {best_name} (val AUROC {best_auc:.4f}; "
-                      "test evaluated once below)")
+                      "test evaluated once below; losing candidates deleted)")
             else:
                 print("[calib] every calibration method failed")
             res["calib_method"] = best_name
@@ -312,14 +356,18 @@ def main() -> int:
     x_np = dummy.numpy()
     lat_fp32 = bench_onnx(onnx_fp32, x_np, args.runs)
     res["fp32"] = {"auroc": fp32_auroc, **fp32_op,
-                   "size_mb": mb(onnx_fp32), "latency_ms": lat_fp32}
+                   "size_mb": mb(onnx_fp32), "latency_ms_cpu_onnx": lat_fp32}
+    fmt_lat = lambda l: f"{l['median']:.1f} [{l['p10']:.1f}-{l['p90']:.1f}]"
 
     print("\n" + "=" * 74)
     print(f"DEPLOYMENT REPORT — {task}   (test n={len(ty)}, patient-grouped hold-out)")
+    print(f"  model: backbone={backbone} use_gcg={use_gcg} size={img_size} seed={seed}")
     print("=" * 74)
-    print(f"{'variant':<12}{'AUROC':>8}{'Sens':>8}{'Spec':>8}{'PPV':>8}{'size MB':>10}{'ms/frame':>11}")
+    print(f"{'variant':<12}{'AUROC':>8}{'Sens':>8}{'Spec':>8}{'PPV':>8}{'size MB':>10}"
+          f"{'CPU ms median [p10-p90]':>26}")
     print(f"{'FP32':<12}{fp32_auroc:>8.4f}{fp32_op['sensitivity']:>8.3f}"
-          f"{fp32_op['specificity']:>8.3f}{fp32_op['ppv']:>8.3f}{mb(onnx_fp32):>10.2f}{lat_fp32:>11.1f}")
+          f"{fp32_op['specificity']:>8.3f}{fp32_op['ppv']:>8.3f}{mb(onnx_fp32):>10.2f}"
+          f"{fmt_lat(lat_fp32):>26}")
 
     if int8_ok:
         # Quantization preserves RANKING (AUROC) but shifts the probability
@@ -335,22 +383,23 @@ def main() -> int:
               f"(FP32 threshold {thr:.4f} does not transfer after quantization)")
         lat_int8 = bench_onnx(onnx_int8, x_np, args.runs)
         res["int8"] = {"auroc": int8_auroc, **int8_op,
-                       "size_mb": mb(onnx_int8), "latency_ms": lat_int8}
+                       "size_mb": mb(onnx_int8), "latency_ms_cpu_onnx": lat_int8}
         print(f"{'INT8':<12}{int8_auroc:>8.4f}{int8_op['sensitivity']:>8.3f}"
               f"{int8_op['specificity']:>8.3f}{int8_op['ppv']:>8.3f}"
-              f"{mb(onnx_int8):>10.2f}{lat_int8:>11.1f}")
+              f"{mb(onnx_int8):>10.2f}{fmt_lat(lat_int8):>26}")
         print("-" * 74)
         d = int8_auroc - fp32_auroc
         res["quantization_delta_auroc"] = d
         print(f"RQ3 -> quantization cost: {d:+.4f} AUROC   "
-              f"({mb(onnx_fp32)/mb(onnx_int8):.2f}x smaller, {lat_fp32/lat_int8:.2f}x faster)")
+              f"({mb(onnx_fp32)/mb(onnx_int8):.2f}x smaller, "
+              f"{lat_fp32['median']/lat_int8['median']:.2f}x faster on CPU-ONNX)")
         verdict = ("negligible (<0.01 AUROC)" if abs(d) < 0.01 else
                    "modest (<0.02)" if abs(d) < 0.02 else "SIGNIFICANT — report it")
         print(f"     degradation is {verdict}")
 
     print(f"\nconfusion @ threshold {thr:.4f}: "
           f"TP={fp32_op['tp']} FP={fp32_op['fp']} TN={fp32_op['tn']} FN={fp32_op['fn']}")
-    print("NOTE: latency is a desktop-CPU proxy; on-device figures require Phase 4 hardware.")
+    print(f"NOTE: {LATENCY_NOTE}")
 
     out = os.path.join(args.out_dir, f"deploy_{task}_seed{seed}.json")
     with open(out, "w") as f:

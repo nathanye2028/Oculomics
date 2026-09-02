@@ -3,7 +3,7 @@
 # BRSET -> mBRSET transfer experiment. Run it on the GPU box inside tmux:
 #
 #   tmux new -s kd
-#   cd ~/Oculomics && bash run_kd_xfer.sh 0 1 2 2>&1 | tee -a exp_kd/sweep.log
+#   cd ~/Oculomics && B=<BRSET root> M=<mBRSET root> bash run_kd_xfer.sh 0 1 2 2>&1 | tee -a exp_kd/sweep.log
 #   (Ctrl-b, d to detach;  tmux attach -t kd  to come back)
 #
 # Per seed it trains THREE models on the same patient split (same --seed), all
@@ -16,16 +16,63 @@
 # BN-adapt effect is paired within each run. The deployed model (kd) has the
 # SAME architecture, params and Core ML latency as ctrl — nothing mobile changes.
 #
-# Idempotent: a run whose JSON exists is skipped, so re-running resumes.
+# Idempotent: a run whose JSON exists is skipped, so re-running resumes. A
+# teacher is only REUSED from $TEACHER_CK when its `.done` marker exists: the
+# trainer saves the .pt on every val improvement, so a bare .pt is just as
+# likely to be a killed run as a finished one.
 # Wall-clock (A100, 224px): ~40 min ctrl, ~60-90 min teacher, ~50 min kd per seed.
-#
-# Override any of these via the environment, e.g. SIZE=384 EPOCHS=30 bash run_kd_xfer.sh 0
 set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_kd_xfer.sh [seed ...]
+
+Trains ctrl / teacher / kd per seed on BRSET, scores each on mBRSET zero-shot
+and after label-free BN adaptation, then prints paired kd-minus-ctrl statistics.
+Seeds default to 0 1 2. Every knob is an environment variable:
+
+  required
+    B              BRSET root      (dir holding fundus_photos/ + labels_brset.csv)
+    M              mBRSET root     (dir holding images/ + labels_mbrset.csv)
+  outputs
+    OUT            results JSONs + summary        (default exp_kd)
+    CK             checkpoints for ctrl/kd         (default ck_kd)
+    TEACHER_CK     checkpoints for teachers        (default $CK). Point a 2nd sweep
+                   (different STUDENT, same seeds) at the 1st sweep's dir to reuse
+                   its finished teachers instead of retraining them.
+  models
+    STUDENT        deployable backbone for ctrl AND kd (default mobilenetv3_small;
+                   e.g. timm:mobilenetv4_conv_small.e2400_r224_in1k)
+    TEACHER        timm backbone (default timm:convnext_small.fb_in22k_ft_in1k;
+                   or timm:vit_base_patch14_dinov2.lvd142m)
+    TEACHER_LR     teacher learning rate           (default 1e-4)
+  training
+    SIZE           image size                      (default 224)
+    EPOCHS         epochs per run                  (default 25)
+    WORKERS        DataLoader workers              (default 8)
+    KD_ALPHA       weight on the KD term           (default 0.7)
+    KD_TEMP        distillation temperature        (default 4.0)
+    FEAT_W         cosine feature-matching weight  (default 0.0 = off)
+    AMP            "" = trainer default, "--amp" / "--no-amp" to force
+    EXTRA          extra flags for BOTH student arms, e.g. "--ema-decay 0.999"
+    TEACHER_EXTRA  extra flags for the teacher only
+    TRAIN_DATASET  schema of $B (default brset; mbrset only for local smoke tests)
+
+example
+    B=/data/BRSET/1.0.1 M=/data/mBRSET/1.0 SIZE=384 EPOCHS=30 bash run_kd_xfer.sh 0 1 2
+USAGE
+}
+for a in "$@"; do
+  case "$a" in -h|--help) usage; exit 0;; esac
+done
+
 cd "$(dirname "$0")"
 export PYTHONUNBUFFERED=1    # epoch lines must reach `tee` live, not at process exit
 
-B=${B:-/data/users4/nshaik3/Datasets/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1}
-M=${M:-/data/users4/nshaik3/Datasets/mBRSET/physionet.org/files/mbrset/1.0}
+# The dataset roots are machine-specific; a default pointing into someone
+# else's home directory only produces a confusing "not found" on every other box.
+: "${B:?set B=<BRSET root> (dir holding fundus_photos/ + labels_brset.csv); see --help}"
+: "${M:?set M=<mBRSET root> (dir holding images/ + labels_mbrset.csv); see --help}"
 OUT=${OUT:-exp_kd}
 CK=${CK:-ck_kd}
 TEACHER_CK=${TEACHER_CK:-$CK}    # where teachers live. Point a 2nd sweep (different
@@ -52,6 +99,13 @@ mkdir -p "$OUT" "$CK"
 [ -d "$M" ] || { echo "[fatal] mBRSET root not found: $M"; exit 1; }
 .venv/bin/python -c "import timm" 2>/dev/null || { echo "[fatal] timm missing: .venv/bin/pip install -r requirements.txt"; exit 1; }
 
+# GCG is a MobileNetV3-specific gate: model.py now REFUSES use_gcg on a timm:
+# backbone instead of silently dropping it, so timm students and the teacher
+# must be told --no-gcg explicitly. (For the MobileNetV3 student the ctrl/kd
+# contrast is about distillation, and both arms keep the same GCG setting.)
+STUDENT_GCG=()
+case "$STUDENT" in timm:*) STUDENT_GCG=(--no-gcg);; esac
+
 COMMON=(--dataset "$TRAIN_DATASET" --root "$B" --external-test-root "$M" --external-test-dataset mbrset
         --task dr_referable --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS"
         --bn-adapt --ckpt-dir "$CK" $AMP)
@@ -66,19 +120,28 @@ run() {  # run <name> <flags...>
 
 for s in "${SEEDS[@]}"; do
   # 1) control: the deployable student, no teacher
-  run "ctrl_seed$s"    --seed "$s" --backbone "$STUDENT" $EXTRA
-  # 2) teacher: large backbone, same split. GCG flags are ignored for timm backbones.
-  #    Reused (not retrained) if TEACHER_CK already holds it from another sweep —
-  #    legitimate because the same seed gives the same patient split.
-  if [ -f "$TEACHER_CK/teacher_seed$s.pt" ] && [ ! -f "$OUT/teacher_seed$s.json" ]; then
-    echo "[reuse] teacher $TEACHER_CK/teacher_seed$s.pt (trained by another sweep)"
+  run "ctrl_seed$s"    --seed "$s" --backbone "$STUDENT" ${STUDENT_GCG[@]+"${STUDENT_GCG[@]}"} $EXTRA
+  # 2) teacher: large backbone, same split, --no-gcg (timm backbone). Reused
+  #    (not retrained) only when TEACHER_CK holds a FINISHED teacher from another
+  #    sweep — the trainer writes <name>.done after its results JSON, whereas the
+  #    .pt appears at the first val improvement — legitimate because the same
+  #    seed gives the same patient split.
+  tpt="$TEACHER_CK/teacher_seed$s.pt"; tdone="$TEACHER_CK/teacher_seed$s.done"
+  if [ -f "$tdone" ] && { [ "$TEACHER_CK" != "$CK" ] || [ -f "$OUT/teacher_seed$s.json" ]; }; then
+    echo "[reuse] teacher $tpt (completed: $(tr -d '\n' < "$tdone"))"
   else
+    if [ -f "$tpt" ]; then
+      echo "[warn] $tpt exists without a completion marker ($tdone) or results JSON;"
+      echo "       treating it as a killed partial run: deleting it and retraining the teacher."
+      rm -f "$tpt" "$tdone"
+    fi
     mkdir -p "$TEACHER_CK"
-    run "teacher_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR" \
+    run "teacher_seed$s" --seed "$s" --backbone "$TEACHER" --no-gcg --lr "$TEACHER_LR" \
                          --ckpt-dir "$TEACHER_CK" $TEACHER_EXTRA
   fi
   # 3) student distilled from that teacher (same seed => same patient split)
-  run "kd_seed$s"      --seed "$s" --backbone "$STUDENT" --teacher "$TEACHER_CK/teacher_seed$s.pt" \
+  run "kd_seed$s"      --seed "$s" --backbone "$STUDENT" ${STUDENT_GCG[@]+"${STUDENT_GCG[@]}"} \
+                       --teacher "$tpt" \
                        --kd-alpha "$KD_ALPHA" --kd-temp "$KD_TEMP" \
                        --distill-feat-weight "$FEAT_W" $EXTRA
 done

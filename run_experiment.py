@@ -41,6 +41,82 @@ TRAINER = os.path.join(HERE, "train_idrid.py")
 CONDITIONS = [("gcg", []), ("nogcg", ["--no-gcg"])]
 
 
+def add_tiled_val_args(p: argparse.ArgumentParser) -> None:
+    """``--eval-tiled-val`` / ``--no-eval-tiled-val`` with a 3-state default.
+
+    Shared with run_arch_sweep.py so both harnesses resolve it identically
+    (see :func:`resolve_eval_tiled_val`).
+    """
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--eval-tiled-val", dest="eval_tiled_val", action="store_true",
+                   help="Select the best checkpoint on TILED native-res val (train_idrid "
+                        "--eval-tiled-val). Default: ON whenever --eval-tiled and "
+                        "--patch-size > 0, because whole-image val selection loses most "
+                        "1-2px microaneurysms and can pick an epoch that is worse for "
+                        "exactly the lesion the tiled test reports.")
+    g.add_argument("--no-eval-tiled-val", dest="eval_tiled_val", action="store_false",
+                   help="Opt out of tiled val selection (one tiled pass over val per epoch).")
+    p.set_defaults(eval_tiled_val=None)
+
+
+def resolve_eval_tiled_val(args) -> bool:
+    """None (unset) -> follow --eval-tiled, which itself only makes sense with a
+    patch-trained model. An explicit flag always wins."""
+    if args.eval_tiled_val is None:
+        return bool(args.eval_tiled and args.patch_size > 0)
+    return bool(args.eval_tiled_val)
+
+
+def config_slug(args) -> str:
+    """Short tag of every non-default knob, or "" for the plain default run.
+
+    Used to namespace --out-dir / --ckpt-dir: with one shared ``experiments/``
+    the JSON for ``gcg_seed0`` from an attention-gate sweep silently overwrites
+    the baseline's, and the summary table then mixes conditions. Only knobs that
+    change *what was trained* are included; --epochs/--lr etc. are recorded in
+    each results JSON instead.
+    """
+    parts = []
+    if args.gcg_variant != "baseline":
+        parts.append(f"gcg-{args.gcg_variant}")
+    if args.encoder != "mobilenetv3":
+        parts.append(f"enc-{args.encoder}")
+    if args.decoder != "dense":
+        parts.append(f"dec-{args.decoder}")
+    if args.lateral_channels != -1:
+        parts.append(f"lat{args.lateral_channels}")
+    if list(args.datasets) != ["idrid"]:
+        parts.append("data-" + "+".join(args.datasets))
+    if args.no_pretrained:
+        parts.append("scratch")
+    if args.init_encoder:
+        parts.append("initenc-" + os.path.splitext(os.path.basename(args.init_encoder))[0])
+    if args.init_weights:
+        parts.append("initw-" + os.path.splitext(os.path.basename(args.init_weights))[0])
+    return "_".join(parts)
+
+
+def resolve_dirs(args) -> None:
+    """Fill in --out-dir / --ckpt-dir when the user did not pass them.
+
+    * plain default run     -> experiments/ and checkpoints/   (prior paths still work)
+    * any non-default knob  -> experiments/<slug>/ and checkpoints/<slug>/
+    * --quick               -> experiments_quick/ and checkpoints_quick/, because a
+      2-epoch 128px harness check must never clobber checkpoints/gcg_seed0.pt
+      from a real run (it did).
+    Explicit --out-dir / --ckpt-dir are always honoured as given.
+    """
+    slug = config_slug(args)
+    if args.quick:
+        out_base, ck_base = "experiments_quick", "checkpoints_quick"
+    else:
+        out_base, ck_base = "experiments", "checkpoints"
+    if args.out_dir is None:
+        args.out_dir = os.path.join(out_base, slug) if slug else out_base
+    if args.ckpt_dir is None:
+        args.ckpt_dir = os.path.join(ck_base, slug) if slug else ck_base
+
+
 def build_cmd(args, cond_flags, seed, results_json, run_name):
     base = [sys.executable, TRAINER]
     if args.launcher == "torchrun":
@@ -70,10 +146,14 @@ def build_cmd(args, cond_flags, seed, results_json, run_name):
         cmd += ["--image-size", str(args.image_size)]
     if args.eval_tiled:
         cmd += ["--eval-tiled"]
+    if resolve_eval_tiled_val(args):
+        cmd += ["--eval-tiled-val"]
     if args.amp:
         cmd += ["--amp"]
     if args.warmup_epochs > 0:
         cmd += ["--warmup-epochs", str(args.warmup_epochs)]
+    # NB: --pretrained is a deprecated no-op in the trainer and is deliberately
+    # not forwarded; ImageNet init is the default and --no-pretrained the opt-out.
     if args.no_pretrained:
         cmd += ["--no-pretrained"]
     if args.init_encoder:
@@ -140,7 +220,9 @@ def main() -> int:
                    help="Early-stop patience passed to each run (0 = off).")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=0)
-    p.add_argument("--eval-tiled", action="store_true")
+    p.add_argument("--eval-tiled", action="store_true",
+                   help="Score test at native resolution via tiling. Requires --patch-size.")
+    add_tiled_val_args(p)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-3)
@@ -171,19 +253,33 @@ def main() -> int:
                    help="Training sources (val/test stay IDRiD for comparability).")
     p.add_argument("--lesions", nargs="+", default=["MA", "HE", "EX", "SE"])
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--out-dir", default="experiments")
-    p.add_argument("--ckpt-dir", default="checkpoints")
+    p.add_argument("--out-dir", default=None,
+                   help="Results dir. Default: experiments/ for the plain config, "
+                        "experiments/<config-slug>/ when any architecture/data knob is "
+                        "non-default, experiments_quick/ under --quick.")
+    p.add_argument("--ckpt-dir", default=None,
+                   help="Checkpoint dir; defaults mirror --out-dir under checkpoints/.")
     p.add_argument("--launcher", default="python", choices=["python", "torchrun"])
     p.add_argument("--nproc", type=int, default=2, help="GPUs per run when --launcher torchrun.")
     p.add_argument("--master-port", type=int, default=29570)
-    p.add_argument("--quick", action="store_true", help="Tiny run to validate the harness.")
+    p.add_argument("--quick", action="store_true",
+                   help="Tiny run to validate the harness (2 epochs, 128px, whole-image, "
+                        "no tiled eval). Writes to *_quick/ dirs unless overridden.")
     args = p.parse_args()
 
     if args.quick:
         args.epochs = min(args.epochs, 2)
         args.image_size = min(args.image_size, 128)
         args.patch_size = 0
+        # Whole-image at 128px: tiled eval of that model is meaningless (and the
+        # trainer now refuses --eval-tiled without --patch-size).
+        args.eval_tiled = False
+        args.eval_tiled_val = False
 
+    resolve_dirs(args)
+    print(f"[info] out-dir : {args.out_dir}\n[info] ckpt-dir: {args.ckpt_dir}"
+          f"\n[info] tiled   : test={'on' if args.eval_tiled else 'off'} "
+          f"val={'on' if resolve_eval_tiled_val(args) else 'off'}", flush=True)
     os.makedirs(args.out_dir, exist_ok=True)
     use_fgadr = "fgadr" in args.datasets
     # Seed-keyed so control/GCG stay aligned per seed even if a run fails.

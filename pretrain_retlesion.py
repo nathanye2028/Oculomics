@@ -39,22 +39,61 @@ import sys
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_seg import build_model                                  # noqa: E402
-from retlesion_dataset import RetLesionDataset, download_retlesion  # noqa: E402
+from retlesion_dataset import (                                    # noqa: E402
+    RetLesionDataset, download_retlesion, IDRID_PATCH_FRAC, IMAGENET_MEAN, IMAGENET_STD,
+)
 from idrid_dataset import DEFAULT_LESIONS                          # noqa: E402
-from fundus_utils import seed_everything, seed_worker, focal_tversky_loss  # noqa: E402
+from fundus_utils import seed_everything, seed_worker, focal_tversky_loss, pick_device  # noqa: E402
 from metrics import dice_iou_from_counts, CSVLogger                # noqa: E402
 
+# Salt for the val view's per-index crop RNG. Any fixed constant works; it only
+# has to be independent of the run seed's training stream.
+_VAL_CROP_SEED = 0x5EED_1E51
 
-def pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+
+class _FixedCropView(Dataset):
+    """Deterministic validation view over a :class:`RetLesionDataset`.
+
+    ``RetLesionDataset.__getitem__`` draws its crop position from
+    ``fundus_utils.make_rng``, which is *designed* to differ every fetch — right
+    for training, wrong for model selection: with a moving val crop the
+    per-epoch Dice compares different pixels each epoch, so "best epoch" is
+    partly which epoch drew the easier crops. This view keys a local RNG on the
+    sample index alone, so every epoch scores the identical crop of every image.
+    No augmentation, no lesion bias (uniform crop, as the old clean view had),
+    same scale-matching and resize as the training view.
+    """
+
+    def __init__(self, ds: RetLesionDataset) -> None:
+        self.ds = ds
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int):
+        rng = np.random.default_rng([_VAL_CROP_SEED, int(idx)])   # epoch-invariant
+        img, masks, valid = self.ds.load_full(idx)
+        H, W = img.shape[:2]
+        crop = (int(round(min(H, W) * IDRID_PATCH_FRAC)) if self.ds.scale_match
+                else self.ds.patch_size)
+        crop = max(32, min(crop, H, W))
+        top = int(rng.integers(0, H - crop + 1))
+        left = int(rng.integers(0, W - crop + 1))
+        img = img[top:top + crop, left:left + crop]
+        masks = masks[:, top:top + crop, left:left + crop]
+        if crop != self.ds.patch_size:
+            size = (self.ds.patch_size, self.ds.patch_size)
+            img = np.asarray(Image.fromarray(img).resize(size, Image.BILINEAR))
+            masks = np.stack([np.asarray(Image.fromarray(masks[c]).resize(size, Image.NEAREST))
+                              for c in range(masks.shape[0])], axis=0)
+        x = torch.from_numpy(img.astype(np.float32).transpose(2, 0, 1) / 255.0)
+        x = (x - IMAGENET_MEAN) / IMAGENET_STD
+        return x, torch.from_numpy(masks.astype(np.float32)), valid.clone()
 
 
 @torch.no_grad()
@@ -105,13 +144,11 @@ def main() -> int:
     full = RetLesionDataset(root, lesions=args.lesions, patch_size=args.patch_size,
                             scale_match=not args.no_scale_match, drop_empty=True,
                             augment=True, seed=args.seed)
-    # The clean (val-transform) view shares full's item list instead of
-    # re-running the ~1,900-mask non-empty scan a second time; only the
-    # per-sample transform flags differ.
-    import copy
-    clean = copy.copy(full)
-    clean.augment = False
-    clean.fg_bias = 0.0
+    # The clean (val) view wraps full's item list instead of re-running the
+    # ~1,900-mask non-empty scan a second time, and takes a crop that is fixed
+    # per image across epochs (see _FixedCropView) so best-epoch selection is
+    # not scored on a moving target.
+    clean = _FixedCropView(full)
     n = len(full)
     perm = np.random.default_rng(args.seed).permutation(n)
     n_val = max(1, int(round(n * args.val_frac)))

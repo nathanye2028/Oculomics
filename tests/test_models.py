@@ -25,6 +25,35 @@ def test_gcg_unet_forward_backward():
         F.binary_cross_entropy_with_logits(y, torch.rand_like(y)).backward()
 
 
+def test_gcg_and_control_share_all_non_gate_weights_at_same_seed():
+    """The GCG-vs-control contrast must be gating alone, not gating + init.
+
+    The gate modules are built inside a forked RNG, so every parameter whose
+    name does not contain 'gcg' must be bit-identical between the two arms at
+    the same seed. Before the fix the gate convs consumed the RNG before the
+    fuse/head layers, and the control got different weights everywhere.
+    """
+    torch.manual_seed(0)
+    gcg = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=True)
+    torch.manual_seed(0)
+    ctrl = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=False)
+    ctrl_params = dict(ctrl.named_parameters())
+    n_gate = n_shared = 0
+    for name, p in gcg.named_parameters():
+        if "gcg" in name:
+            n_gate += 1
+            assert name not in ctrl_params
+            continue
+        n_shared += 1
+        assert torch.equal(p, ctrl_params[name]), f"{name} differs between GCG and control"
+    assert n_gate > 0 and n_shared == len(ctrl_params)
+    # And the gate init itself still depends on the seed (not a fixed constant).
+    torch.manual_seed(1)
+    other = build_model(arch="gcg_unet", num_classes=4, pretrained=False, use_gcg=True)
+    a = gcg.decoders[0].gcg.skip_proj.weight
+    assert not torch.equal(a, other.decoders[0].gcg.skip_proj.weight)
+
+
 def test_gcg_unet_accepts_variant_factory():
     from gcg_blocks import GCG_VARIANTS
     m = build_model(arch="gcg_unet", num_classes=4, pretrained=False,

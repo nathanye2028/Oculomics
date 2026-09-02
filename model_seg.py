@@ -358,7 +358,22 @@ class DecoderBlock(nn.Module):
         super().__init__()
         conv = DECODER_BLOCKS[block]
         self.has_skip = skip_channels > 0
-        self.gcg = gcg_factory(skip_channels, in_channels) if (gcg_factory and self.has_skip) else None
+        # The gate is built inside a forked RNG so it consumes NOTHING from the
+        # global stream. Otherwise the gate convs advance the RNG before `fuse`
+        # is initialised, and the GCG arm and its --no-gcg control end up with
+        # different fuse/up/head weights at the same seed — the "gating" delta
+        # then also carries an init delta. With the fork, every non-gate
+        # parameter is bit-identical between use_gcg=True and use_gcg=False
+        # (tests/test_models.py guards this). The gate's own seed is drawn from
+        # the forked copy of the current state, so it still varies with the run
+        # seed and the block position; the outer state is restored on exit.
+        # Attribute order is unchanged, so state_dict keys (and checkpoints)
+        # are unaffected.
+        self.gcg = None
+        if gcg_factory and self.has_skip:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(int(torch.randint(0, 2 ** 31 - 1, ()).item()))
+                self.gcg = gcg_factory(skip_channels, in_channels)
         self.fuse = nn.Sequential(
             conv(in_channels + skip_channels, out_channels),
             conv(out_channels, out_channels),

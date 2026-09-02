@@ -20,9 +20,9 @@ so it does not depend on the hand-picked cut-offs), plus the best achievable
 operating point (Youden's J) — which also *calibrates* the thresholds that
 ``artifacts.py`` should use instead of the current guesses.
 
-Run (on the server, where mBRSET lives):
-    python validate_artifacts.py \
-        --root /data/users4/nshaik3/Datasets/mBRSET/physionet.org/files/mbrset/1.0 \
+Run (on the server, where mBRSET lives; <mBRSET root> is the directory that
+holds ``images/`` and ``labels_mbrset.csv``):
+    python validate_artifacts.py --root <mBRSET root> \
         --workers 8 --out artifact_validation.csv
 """
 from __future__ import annotations
