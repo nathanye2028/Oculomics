@@ -9,7 +9,7 @@ a MobileNetV4 backbone at 384 px, the resulting numbers with their statistics,
 and the deployment tooling that turns those numbers into an on-device claim.
 
 **Headline.** The model's zero-shot AUROC on 4,884 never-seen smartphone images
-rose from **0.813 → 0.882** (control) and **0.909** with label-free test-time
+rose from **0.813 → 0.886** (control) and **0.907** with label-free test-time
 adaptation (transductive AdaBN: BatchNorm statistics re-estimated on the same
 unlabelled mBRSET images that are then scored; the exported Core ML model is the
 zero-shot network unless exported with `--bn-stats adapted`), the tabletop→smartphone domain gap shrank from **−0.144 → −0.090**,
@@ -165,20 +165,38 @@ V4 + kd + AdaBN: 0.9161 ± 0.0065. Paired kd − ctrl on V4: +0.0155, 3/3 seeds,
 95 % CI [−0.0011, +0.0320] — the same marginal n = 3 profile that had produced
 a false positive on 22 August, so two more seeds were run before claiming it.
 
-### 5.2 Five seeds, V4-Small at 384 px (30 August)
+### 5.2 Seven seeds, V4-Small at 384 px (final, 31 August)
+
+Five seeds (30 August) reproduced the 22-August lesson exactly: the 3-seed
+zero-shot distillation delta (+0.0155, 3/3) fell to +0.0064 with a CI spanning
+zero. Two more seeds were added for a 7-seed verdict:
 
 | | zero-shot mBRSET | BN-adapted mBRSET | adapt effect (paired) |
 |---|---|---|---|
-| ctrl | 0.8819 ± 0.0117 | 0.8962 ± 0.0067 | **+0.0143 [+0.0067, +0.0219] — significant** |
-| kd | 0.8884 ± 0.0225 | 0.9089 ± 0.0121 | +0.0205 [−0.0086, +0.0496] n.s. |
+| ctrl | 0.8855 ± 0.0115 | 0.8959 ± 0.0073 | **+0.0104 [+0.0024, +0.0185] — significant** |
+| kd | 0.8877 ± 0.0193 | **0.9068 ± 0.0113** | **+0.0191 [+0.0013, +0.0369] — significant** |
 
-Paired kd − ctrl: zero-shot +0.0064, CI [−0.0193, +0.0322], 4/5 seeds
-(inconclusive); on BN-adapted AUROC +0.0126, CI [−0.0013, +0.0265], 4/5 seeds
-(just short of significance). In-domain: ctrl 0.9762 ± 0.0055, kd 0.9785 ±
-0.0064. Teacher zero-shot mBRSET: 0.9446 / 0.9335 / 0.9298 / 0.9354 / 0.9349
-(mean 0.936).
+Paired kd − ctrl: **zero-shot +0.0022, CI [−0.0149, +0.0193], 4/7 seeds —
+null.** On BN-adapted AUROC **+0.0109, CI [+0.0020, +0.0198], 6/7 seeds —
+significant.** In-domain: ctrl 0.9756 ± 0.0067, kd 0.9780 ± 0.0071; gap
+−0.090 for both. Teacher zero-shot mBRSET over the 7 seeds: 0.9446 / 0.9335 /
+0.9298 / 0.9354 / 0.9349 / 0.9349 / 0.9396 (mean 0.936).
 
-Per-seed (in-domain / zero-shot / adapted):
+The reading: distillation on its own does **not** improve zero-shot transfer,
+but the distilled student benefits about twice as much from test-time BN
+adaptation as the control does, and the combination is significantly better
+than AdaBN alone. The two levers interact: the teacher's representation is
+more transferable, but that only shows once the student's BatchNorm statistics
+match the target domain.
+
+**Ceiling.** The same V4-Small at 384 px trained *on* mBRSET and tested
+in-domain (3 seeds, n = 964 per test split): **0.9331 ± 0.0029** (0.9297 /
+0.9368 / 0.9328). So the 49.7 M-parameter teacher's zero-shot 0.936 already
+sits *at* the in-domain ceiling, and the 2.8 M-parameter student with AdaBN
+(0.907) is within 0.026 of it — 97 % of the ceiling without ever training on a
+smartphone image.
+
+Per-seed, first five seeds (in-domain / zero-shot / adapted):
 
 | seed | ctrl | kd | teacher |
 |---|---|---|---|
@@ -201,24 +219,30 @@ cannot be used for selection without breaking the experiment.
 |---|---|
 | old baseline (V3-Small, 224 px, old recipe) | 0.813 |
 | V3-Small, new recipe, 384 px | 0.863 |
-| V4-Small, new recipe, 384 px (control) | 0.882 |
+| V4-Small, new recipe, 384 px (control, n = 7) | 0.886 |
 | + AdaBN | 0.896 |
-| + distillation + AdaBN | 0.909 |
-| teacher (49.7 M params) | 0.936 |
-| mBRSET-trained ceiling | *running* |
+| + distillation + AdaBN | 0.907 |
+| teacher, zero-shot (49.7 M params) | 0.936 |
+| mBRSET-trained ceiling (V4-Small, in-domain) | 0.933 |
 
-A 2.8 M-parameter student with test-time adaptation recovers ~93 % of a
-49.7 M-parameter teacher's transfer performance at 1/18th the size.
+A 2.8 M-parameter student with test-time adaptation reaches 97 % of the
+in-domain ceiling and ~97 % of a 49.7 M-parameter teacher's transfer
+performance, at 1/18th the teacher's size.
 
 ### 5.4 What is claimable
 
 * **Robust:** the recipe + resolution + V4 backbone effect. Fourteen of the
   fifteen V4 runs land 0.85–0.92 zero-shot (kd_seed3: 0.849) against an old
   baseline of 0.80–0.82.
-* **Significant:** AdaBN on the control, +0.0143 with a CI excluding zero.
-* **Trend, not a claim:** distillation — positive in 4/5 seeds on both
-  readouts, not significant at n = 5. Seeds 5–6 are queued; the BN-adapted
-  contrast needs only its current mean to hold to clear zero at n = 7.
+* **Significant (n = 7):** AdaBN, on both the control (+0.0104) and the
+  distilled student (+0.0191); and distillation *combined with* AdaBN over
+  AdaBN alone (+0.0109, 6/7 seeds).
+* **Null:** distillation on zero-shot transfer (+0.0022, 4/7). Do not claim
+  "distillation improves transfer" — claim the interaction, which is what the
+  data support and is the more interesting mechanism.
+* **Near-parity:** the adapted student (0.907) is within 0.026 of the
+  mBRSET-trained ceiling (0.933); the residual gap after adaptation is small
+  compared with the 0.12 that the recipe, resolution and backbone removed.
 * **Accuracy:** 0.90–0.91 on mBRSET now clears the 82.4 % all-negative base
   rate meaningfully (BRSET in-domain: 5.5 % prevalence, so 95 % accuracy there
   is barely above chance). Lead with AUROC; never headline accuracy without the
@@ -246,14 +270,13 @@ Chosen checkpoint for deployment: `ck_kd_v4_384/kd_seed1.pt`, selected by
 in-domain val AUROC (0.9979), not by its mBRSET score. Its `.mlpackage` carries
 source-domain BN statistics (zero-shot 0.8945 for this seed); the 0.9189
 AdaBN figure needs `--bn-stats adapted`, and AdaBN on-device would require
-re-estimating BN statistics from the phone's own unlabelled captures. Report the 5-seed mean ±
+re-estimating BN statistics from the phone's own unlabelled captures. Report the 7-seed mean ±
 std as the science and this checkpoint's numbers as the shipped model.
 
 ## 7. Open items
 
-1. **Ceiling** — `exp_ceiling_384` (V4@384 trained *on* mBRSET, 3 seeds) is
-   running; it decomposes the residual gap into "the phone" vs "the task".
-2. **Seeds 5–6** of ctrl/teacher/kd for the 7-seed distillation verdict.
+1. ~~Ceiling~~ — done (0.9331 ± 0.0029, §5.2).
+2. ~~Seeds 5–6~~ — done; the 7-seed verdict is in §5.2.
 3. **`evaluate_deploy.py` on `kd_seed1.pt`** with `--external-root <mBRSET>`
    (server): target-domain sensitivity/specificity at a val-calibrated
    threshold, plus INT8 cost.
