@@ -261,10 +261,29 @@ def main() -> int:
     # dynamo=False pins the TorchScript exporter: torch >= 2.9 flips the default
     # to the dynamo exporter, whose graph differs enough to change what
     # quant_pre_process / quantize_static see.
-    torch.onnx.export(model.cpu().eval(), dummy, onnx_fp32, input_names=["input"],
-                      output_names=["logits"], opset_version=13,
-                      dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-                      dynamo=False)
+    try:
+        torch.onnx.export(model.cpu().eval(), dummy, onnx_fp32, input_names=["input"],
+                          output_names=["logits"], opset_version=13,
+                          dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+                          dynamo=False)
+    except Exception as e:  # noqa
+        # A broken onnx/onnxruntime install (e.g. the onnx<->ml_dtypes version
+        # clash on Python 3.13) must not throw away the FP32 + target-domain
+        # numbers computed above: write them and stop here.
+        model.to(device)
+        print(f"\n[warn] ONNX export failed: {str(e)[:160]}")
+        print("       FP32 + target-domain results are saved; INT8/latency skipped. "
+              "Fix with: pip install -U 'ml_dtypes>=0.5'  (or pip install 'onnx<1.18').")
+        res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
+               "use_gcg": use_gcg, "backbone": backbone, "train_dataset": train_dataset,
+               "tta": args.tta, "n_test": int(len(ty)), "external": ext_report,
+               "external_dataset": args.external_dataset if ext_report else None,
+               "fp32": {"auroc": fp32_auroc, **fp32_op}, "onnx_error": str(e)}
+        out = os.path.join(args.out_dir, f"deploy_{task}_seed{seed}.json")
+        with open(out, "w") as f:
+            json.dump(res, f, indent=2)
+        print(f"[info] wrote {out}")
+        return 0
     model.to(device)
 
     res = {"ckpt": args.ckpt, "task": task, "seed": seed, "image_size": img_size,
