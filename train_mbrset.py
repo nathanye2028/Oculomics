@@ -41,6 +41,23 @@ attributable to the pixels once prevalence is accounted for.
 Both datasets flow through the same :class:`dataset.MBRSETDataset` — see
 ``brset_dataset.py`` for why a second loader would confound the comparison.
 
+Systemic (oculomics) targets on mBRSET
+--------------------------------------
+``--task hypertension|nephropathy|neuropathy|myocardial_infarction|...`` (see
+``dataset.SYSTEMIC_TASKS``) trains the same image-only model on mBRSET's
+systemic-comorbidity metadata, in-domain, patient-grouped. Two extras exist for
+them and cost nothing on the DR tasks:
+
+* ``--covariate-baseline``: a logistic regression on age+sex fit on the run's
+  own train split and scored on its test split (``covariate_baseline`` in the
+  JSON). Every systemic label is age-confounded and the retina encodes age, so
+  the image AUROC is only evidence of disease signal once it beats this line.
+* ``--init-from <ckpt>``: warm-start every non-head tensor from another
+  train_mbrset.py checkpoint (e.g. the BRSET-trained referable-DR student), the
+  head stays fresh. ``run_systemic.sh`` pairs this against ImageNet init
+  (``drinit`` vs ``ctrl``) so "does DR pre-training transfer to systemic
+  targets" gets the same paired-seed treatment as everything else here.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -85,6 +102,7 @@ from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
+from covariate_baseline import covariate_baseline, image_minus_covariate  # noqa: E402
 
 
 class ModelEMA:
@@ -228,6 +246,62 @@ def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0):
     return m, len(bns)
 
 
+def load_init_weights(model: nn.Module, path: str, root: str = None,
+                      external_root: str = None, seed: int = None) -> dict:
+    """Warm-start the backbone (every tensor except ``head.*``) from a
+    train_mbrset.py checkpoint trained on ANOTHER task -- e.g. initialise a
+    ``hypertension`` model from the BRSET-trained referable-DR student.
+
+    The head keeps its fresh init because the class semantics differ; every other
+    tensor whose name AND shape match is copied (a GCG gate or a different
+    backbone simply does not match, and is counted, not silently ignored). Always
+    the zero-shot ``model`` weights, never ``model_bnadapt``: those statistics were
+    estimated on mBRSET images, which may be this run's test split.
+
+    Leakage guards mirror :func:`load_teacher`: a checkpoint trained on this
+    run's ``--root`` under a different seed has fitted images that sit in this
+    run's test split (a warning -- the labels differ, but the features do not
+    know that); one trained on the external test root is refused.
+    """
+    ck = torch.load(path, map_location="cpu")
+    if "model" not in ck:
+        raise SystemExit(f"[fatal] --init-from {path}: no 'model' state dict in the checkpoint")
+    a = ck.get("args", {}) or {}
+    if external_root and a.get("root") and \
+            os.path.realpath(a["root"]) == os.path.realpath(external_root):
+        raise SystemExit(f"[fatal] --init-from {path} was trained on {a['root']}, which is this "
+                         f"run's --external-test-root: its features have seen the out-of-domain "
+                         f"test images.")
+    warning = None
+    if root and a.get("root") and os.path.realpath(a["root"]) == os.path.realpath(root) \
+            and seed is not None and int(a.get("seed", seed)) != int(seed):
+        warning = (f"--init-from checkpoint was trained on this run's --root with seed "
+                   f"{a.get('seed')} != {seed}: its train split overlaps this run's test "
+                   f"split. Use the same seed or a checkpoint from another dataset.")
+    src, dst = ck["model"], model.state_dict()
+    loaded, head, mismatch = [], [], []
+    for k, v in src.items():
+        if k.startswith("head."):
+            head.append(k)
+            continue
+        if k in dst and tuple(dst[k].shape) == tuple(v.shape):
+            dst[k] = v
+            loaded.append(k)
+        else:
+            mismatch.append(k)
+    if not loaded:
+        raise SystemExit(f"[fatal] --init-from {path}: no tensor matched this model "
+                         f"(checkpoint backbone {a.get('backbone')!r}); nothing to warm-start from.")
+    model.load_state_dict(dst)
+    missing = [k for k in dst if k not in loaded and not k.startswith("head.")]
+    return {"path": os.path.abspath(path), "init_task": a.get("task"),
+            "init_dataset": a.get("dataset"), "init_root": a.get("root"),
+            "init_backbone": a.get("backbone"), "init_seed": a.get("seed"),
+            "n_loaded": len(loaded), "n_head_skipped": len(head),
+            "n_shape_mismatch": len(mismatch), "n_missing": len(missing),
+            "warning": warning}
+
+
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -284,9 +358,12 @@ def main() -> int:
                    help="Schema of --external-test-root.")
     p.add_argument("--image-ext", default=".jpg",
                    help="Extension appended to BRSET image_id values that lack one.")
+    from dataset import LABEL_REGISTRY                        # noqa: E402
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
-                            "quality", "artifacts"])
+                   choices=[t for t, sp in LABEL_REGISTRY.items() if sp.num_classes],
+                   help="Any classification task in dataset.LABEL_REGISTRY: the DR/edema/quality "
+                        "tasks and the systemic targets (hypertension, nephropathy, ...). "
+                        "Regression tasks (age) are not supported by this CE trainer.")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
@@ -342,6 +419,18 @@ def main() -> int:
                         "loader is shuffled with a generator seeded from --seed, so N "
                         "batches is a random sample of the external set, not its first N "
                         "rows in CSV order (which are often one clinic/patient block).")
+    # ---- systemic (oculomics) targets ------------------------------------- #
+    p.add_argument("--init-from", default=None,
+                   help="Warm-start every non-head tensor from another train_mbrset.py "
+                        "checkpoint (e.g. the referable-DR student) -- the head stays fresh. "
+                        "Loads the zero-shot 'model' weights, never 'model_bnadapt'.")
+    p.add_argument("--covariate-baseline", action="store_true",
+                   help="Also fit a logistic regression on --covariate-features (train split) "
+                        "and score it on the test split -> 'covariate_baseline' in the JSON. "
+                        "The floor an image model must clear on an age-confounded target.")
+    p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
+                   help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
+                        "for the stricter chart-knowledge baseline).")
     p.add_argument("--gpu-aug", dest="gpu_aug", action="store_true", default=None,
                    help="Run the photometric/blur/erasing augmentation on the GPU per batch "
                         "instead of in CPU workers (default: on for CUDA). Same ops and "
@@ -443,6 +532,17 @@ def main() -> int:
     # records model.use_gcg for the same reason.
     print(f"[info] model  : {args.backbone}, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params  "
           f"gcg={('on:' + args.gcg_variant) if model.use_gcg else 'off'}")
+
+    init_info = None
+    if args.init_from:
+        init_info = load_init_weights(model, args.init_from, root=args.root,
+                                      external_root=args.external_test_root, seed=args.seed)
+        print(f"[info] init   : {init_info['n_loaded']} tensors from {args.init_from} "
+              f"(task {init_info['init_task']!r} on {init_info['init_dataset']!r}); "
+              f"head re-initialised ({init_info['n_head_skipped']} tensors), "
+              f"{init_info['n_shape_mismatch']} shape-mismatched, {init_info['n_missing']} left at init")
+        if init_info["warning"]:
+            print(f"[warn] {init_info['warning']}")
 
     # ---- teacher for distillation ---------------------------------------- #
     teacher, proj, t_args = None, None, {}
@@ -595,6 +695,29 @@ def main() -> int:
         print("    NB: one seed. Run >=3 and report mean+/-std, and check the class")
         print("    prevalence of both sets before attributing this gap to the images.")
 
+    # Age+sex logistic baseline on the SAME split (paired with the image model).
+    cb, cb_ext = None, None
+    if args.covariate_baseline:
+        feats = tuple(args.covariate_features)
+        cb = covariate_baseline(splits["train"], splits["test"], args.task,
+                                features=feats, seed=args.seed)
+        print(f"\n=== COVARIATE BASELINE (logistic regression on {'+'.join(feats)}; "
+              f"same patient-grouped split) ===")
+        if cb["auroc"] == cb["auroc"]:
+            d = image_minus_covariate(tm["auroc"], cb)
+            print(f"  AUROC={cb['auroc']:.4f}  n={cb['n_test']}    image model={tm['auroc']:.4f}"
+                  f"    image-minus-covariate={d:+.4f}")
+            print("  An image model that does not clear this line has learned the patient's")
+            print("  age from the retina, not the disease. Quote both numbers.")
+        else:
+            print(f"  not computed: {cb['reason']}")
+        if ext_ds is not None:
+            cb_ext = covariate_baseline(splits["train"], ext["df"], args.task,
+                                        features=feats, seed=args.seed)
+            if cb_ext["auroc"] == cb_ext["auroc"]:
+                print(f"  external ({args.external_test_dataset}): covariate AUROC="
+                      f"{cb_ext['auroc']:.4f}  image={em['auroc']:.4f}")
+
     # Positive-class counts (binary tasks) so a summariser can derive the two
     # prevalences from the run itself instead of hardcoding them.
     def _pos(ds):
@@ -613,6 +736,10 @@ def main() -> int:
               "external_pos": _pos(ext_ds),
               "domain_gap_auroc": (em["auroc"] - tm["auroc"]) if em else None,
               "external_bnadapt": None,
+              "init_from": init_info,
+              "covariate_baseline": cb,
+              "covariate_baseline_external": cb_ext,
+              "image_minus_covariate_auroc": image_minus_covariate(tm["auroc"], cb) if cb else None,
               "backbone": args.backbone, "teacher": args.teacher,
               "teacher_ckpt": os.path.abspath(args.teacher) if args.teacher else None,
               "teacher_dataset": t_args.get("dataset") if args.teacher else None,
@@ -624,6 +751,7 @@ def main() -> int:
 
     def write_results():
         if args.results_json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
             with open(args.results_json, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"[info] wrote {args.results_json}")

@@ -130,6 +130,19 @@ TASK_REQUIREMENTS: Dict[str, str] = {
     "artifacts": "final_artifacts",
     "sex": "sex",
     "age": "age",
+    # Systemic (oculomics) targets: mBRSET-only metadata. BRSET has a free-text
+    # ``comorbidities`` column instead, so --inspect reports these as unavailable
+    # on a BRSET CSV; they are trained in-domain on mBRSET (run_systemic.sh).
+    "hypertension": "systemic_hypertension",
+    "nephropathy": "nephropathy",
+    "neuropathy": "neuropathy",
+    "myocardial_infarction": "acute_myocardial_infarction",
+    "vascular_disease": "vascular_disease",
+    "diabetic_foot": "diabetic_foot",
+    "obesity": "obesity",
+    "smoking": "smoking",
+    "alcohol": "alcohol_consumption",
+    "insulin": "insulin",
 }
 
 

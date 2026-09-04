@@ -2,10 +2,12 @@
 PY ?= python3           # macOS: make setup PY=/usr/bin/python3 (3.9); default python3 may be 3.14
 SEEDS ?= 0 1 2 3 4
 CKPT ?= ck_kd_v4_384/kd_seed1.pt
+DR_CK ?=
+TASKS ?= hypertension nephropathy neuropathy myocardial_infarction
 B ?=
 M ?=
 
-.PHONY: help setup check test smoke reproduce stats deploy export clean-scratch
+.PHONY: help setup check test smoke reproduce stats deploy export inspect systemic clean-scratch
 
 .DEFAULT_GOAL := help
 
@@ -35,6 +37,12 @@ stats:  ## re-summarise an existing sweep
 
 deploy:  ## operating point + Core ML for CKPT (default ck_kd_v4_384/kd_seed1.pt)
 	B="$(B)" M="$(M)" STAGE=deploy DEPLOY_CK="$(CKPT)" bash reproduce.sh
+
+inspect:  ## pre-flight the systemic targets on an mBRSET CSV: make inspect M=...
+	.venv/bin/python inspect_mbrset.py --csv "$(M)/labels_mbrset.csv" --strict
+
+systemic:  ## systemic (oculomics) sweep on mBRSET: make systemic M=... [DR_CK=ck.pt] [TASKS="hypertension nephropathy"] [SEEDS="0 1 2"]
+	M="$(M)" DR_CK="$(DR_CK)" TASKS="$(TASKS)" bash run_systemic.sh $(SEEDS)
 
 export:  ## Core ML export only: make export CKPT=path.pt
 	.venv/bin/python export_coreml.py --checkpoint "$(CKPT)"

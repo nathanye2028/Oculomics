@@ -2,7 +2,7 @@
 
 PyTorch research code for an ISEF project whose premise is **mobile viability**: a
 model that stays accurate on unconstrained smartphone fundus captures at
-on-device latency. Two tracks share one codebase:
+on-device latency. Three tracks share one codebase:
 
 1. **Classification (the headline experiment)** — referable-DR classification
    trained on **BRSET** (tabletop camera, 11,405 images) and tested zero-shot on
@@ -15,9 +15,14 @@ on-device latency. Two tracks share one codebase:
    FGADR). The GCG-vs-control comparison was null; the track is kept for the
    lesion-level evidence and the latency measurements.
 
+3. **Systemic (oculomics) targets** — hypertension, nephropathy, myocardial
+   infarction and the other systemic comorbidities in mBRSET's metadata,
+   predicted from the smartphone photograph alone and always read against an
+   age+sex baseline. See [Systemic targets](#systemic-oculomics-targets-on-mbrset).
+
 **Status document:** [REPORT.md](REPORT.md) (numbers, statistics, what is
 claimable). **Changes:** [CHANGELOG.md](CHANGELOG.md). Image-only by design — no
-demographic/systemic metadata fusion in either track.
+demographic/systemic metadata fusion in any track (the age+sex baseline is a *comparison*, not an input).
 
 | mBRSET AUROC (zero-shot unless noted) | |
 |---|---|
@@ -77,6 +82,11 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
+| **Systemic (oculomics) targets** | |
+| `run_systemic.sh` | Per-task sweep on mBRSET's systemic labels: `ctrl` (ImageNet init) vs optional `drinit` (`--init-from` the DR student), both with the age+sex baseline; `M=` required, `--help` lists every knob |
+| `inspect_mbrset.py` | Pre-flight: raw encodings, prevalence, patients and the age+sex baseline AUROC per systemic task; `--strict` gates the sweep |
+| `covariate_baseline.py` | Logistic regression on age+sex (or `+dm_time`) fit and scored on the run's own split — the floor an image model must clear |
+| `summarize_systemic.py` | Per-task paired statistics: image minus covariate AUROC, and treatment minus control |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -146,6 +156,68 @@ Design points that the code enforces:
   `run_kd_xfer.sh` retrains a teacher whose checkpoint exists without it.
 - **Imbalance** is corrected once (`--imbalance sampler`); `--amp` is bf16 on
   MPS, fp16 + GradScaler on CUDA, identically for every arm.
+
+## Systemic (oculomics) targets on mBRSET
+
+mBRSET's metadata carries systemic comorbidities for every patient — systemic
+hypertension, nephropathy, neuropathy, acute myocardial infarction, vascular
+disease, diabetic foot, obesity, smoking, alcohol, insulin — and these are the
+*oculomics* targets: systemic disease read from the fundus photograph alone. They
+are yes/no tasks in `dataset.SYSTEMIC_TASKS` (`--task hypertension`,
+`nephropathy`, `myocardial_infarction`, …). BRSET has no per-condition columns,
+so they are trained and tested **in-domain on mBRSET** with the same
+patient-grouped 70/10/20 split; there is no tabletop→smartphone transfer arm.
+
+```bash
+# 1) pre-flight: raw encodings, prevalence, and what age+sex alone already scores
+python inspect_mbrset.py --csv <mBRSET>/labels_mbrset.csv --strict
+
+# 2) the sweep: ctrl (ImageNet init) and, with DR_CK set, drinit (warm-started from the DR student)
+M=<mBRSET> DR_CK=ck_kd_v4_384/kd_seed1.pt TASKS="hypertension nephropathy" bash run_systemic.sh 0 1 2 3 4
+
+# one arm by hand
+python train_mbrset.py --root <mBRSET> --task hypertension --image-size 384 \
+    --backbone timm:mobilenetv4_conv_small.e2400_r224_in1k --no-gcg \
+    --covariate-baseline --init-from ck_kd_v4_384/kd_seed1.pt --seed 0
+
+# 3) paired statistics per task
+python summarize_systemic.py --dir exp_systemic --treatment drinit --control ctrl
+```
+
+What the numbers mean, and what the code enforces:
+
+- **The age confound is the whole game.** Every systemic label rises with age
+  and diabetes duration, and a fundus photograph encodes age well. Each run
+  therefore records a logistic regression on **age+sex** fit on its own train
+  split and scored on its own test split (`covariate_baseline` in the JSON), and
+  the summariser reports the paired *image minus covariate* AUROC with a CI. An
+  image model that does not clear that line has learned age, not the disease.
+  `--covariate-features age sex dm_time` gives the stricter "beyond what the
+  chart already says" baseline.
+- **Warm start, not fine-tuning of the head.** `--init-from` copies every
+  tensor except `head.*` from another checkpoint (zero-shot `model` weights,
+  never `model_bnadapt`), refuses a checkpoint trained on the external test
+  root, and warns when the checkpoint's train split overlaps this run's test
+  split (same root, different seed). `drinit` vs `ctrl` is paired by seed, so
+  the delta is attributable to DR pre-training.
+- **Encodings are checked before GPU time.** `dataset._binary_flag` is strict
+  (yes/no/1/0/true/false/sim/não → 0/1, anything else → NaN → dropped);
+  `inspect_mbrset.py --strict` refuses a task that comes out empty or
+  single-class, and prints the raw values so a 1/2-coded release is fixed in
+  the normaliser, not in the CSV.
+- **Expect modest AUROCs.** These are self-reported / chart comorbidities in a
+  diabetic cohort scored on ~1,000 smartphone images; the literature on
+  hypertension from fundus photographs sits near 0.70 with far more data.
+  Report image and covariate AUROC together, per task, with the prevalence.
+- **Mobile cost is unchanged.** The head is the only task-specific part, so the
+  Core ML latency measured for the DR model applies as is.
+
+### Branches
+
+`main` holds the shared codebase. Work on a disease target lives on a
+`disease/<target>` branch and is merged back when it lands:
+`disease/diabetic-retinopathy` (the BRSET→mBRSET headline, REPORT.md) and
+`disease/systemic` (the targets above).
 
 ## Segmentation: GCG vs control
 
