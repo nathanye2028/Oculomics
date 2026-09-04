@@ -48,3 +48,7 @@ scipy>=1.13
 
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
 # tensorboard
+
+# public_fundus.py reads the PAPILA / REFUGE / ODIR-5K metadata sheets (.xlsx).
+# Pure Python; a CSV export next to the sheet works without it.
+openpyxl>=3.1

@@ -5,7 +5,7 @@ CKPT ?= ck_kd_v4_384/kd_seed1.pt
 B ?=
 M ?=
 
-.PHONY: help setup check test smoke reproduce stats deploy export clean-scratch
+.PHONY: help setup check test smoke reproduce stats deploy export public-xfer clean-scratch
 
 .DEFAULT_GOAL := help
 
@@ -35,6 +35,9 @@ stats:  ## re-summarise an existing sweep
 
 deploy:  ## operating point + Core ML for CKPT (default ck_kd_v4_384/kd_seed1.pt)
 	B="$(B)" M="$(M)" STAGE=deploy DEPLOY_CK="$(CKPT)" bash reproduce.sh
+
+public-xfer:  ## glaucoma/AMD transfer on public sets: make public-xfer SRC=... SRC_DATASET=airogs TASK=glaucoma EXT=... EXT_DATASET=refuge [MORE="papila=..."]
+	SRC="$(SRC)" SRC_DATASET="$(SRC_DATASET)" TASK="$(TASK)" EXT="$(EXT)" EXT_DATASET="$(EXT_DATASET)" MORE="$(MORE)" bash run_public_xfer.sh $(SEEDS)
 
 export:  ## Core ML export only: make export CKPT=path.pt
 	.venv/bin/python export_coreml.py --checkpoint "$(CKPT)"

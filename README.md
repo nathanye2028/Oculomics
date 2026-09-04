@@ -77,6 +77,11 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
+| **Glaucoma / AMD on public sets** | |
+| `public_fundus.py` | Adapters for AIROGS, REFUGE, PAPILA, ODIR-5K into the mBRSET schema (`glaucoma` / `amd` columns); `--inspect --strict` audits a root before training |
+| `run_public_xfer.sh` | The paired ctrl / teacher / kd transfer design (via `run_kd_xfer.sh` with `TASK=` / `EXT_DATASET=`) from one public set to another, plus every extra set via `score_external.py` |
+| `score_external.py` | Score a finished checkpoint on any dataset in `brset_dataset.DATASETS`, zero-shot and after AdaBN, without retraining |
+| `summarize_external.py` | Paired treatment-vs-control statistics per extra external set |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -146,6 +151,54 @@ Design points that the code enforces:
   `run_kd_xfer.sh` retrains a teacher whose checkpoint exists without it.
 - **Imbalance** is corrected once (`--imbalance sampler`); `--amp` is bf16 on
   MPS, fp16 + GradScaler on CUDA, identically for every arm.
+
+## Glaucoma and AMD on the public fundus sets
+
+There is plenty of public tabletop data for glaucoma, some for AMD, and **no
+public smartphone set for either** — so the claim available here is transfer
+**across cameras and populations**, not tabletop→phone. The same paired design
+as the DR headline applies unchanged: train ctrl / teacher / kd on one set,
+score zero-shot and after AdaBN on the others.
+
+| set | task | what the adapter reads | notes |
+|---|---|---|---|
+| AIROGS (Rotterdam EyePACS) | `glaucoma` | `train_labels.csv` (`challenge_id`, `class` RG/NRG); images in `train/` (nested OK) | ~101k images, the natural training set; **no patient id is published**, so the grouped split treats each image as its own subject |
+| REFUGE | `glaucoma` | `Glaucoma/` vs `Non-Glaucoma/` folders and/or a label sheet (`ImgName`, `Label`); mask folders skipped | 1,200 images, 10 % glaucoma |
+| PAPILA | `glaucoma` | `ClinicalData/patient_data_od|os.xlsx` (Diagnosis 0/1/2), `FundusImages/RET<ID>OD|OS.jpg` | both eyes share a patient; **suspects excluded by default** (`--papila-suspect`) |
+| ODIR-5K | `glaucoma`, `amd` | `full_df.csv` (per eye) or the per-patient sheet; labels from the per-eye diagnostic keywords; low-quality eyes → NaN | ~7k eyes; `age`/`sex` present |
+| BRSET | `amd` | its own `amd` column, now carried by the adapter | the AMD external set for an ODIR-trained model |
+
+```bash
+# audit a root before training (raw encodings, prevalence, files on disk)
+python public_fundus.py --root <ODIR-5K> --dataset odir --inspect --strict
+
+# glaucoma: AIROGS -> REFUGE (primary, inside every run) + PAPILA and ODIR (scored afterwards)
+SRC=<AIROGS> SRC_DATASET=airogs TASK=glaucoma EXT=<REFUGE> EXT_DATASET=refuge \
+    MORE="papila=<PAPILA> odir=<ODIR-5K>" bash run_public_xfer.sh 0 1 2 3 4
+
+# AMD: ODIR-5K -> BRSET
+SRC=<ODIR-5K> SRC_DATASET=odir TASK=amd EXT=<BRSET> EXT_DATASET=brset bash run_public_xfer.sh 0 1 2 3 4
+
+# one arm by hand, and scoring a finished checkpoint on one more set
+python train_mbrset.py --dataset airogs --root <AIROGS> --task glaucoma \
+    --external-test-root <REFUGE> --external-test-dataset refuge --bn-adapt --seed 0 ...
+python score_external.py --ckpt ck_glaucoma/kd_seed0.pt --root <PAPILA> --dataset papila --bn-adapt \
+    --out exp_glaucoma/kd_seed0_on_papila.json
+python summarize_xfer.py --dir exp_glaucoma --treatment kd --control ctrl      # primary external set
+python summarize_external.py --dir exp_glaucoma --treatment kd --control ctrl  # the extra sets
+```
+
+What to know before quoting a number:
+
+- **"Glaucoma" is not one label.** AIROGS is *referable* glaucoma by graders,
+  REFUGE and PAPILA are clinical diagnoses, ODIR-5K is a keyword that includes
+  "suspected glaucoma". A cross-set AUROC mixes definitions; say which.
+- **`score_external.py` refuses** to score a checkpoint on its own training
+  root, and `train_mbrset.py` refuses an external root equal to `--root`.
+- **`.xlsx` sheets need `openpyxl`** (in `requirements.txt`); a CSV export
+  next to the sheet works too.
+- **Mobile cost is unchanged**: same student, same head size, same Core ML
+  latency as the DR model.
 
 ## Segmentation: GCG vs control
 

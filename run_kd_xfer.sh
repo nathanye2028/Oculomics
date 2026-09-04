@@ -57,6 +57,8 @@ Seeds default to 0 1 2. Every knob is an environment variable:
     EXTRA          extra flags for BOTH student arms, e.g. "--ema-decay 0.999"
     TEACHER_EXTRA  extra flags for the teacher only
     TRAIN_DATASET  schema of $B (default brset; mbrset only for local smoke tests)
+    EXT_DATASET    schema of $M (default mbrset; any of brset_dataset.DATASETS, e.g. refuge)
+    TASK           task for every arm (default dr_referable; e.g. glaucoma, amd)
 
 example
     B=/data/BRSET/1.0.1 M=/data/mBRSET/1.0 SIZE=384 EPOCHS=30 bash run_kd_xfer.sh 0 1 2
@@ -91,6 +93,8 @@ AMP=${AMP:-}                     # "" = trainer default; "--no-amp" / "--amp" to
 EXTRA=${EXTRA:-}                 # extra flags for BOTH student arms, e.g. "--ema-decay 0.999"
 TEACHER_EXTRA=${TEACHER_EXTRA:-} # extra flags for the teacher only
 TRAIN_DATASET=${TRAIN_DATASET:-brset}   # schema of $B (brset); mbrset only for local smoke tests
+EXT_DATASET=${EXT_DATASET:-mbrset}      # schema of $M; any of brset_dataset.DATASETS
+TASK=${TASK:-dr_referable}              # every arm trains and is scored on this task
 
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
 export OUT    # the teacher-ceiling printout below reads it from the environment
@@ -106,8 +110,8 @@ mkdir -p "$OUT" "$CK"
 STUDENT_GCG=()
 case "$STUDENT" in timm:*) STUDENT_GCG=(--no-gcg);; esac
 
-COMMON=(--dataset "$TRAIN_DATASET" --root "$B" --external-test-root "$M" --external-test-dataset mbrset
-        --task dr_referable --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS"
+COMMON=(--dataset "$TRAIN_DATASET" --root "$B" --external-test-root "$M" --external-test-dataset "$EXT_DATASET"
+        --task "$TASK" --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS"
         --bn-adapt --ckpt-dir "$CK" $AMP)
 
 run() {  # run <name> <flags...>
@@ -154,7 +158,8 @@ echo "teacher ceiling (what the student is being pulled toward), per seed:"
 import glob, json, os
 for p in sorted(glob.glob(os.path.join(os.environ.get("OUT", "exp_kd"), "teacher_seed*.json"))):
     r = json.load(open(p)); e = r["external"]; a = r.get("external_bnadapt") or {}
-    print(f"  {os.path.basename(p)[:-5]:<16} in={r['test']['auroc']:.4f}  mBRSET={e['auroc']:.4f}"
-          + (f"  mBRSET+BNadapt={a['auroc']:.4f}" if a else "") + f"  params={r.get('params_m')}M")
+    ext = r.get("external_dataset") or "ext"
+    print(f"  {os.path.basename(p)[:-5]:<16} in={r['test']['auroc']:.4f}  {ext}={e['auroc']:.4f}"
+          + (f"  {ext}+BNadapt={a['auroc']:.4f}" if a else "") + f"  params={r.get('params_m')}M")
 PY
 echo "done=$(date)  ->  $OUT/summary.md"

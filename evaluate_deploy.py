@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from brset_dataset import DATASETS                        # noqa: E402
 from dataset import MBRSETDataset, stratified_split     # noqa: E402
 from model import MBRSETClassifier                       # noqa: E402
 from fundus_utils import seed_everything, seed_worker    # noqa: E402
@@ -150,7 +151,7 @@ def main() -> int:
                    help="Optional second dataset (e.g. mBRSET for a BRSET-trained checkpoint): "
                         "reports the deployment operating point on the TARGET domain, with the "
                         "threshold still calibrated on the in-domain VAL split.")
-    p.add_argument("--external-dataset", default="mbrset", choices=["mbrset", "brset"])
+    p.add_argument("--external-dataset", default="mbrset", choices=DATASETS)
     p.add_argument("--target-sens", type=float, default=0.85,
                    help="Screening sensitivity to calibrate the threshold for (on VAL).")
     p.add_argument("--tta", action="store_true", help="Horizontal-flip test-time augmentation.")

@@ -41,6 +41,15 @@ attributable to the pixels once prevalence is accounted for.
 Both datasets flow through the same :class:`dataset.MBRSETDataset` — see
 ``brset_dataset.py`` for why a second loader would confound the comparison.
 
+Glaucoma / AMD on the public sets
+---------------------------------
+``--dataset airogs|refuge|papila|odir`` (``public_fundus.py``) with ``--task
+glaucoma`` or ``--task amd`` runs the same transfer design across cameras and
+populations: train on one public set, ``--external-test-root`` another,
+``--bn-adapt`` for AdaBN, ``--teacher`` for distillation. ``score_external.py``
+scores a finished checkpoint on the remaining sets. There is no smartphone
+glaucoma/AMD set, so the claim is cross-dataset, not tabletop-to-phone.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -82,6 +91,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
+from brset_dataset import DATASETS                        # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
@@ -274,19 +284,22 @@ def main() -> int:
     p.add_argument("--root", required=True,
                    help="Training dataset dir. mBRSET: images/ + labels_mbrset.csv. "
                         "BRSET: fundus_photos/ + labels.csv (pass --dataset brset).")
-    p.add_argument("--dataset", default="mbrset", choices=["mbrset", "brset"],
+    p.add_argument("--dataset", default="mbrset", choices=DATASETS,
                    help="Schema of --root. Default 'mbrset' keeps every prior run identical.")
     p.add_argument("--external-test-root", default=None,
                    help="Optional SECOND dataset, evaluated once with the best checkpoint. "
                         "This is the out-of-domain number in a transfer experiment; it never "
                         "touches training or model selection.")
-    p.add_argument("--external-test-dataset", default="mbrset", choices=["mbrset", "brset"],
+    p.add_argument("--external-test-dataset", default="mbrset", choices=DATASETS,
                    help="Schema of --external-test-root.")
     p.add_argument("--image-ext", default=".jpg",
                    help="Extension appended to BRSET image_id values that lack one.")
+    from dataset import LABEL_REGISTRY                        # noqa: E402
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
-                            "quality", "artifacts"])
+                   choices=[t for t, sp in LABEL_REGISTRY.items() if sp.num_classes],
+                   help="Any classification task in dataset.LABEL_REGISTRY: the DR/edema/quality "
+                        "tasks and the systemic targets (hypertension, nephropathy, ...). "
+                        "Regression tasks (age) are not supported by this CE trainer.")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
@@ -624,6 +637,7 @@ def main() -> int:
 
     def write_results():
         if args.results_json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
             with open(args.results_json, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"[info] wrote {args.results_json}")

@@ -110,13 +110,16 @@ def main() -> int:
         print("[fatal] no seed appears in both conditions; nothing is paired.", file=sys.stderr)
         return 2
     unpaired = (set(runs[args.treatment]) ^ set(runs[args.control]))
+    r_first = runs[args.control][seeds[0]]
+    ext_name = r_first.get("external_dataset") or "external"
+    src = r_first.get("train_dataset") or "source"
     L = [f"\n{'='*76}",
-         f"BRSET -> mBRSET TRANSFER: {args.treatment} vs {args.control}",
+         f"{src} -> {ext_name} TRANSFER ({r_first.get('task', '?')}): {args.treatment} vs {args.control}",
          f"  paired seeds={seeds}" + (f"   (dropped unpaired: {sorted(unpaired)})" if unpaired else ""),
          f"{'='*76}"]
 
     # ---- per-condition table ------------------------------------------------ #
-    L.append(f"\n{'condition':<10}{'in-domain AUROC':<20}{'mBRSET AUROC':<20}{'gap':<16}{'n(ext)':>7}")
+    L.append(f"\n{'condition':<10}{'in-domain AUROC':<20}{f'{ext_name} AUROC':<20}{'gap':<16}{'n(ext)':>7}")
     per = {}
     for cond in (args.control, args.treatment):
         ind = [runs[cond][s]["test"]["auroc"] for s in seeds]
@@ -137,7 +140,7 @@ def main() -> int:
     gap_stats = paired_stats(per[args.treatment]["gap"], per[args.control]["gap"])
 
     for label, st, note in (
-        ("mBRSET AUROC", ext_stats, "<- THE RESULT: performance on smartphone captures"),
+        (f"{ext_name} AUROC", ext_stats, "<- THE RESULT: performance on the external set"),
         ("domain gap", gap_stats, "   (descriptive; only meaningful if the row above improved)"),
     ):
         lo, hi = st["ci95"]
@@ -161,7 +164,7 @@ def main() -> int:
         print(f"[skip] BN-adaptation table: no external_bnadapt in {no_bn}", file=sys.stderr)
     if have_bn:
         L += ["", "-" * 76,
-              "TEST-TIME BN ADAPTATION (label-free AdaBN on mBRSET images; report separately):",
+              f"TEST-TIME BN ADAPTATION (label-free AdaBN on {ext_name} images; report separately):",
               f"  {'condition':<10}{'zero-shot':<18}{'BN-adapted':<18}{'adapt effect (paired)':<24}"]
         per_bn = {}
         for cond in (args.control, args.treatment):
@@ -183,7 +186,7 @@ def main() -> int:
 
     # ---- secondary metrics, flagged as prevalence-sensitive ----------------- #
     L += ["", "-" * 76,
-          "Secondary metrics on mBRSET (prevalence-sensitive -- context only, not evidence):",
+          f"Secondary metrics on {ext_name} (prevalence-sensitive -- context only, not evidence):",
           f"  {'metric':<10}{args.control:<22}{args.treatment:<22}{'delta':<12}"]
     for m in METRICS[1:]:
         cv = [runs[args.control][s]["external"][m] for s in seeds]
@@ -196,7 +199,7 @@ def main() -> int:
     # omitted rather than filled with a number from some other dataset/task.
     prev = _prevalences(runs, (args.control, args.treatment), seeds)
     if prev is not None:
-        L += ["", f"NB: the in-domain test split is {prev[0]:.1%} positive and mBRSET {prev[1]:.1%}.",
+        L += ["", f"NB: the in-domain test split is {prev[0]:.1%} positive and {ext_name} {prev[1]:.1%}.",
               "    AUROC is rank-based and does not move on prevalence alone;",
               "    accuracy/F1/kappa do. Quote the AUROC delta."]
     else:

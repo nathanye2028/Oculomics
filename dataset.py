@@ -107,6 +107,45 @@ def _yes_no(value, positive: str = "yes") -> float:
     return float(value)
 
 
+_POS_TOKENS = frozenset({"yes", "y", "true", "t", "1", "1.0", "sim", "present", "positive"})
+_NEG_TOKENS = frozenset({"no", "n", "false", "f", "0", "0.0", "nao", "n\u00e3o", "absent", "negative"})
+
+
+def _binary_flag(value) -> float:
+    """Strict yes/no -> 1.0/0.0 for the systemic-comorbidity columns; NaN otherwise.
+
+    :func:`_yes_no` maps every unrecognised string to 0.0. That is acceptable for
+    the curated ophthalmic yes/no columns but not for self-reported / chart-derived
+    systemic fields whose encodings have not been audited on every release: an
+    unknown token ("unknown", "n/a", a 2 from a 1/2 release) must become NaN so
+    ``drop_missing_labels`` removes the row, rather than arriving as a confident
+    negative. If a column is encoded 1/2 the whole task comes out empty and the
+    trainer fails loudly — run ``inspect_mbrset.py`` on the CSV first.
+    """
+    if value is None:
+        return np.nan
+    if isinstance(value, (bool, np.bool_)):
+        return float(value)
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in _POS_TOKENS:
+            return 1.0
+        if t in _NEG_TOKENS:
+            return 0.0
+        return np.nan
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if np.isnan(f):
+        return np.nan
+    if f == 1.0:
+        return 1.0
+    if f == 0.0:
+        return 0.0
+    return np.nan
+
+
 def _icdr_grade(row: Dict[str, object]) -> float:
     v = row["final_icdr"]
     return np.nan if pd.isna(v) else float(int(v))
@@ -174,6 +213,21 @@ LABEL_REGISTRY: Dict[str, LabelSpec] = {
         dtype=torch.float32,
         num_classes=None,
         description="Patient age in years (regression).",
+    ),
+    # Glaucoma / AMD (public sets via public_fundus.py; BRSET carries ``amd``) --- #
+    "glaucoma": LabelSpec(
+        source_cols=("glaucoma",),
+        fn=lambda r: _binary_flag(r["glaucoma"]),
+        dtype=torch.long,
+        num_classes=2,
+        description="Glaucoma (referable / diagnosed, per the source dataset's definition; yes/no).",
+    ),
+    "amd": LabelSpec(
+        source_cols=("amd",),
+        fn=lambda r: _binary_flag(r["amd"]),
+        dtype=torch.long,
+        num_classes=2,
+        description="Age-related macular degeneration (yes/no).",
     ),
 }
 
@@ -407,8 +461,12 @@ class MBRSETDataset(Dataset):
             valid = ~_isnan_vector(label_values)
             keep &= valid
         if drop_missing_files:
+            # Flat layouts are checked against one listdir; a ``file`` with a
+            # sub-directory (public sets shipped in nested folders) is stat'ed.
             existing = {f for f in os.listdir(images_dir)} if os.path.isdir(images_dir) else set()
-            keep &= np.array([f in existing for f in files], dtype=bool)
+            keep &= np.array([(f in existing) or
+                              (os.sep in f and os.path.isfile(os.path.join(images_dir, f)))
+                              for f in files], dtype=bool)
 
         n_drop = int((~keep).sum())
         if n_drop:

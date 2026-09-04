@@ -2,6 +2,14 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-09-04 glaucoma / AMD on public sets  (branch `disease/glaucoma-amd`)
+
+- `public_fundus.py`: adapters for AIROGS, REFUGE, PAPILA, ODIR-5K into the mBRSET schema (`glaucoma` / `amd`, `patient`, `age`/`sex` where available), with `--inspect --strict`; `brset_dataset.load_any` dispatches them and `DATASETS` lists every name; BRSET's `amd` column is carried through.
+- `dataset.py`: `glaucoma` and `amd` tasks (strict `_binary_flag`); `drop_missing_files` accepts nested image paths.
+- `train_mbrset.py` / `evaluate_deploy.py`: `--dataset` / `--external-test-dataset` accept every `DATASETS` entry; `--task` accepts every registry task.
+- `run_kd_xfer.sh`: `TASK=` and `EXT_DATASET=` knobs (defaults unchanged); `summarize_xfer.py` names the external set from the JSON instead of hardcoding mBRSET.
+- `score_external.py` (score a checkpoint on another set, zero-shot + AdaBN), `summarize_external.py`, `run_public_xfer.sh`, `make public-xfer`; `openpyxl` in requirements; `tests/test_public_fundus.py`.
+
 ## [Unreleased] — 2026-09-01 audit fixes
 
 Bugs that changed results (re-run affected sweeps):

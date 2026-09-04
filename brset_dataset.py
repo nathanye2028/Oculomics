@@ -117,6 +117,9 @@ OPTIONAL_MAP: Dict[str, str] = {
     "diabetes_time_y": "dm_time",
     "insuline": "insulin",
     "camera": "camera",
+    # BRSET's AMD label, carried through so an ODIR-5K-trained AMD model can be
+    # scored on BRSET (and vice versa) via the public_fundus adapters.
+    "amd": "amd",
 }
 
 # Tasks in dataset.LABEL_REGISTRY and the mBRSET column each one needs, so
@@ -130,6 +133,9 @@ TASK_REQUIREMENTS: Dict[str, str] = {
     "artifacts": "final_artifacts",
     "sex": "sex",
     "age": "age",
+    # Public glaucoma / AMD sets (public_fundus.py) and BRSET's own amd column.
+    "glaucoma": "glaucoma",
+    "amd": "amd",
 }
 
 
@@ -197,12 +203,23 @@ def _normalise_artifacts(s: pd.Series) -> pd.Series:
     return s
 
 
+def _normalise_flag(s: pd.Series) -> pd.Series:
+    """0/1 (or yes/no) -> 0.0/1.0; any other value -> NaN, never a confident 0."""
+    vals = set(pd.unique(s.dropna()))
+    if vals and all(isinstance(v, str) for v in vals):
+        m = s.astype(str).str.strip().str.lower().map({"yes": 1.0, "no": 0.0, "1": 1.0, "0": 0.0})
+        return m.astype(float)
+    num = pd.to_numeric(s, errors="coerce")
+    return num.where(num.isin([0, 1]))
+
+
 # mBRSET column -> re-encoder, applied after the rename. Keyed on the *destination*
 # name so it reads against the schema dataset.py consumes.
 VALUE_NORMALISERS = {
     "sex": _normalise_sex,
     "final_quality": _normalise_quality,
     "final_artifacts": _normalise_artifacts,
+    "amd": _normalise_flag,
 }
 
 
@@ -273,12 +290,21 @@ def load_brset(
     return out
 
 
-def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]:
-    """Resolve ``root`` to a (DataFrame, images_dir) pair for either dataset.
+# Every dataset a trainer / scorer can name: the two Brazilian sets plus the public
+# glaucoma / AMD sets adapted in public_fundus.py.
+from public_fundus import PUBLIC_DATASETS, load_public          # noqa: E402
+DATASETS = ("mbrset", "brset") + PUBLIC_DATASETS
 
-    Lets a trainer accept ``--dataset {mbrset,brset}`` without branching on the
-    schema everywhere. Returns a dict so the caller can log what it resolved.
+
+def load_any(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str, str]:
+    """Resolve ``root`` to a (DataFrame, images_dir) pair for any dataset in DATASETS.
+
+    Lets a trainer accept ``--dataset {mbrset,brset,airogs,refuge,papila,odir}``
+    without branching on the schema everywhere. Returns a dict so the caller can
+    log what it resolved. ``**kw`` reaches the public adapters (``papila_suspect``).
     """
+    if dataset in PUBLIC_DATASETS:
+        return load_public(root, dataset, image_ext=image_ext, **kw)
     if dataset == "mbrset":
         csv_path = os.path.join(root, "labels_mbrset.csv")
         img_dir = os.path.join(root, "images")
@@ -306,7 +332,7 @@ def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]
                         if os.path.isdir(os.path.join(root, c))), os.path.join(root, "fundus_photos"))
         return {"df": load_brset(csv_path, image_ext=image_ext), "images_dir": img_dir,
                 "csv": csv_path, "source": "brset"}
-    raise ValueError(f"unknown dataset {dataset!r}; expected 'mbrset' or 'brset'")
+    raise ValueError(f"unknown dataset {dataset!r}; expected one of {DATASETS}")
 
 
 # --------------------------------------------------------------------------- #
