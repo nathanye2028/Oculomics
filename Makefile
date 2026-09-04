@@ -5,7 +5,7 @@ CKPT ?= ck_kd_v4_384/kd_seed1.pt
 B ?=
 M ?=
 
-.PHONY: help setup check test smoke reproduce stats deploy export clean-scratch
+.PHONY: help setup check test smoke reproduce stats deploy export ophthalmic clean-scratch
 
 .DEFAULT_GOAL := help
 
@@ -35,6 +35,9 @@ stats:  ## re-summarise an existing sweep
 
 deploy:  ## operating point + Core ML for CKPT (default ck_kd_v4_384/kd_seed1.pt)
 	B="$(B)" M="$(M)" STAGE=deploy DEPLOY_CK="$(CKPT)" bash reproduce.sh
+
+ophthalmic:  ## BRSET ophthalmic labels: multi-label head vs one model per label: make ophthalmic B=... [SEEDS="0 1 2"]
+	B="$(B)" bash run_ophthalmic.sh $(SEEDS)
 
 export:  ## Core ML export only: make export CKPT=path.pt
 	.venv/bin/python export_coreml.py --checkpoint "$(CKPT)"

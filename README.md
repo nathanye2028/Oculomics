@@ -77,6 +77,9 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
+| **Ophthalmic labels beyond DR (BRSET)** | |
+| `run_ophthalmic.sh` | Per seed: one multi-label model (`--task ophthalmic`) and one binary model per label on the same patient split; `B=` required, `--help` lists every knob |
+| `summarize_ophthalmic.py` | Paired multi-minus-single AUROC per label over `multi_seed<n>.json` / `single_<label>_seed<n>.json` |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -146,6 +149,40 @@ Design points that the code enforces:
   `run_kd_xfer.sh` retrains a teacher whose checkpoint exists without it.
 - **Imbalance** is corrected once (`--imbalance sampler`); `--amp` is bf16 on
   MPS, fp16 + GradScaler on CUDA, identically for every arm.
+
+## Ophthalmic labels beyond DR: multi-label head on BRSET
+
+BRSET grades every image for more than DR: **AMD, drusen, increased cup-to-disc
+ratio (glaucoma suspect), hypertensive retinopathy, vascular occlusion,
+hemorrhage, myopic fundus, retinal detachment, scar, nevus**. The BRSET adapter
+now carries those columns through (`brset_dataset.OPHTHALMIC_MAP`), each is a
+binary task (`--task amd`), and `--task ophthalmic` trains **one model with a
+sigmoid logit per label** (`dataset.OPHTHALMIC_LABELS`). mBRSET has none of
+these labels, so this is **in-domain on BRSET only** — no smartphone transfer
+claim is available for it.
+
+```bash
+python brset_dataset.py --csv <BRSET>/labels_brset.csv --inspect    # OPHTHALMIC LABELS block: raw encodings + prevalence
+B=<BRSET> bash run_ophthalmic.sh 0 1 2 3 4                          # multi + one-per-label, paired by seed
+python summarize_ophthalmic.py --dir exp_ophthalmic
+```
+
+What changes for the multi-label head, and only there:
+
+- **Loss / imbalance**: `BCEWithLogitsLoss`; `--imbalance loss` uses per-label
+  `neg/pos` as `pos_weight`, `--imbalance sampler` (default) draws each image by
+  the inverse frequency of its *rarest* positive label.
+- **Metrics / selection**: per-label AUROC (`per_label_auroc` in the JSON, NaN
+  where a label has one class in the split) with the macro mean over scored
+  labels as the selection metric; `kappa` is NaN.
+- **Splits**: stratified on each row's rarest positive label so the rare labels
+  reach every partition; a row with any missing label is dropped.
+- **Distillation**: `--teacher` works with a per-logit binary KD term.
+- **The paired question** (`summarize_ophthalmic.py`): does sharing one trunk
+  across labels help or hurt each label versus a dedicated model, same seed,
+  same split? Rare labels have a handful of test positives — quote the CI.
+- **Not yet adapted**: `export_coreml.py` / `evaluate_deploy.py` assume a
+  softmax head; exporting the multi-label model needs a sigmoid output path.
 
 ## Segmentation: GCG vs control
 

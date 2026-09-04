@@ -41,6 +41,17 @@ attributable to the pixels once prevalence is accounted for.
 Both datasets flow through the same :class:`dataset.MBRSETDataset` — see
 ``brset_dataset.py`` for why a second loader would confound the comparison.
 
+Multi-label ophthalmic head on BRSET
+------------------------------------
+``--dataset brset --task ophthalmic`` trains ONE model with a sigmoid logit per
+BRSET ophthalmic label (``dataset.OPHTHALMIC_LABELS``: AMD, drusen, increased
+cup-to-disc, hypertensive retinopathy, vascular occlusion, ...) with BCE; each
+label is also its own binary task (``--task amd``). The multilabel path changes
+only what has to change: BCEWithLogits (``--imbalance loss`` -> per-label
+``pos_weight``; ``sampler`` -> rarest-positive-label sampling), per-label AUROC
+with the macro mean as the selection metric (``per_label_auroc`` in the JSON),
+and a per-logit binary KD term. mBRSET has none of these labels: in-domain only.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -124,7 +135,7 @@ def backbone_kwargs_for(backbone: str, image_size: int) -> dict:
 
 
 def load_teacher(path: str, device: torch.device, num_classes: int, task: str,
-                 dataset: str = None, external_root: str = None):
+                 dataset: str = None, external_root: str = None, multilabel: bool = False):
     """Rebuild a train_mbrset.py checkpoint as a frozen teacher.
 
     The checkpoint records its own backbone / gcg / image_size, so the student
@@ -159,7 +170,7 @@ def load_teacher(path: str, device: torch.device, num_classes: int, task: str,
     use_gcg = ck.get("use_gcg")
     if use_gcg is None:
         use_gcg = (not a.get("no_gcg", False)) and not bk.startswith("timm:")
-    t = MBRSETClassifier(num_classes=num_classes, pretrained=False,
+    t = MBRSETClassifier(num_classes=num_classes, multilabel=multilabel, pretrained=False,
                          use_gcg=use_gcg,
                          gcg_variant=a.get("gcg_variant", "baseline"),
                          backbone=bk,
@@ -185,6 +196,16 @@ def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float
     return F.kl_div(F.log_softmax(student_logits.float() / T, dim=1),
                     F.softmax(teacher_logits.float() / T, dim=1),
                     reduction="batchmean") * (T * T)
+
+
+def kd_loss_multilabel(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float) -> torch.Tensor:
+    """Multi-label counterpart of :func:`kd_loss`: per logit, binary cross-entropy of
+    the student's softened sigmoid against the teacher's softened sigmoid, times
+    ``T^2``. Equals per-logit KL(teacher || student) up to the teacher-entropy
+    constant, so its gradient is the same. Computed in fp32."""
+    return F.binary_cross_entropy_with_logits(
+        student_logits.float() / T, torch.sigmoid(teacher_logits.float() / T),
+        reduction="mean") * (T * T)
 
 
 @torch.no_grad()
@@ -237,8 +258,14 @@ def pick_device() -> torch.device:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes):
-    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader."""
+def evaluate(model, loader, device, num_classes, multilabel: bool = False, label_names=None):
+    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader.
+
+    Multilabel: ``auroc`` is the macro mean of the per-label AUROCs over the labels
+    that have BOTH classes in this loader (``per_label_auroc`` carries every label,
+    NaN where undefined, and ``n_labels_scored`` says how many entered the mean);
+    ``acc``/``f1`` are at a 0.5 threshold per label; ``kappa`` is NaN (ordinal only).
+    """
     model.eval()
     logits_all, y_all = [], []
     for batch in loader:
@@ -247,10 +274,31 @@ def evaluate(model, loader, device, num_classes):
         y_all.append(y.cpu())
     logits = torch.cat(logits_all)
     y = torch.cat(y_all).numpy()
-    prob = torch.softmax(logits, dim=1).numpy()
-    pred = prob.argmax(1)
 
     from sklearn.metrics import roc_auc_score, f1_score
+    if multilabel:
+        prob = torch.sigmoid(logits).numpy()
+        yb = (y > 0.5).astype(int)
+        names = [str(n) for n in (label_names or range(prob.shape[1]))]
+        per = {}
+        for j, name in enumerate(names):
+            col = yb[:, j]
+            per[name] = (float(roc_auc_score(col, prob[:, j]))
+                         if 0 < col.sum() < len(col) else float("nan"))
+        scored = [v for v in per.values() if v == v]
+        pred = (prob >= 0.5).astype(int)
+        return {
+            "auroc": float(np.mean(scored)) if scored else float("nan"),
+            "acc": float((pred == yb).mean()),
+            "f1": float(f1_score(yb, pred, average="macro", zero_division=0)),
+            "kappa": float("nan"),
+            "n": int(len(yb)),
+            "per_label_auroc": per,
+            "n_labels_scored": len(scored),
+        }
+
+    prob = torch.softmax(logits, dim=1).numpy()
+    pred = prob.argmax(1)
     try:
         if num_classes == 2:
             auroc = float(roc_auc_score(y, prob[:, 1]))
@@ -268,7 +316,6 @@ def evaluate(model, loader, device, num_classes):
         "n": int(len(y)),
     }
 
-
 def main() -> int:
     p = argparse.ArgumentParser(description="mBRSET clinical-label classification.")
     p.add_argument("--root", required=True,
@@ -284,9 +331,12 @@ def main() -> int:
                    help="Schema of --external-test-root.")
     p.add_argument("--image-ext", default=".jpg",
                    help="Extension appended to BRSET image_id values that lack one.")
+    from dataset import LABEL_REGISTRY                        # noqa: E402
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
-                            "quality", "artifacts"])
+                   choices=[t for t, sp in LABEL_REGISTRY.items() if sp.num_classes],
+                   help="Any classification task in dataset.LABEL_REGISTRY: the DR/edema/quality "
+                        "tasks and the systemic targets (hypertension, nephropathy, ...). "
+                        "Regression tasks (age) are not supported by this CE trainer.")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
@@ -384,6 +434,7 @@ def main() -> int:
     dev_aug = DeviceAug() if gpu_aug else None
     train_ds, val_ds, test_ds = mk(splits["train"], "train"), mk(splits["val"], "val"), mk(splits["test"], "val")
     C = train_ds.num_classes
+    ML, NAMES = train_ds.multilabel, list(train_ds.label_names)
 
     # The external set is built with split="val": deterministic transforms, no
     # augmentation. Training on one dataset and testing on another is only a
@@ -406,7 +457,11 @@ def main() -> int:
     if ext_ds is not None:
         print(f"[info] extern : {args.external_test_dataset} @ {args.external_test_root} "
               f"n={len(ext_ds)}  (out-of-domain; not used for training or selection)")
-    print(f"[info] class counts (train): {train_ds.class_counts().tolist()}")
+    if ML:
+        print(f"[info] labels : {NAMES}")
+        print(f"[info] positives per label (train): {train_ds.label_pos_counts().tolist()}")
+    else:
+        print(f"[info] class counts (train): {train_ds.class_counts().tolist()}")
 
     g = torch.Generator(); g.manual_seed(args.seed)
     # One imbalance correction, not two: a balanced sampler already delivers
@@ -425,7 +480,7 @@ def main() -> int:
     val_loader, test_loader = dl(val_ds, shuffle=False), dl(test_ds, shuffle=False)
     ext_loader = dl(ext_ds, shuffle=False) if ext_ds is not None else None
 
-    model = MBRSETClassifier(num_classes=C, pretrained=not args.no_pretrained,
+    model = MBRSETClassifier(num_classes=C, multilabel=ML, pretrained=not args.no_pretrained,
                              use_gcg=not args.no_gcg, gcg_variant=args.gcg_variant,
                              backbone=args.backbone,
                              backbone_kwargs=backbone_kwargs_for(args.backbone, args.image_size)
@@ -455,7 +510,7 @@ def main() -> int:
         with torch.random.fork_rng(devices=[]):
             teacher, t_backbone, t_args, t_val = load_teacher(
                 args.teacher, device, C, args.task,
-                dataset=args.dataset, external_root=args.external_test_root)
+                dataset=args.dataset, external_root=args.external_test_root, multilabel=ML)
         if int(t_args.get("seed", args.seed)) != args.seed:
             print(f"[warn] teacher seed {t_args.get('seed')} != student seed {args.seed}: "
                   "the patient splits differ, so the teacher may have trained on images in "
@@ -483,8 +538,16 @@ def main() -> int:
           f"channels_last={'on' if use_cl else 'off'}  "
           f"gpu_aug={'on' if gpu_aug else 'off'}  imbalance={args.imbalance}")
 
-    cw = train_ds.class_weights().to(device) if use_loss_w else None
-    crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
+    if ML:
+        # One sigmoid logit per label. --imbalance loss -> per-label neg/pos pos_weight;
+        # label smoothing has no multi-label analogue here and is ignored.
+        pw = train_ds.pos_weight().to(device) if use_loss_w else None
+        crit = nn.BCEWithLogitsLoss(pos_weight=pw)
+        if args.label_smoothing:
+            print("[warn] --label-smoothing ignored for the multi-label head")
+    else:
+        cw = train_ds.class_weights().to(device) if use_loss_w else None
+        crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
     params = list(model.parameters()) + (list(proj.parameters()) if proj is not None else [])
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     warm = max(0, min(args.warmup_epochs, args.epochs - 1))
@@ -521,7 +584,7 @@ def main() -> int:
                     s_logits, s_feat = model.forward_with_feat(x)
                     with torch.no_grad():
                         t_logits, t_feat = teacher.forward_with_feat(x)
-                    kd = kd_loss(s_logits, t_logits, args.kd_temp)   # T^2 * KL(teacher||student)
+                    kd = (kd_loss_multilabel if ML else kd_loss)(s_logits, t_logits, args.kd_temp)
                     loss = (1.0 - args.kd_alpha) * crit(s_logits, y) + args.kd_alpha * kd
                     if proj is not None:
                         cos = F.cosine_similarity(proj(s_feat.float()), t_feat.float(), dim=1)
@@ -541,7 +604,7 @@ def main() -> int:
         # Selection/checkpointing use the EMA weights when enabled: they are the
         # weights that would ship, so they are the ones that must win selection.
         eval_model = ema.ema if ema is not None else model
-        vm = evaluate(eval_model, val_loader, device, C)
+        vm = evaluate(eval_model, val_loader, device, C, multilabel=ML, label_names=NAMES)
         # NaN-safe selection: a degenerate (single-class) val split makes AUROC
         # NaN every epoch, and NaN > best is always False — without a fallback
         # NO checkpoint is ever saved and the final test load crashes, losing
@@ -566,7 +629,8 @@ def main() -> int:
               f"val_AUROC={vm['auroc']:.4f} acc={vm['acc']:.3f} kappa={vm['kappa']:.3f}"
               f"  [{time.time()-t_ep:.0f}s]{tag}", flush=True)
         csv_log.log({"epoch": epoch, "train_loss": round(run, 5),
-                     **{f"val_{k}": round(v, 5) for k, v in vm.items() if k != "n"}})
+                     **{f"val_{k}": round(v, 5) for k, v in vm.items()
+                        if k != "n" and isinstance(v, (int, float))}})
         sched.step()
         if args.patience and since >= args.patience:
             print(f"  early stop: no val AUROC gain for {args.patience} epochs")
@@ -578,14 +642,14 @@ def main() -> int:
           + ("  (AUROC was NaN; accuracy fallback)" if sel_metric == "acc" else ""))
 
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
-    tm = evaluate(model, test_loader, device, C)
+    tm = evaluate(model, test_loader, device, C, multilabel=ML, label_names=NAMES)
     print(f"\n=== TEST (held-out, best checkpoint @ epoch {best_epoch}) ===")
     print(f"  AUROC={tm['auroc']:.4f}  acc={tm['acc']:.4f}  macroF1={tm['f1']:.4f}  "
           f"kappa={tm['kappa']:.4f}  n={tm['n']}")
 
     em = None
     if ext_loader is not None:
-        em = evaluate(model, ext_loader, device, C)
+        em = evaluate(model, ext_loader, device, C, multilabel=ML, label_names=NAMES)
         print(f"\n=== EXTERNAL TEST ({args.external_test_dataset}, out-of-domain) ===")
         print(f"  AUROC={em['auroc']:.4f}  acc={em['acc']:.4f}  macroF1={em['f1']:.4f}  "
               f"kappa={em['kappa']:.4f}  n={em['n']}")
@@ -598,11 +662,16 @@ def main() -> int:
     # Positive-class counts (binary tasks) so a summariser can derive the two
     # prevalences from the run itself instead of hardcoding them.
     def _pos(ds):
-        return int((ds.labels == 1).sum()) if (ds is not None and C == 2) else None
+        if ds is None:
+            return None
+        if ML:
+            return {n: int(c) for n, c in zip(NAMES, ds.label_pos_counts().tolist())}
+        return int((ds.labels == 1).sum()) if C == 2 else None
 
     result = {"task": args.task, "use_gcg": model.use_gcg,
               "gcg_variant": args.gcg_variant if model.use_gcg else None,
               "seed": args.seed, "num_classes": C,
+              "multilabel": ML, "label_names": NAMES if ML else None,
               "train_dataset": args.dataset,
               "test": tm, "best_val_auroc": best_auroc, "best_epoch": best_epoch,
               "selection_metric": sel_metric,
@@ -624,6 +693,7 @@ def main() -> int:
 
     def write_results():
         if args.results_json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
             with open(args.results_json, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"[info] wrote {args.results_json}")
@@ -647,7 +717,7 @@ def main() -> int:
             print(f"\n[warn] no BatchNorm layers in {args.backbone}; --bn-adapt is a no-op "
                   f"(LayerNorm-only backbone). No adapted number is reported.")
         else:
-            em_adapt = evaluate(adapted, ext_loader, device, C)
+            em_adapt = evaluate(adapted, ext_loader, device, C, multilabel=ML, label_names=NAMES)
             print(f"\n=== EXTERNAL TEST after BN adaptation (label-free AdaBN on "
                   f"{args.external_test_dataset} images; {n_bn} BN layers) ===")
             print(f"  AUROC={em_adapt['auroc']:.4f}  acc={em_adapt['acc']:.4f}  "

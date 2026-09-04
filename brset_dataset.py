@@ -118,6 +118,12 @@ OPTIONAL_MAP: Dict[str, str] = {
     "insuline": "insulin",
     "camera": "camera",
 }
+# BRSET's ophthalmic labels beyond DR, carried through under their own names (0/1;
+# anything else -> NaN -> the row is dropped for that task). ``diabetic_retinopathy``
+# is redundant with DR_ICDR and ``other`` is uninformative; both stay dropped.
+OPHTHALMIC_MAP: Dict[str, str] = {c: c for c in (
+    "amd", "drusens", "increased_cup_disc", "hypertensive_retinopathy", "vascular_occlusion",
+    "hemorrhage", "myopic_fundus", "retinal_detachment", "scar", "nevus")}
 
 # Tasks in dataset.LABEL_REGISTRY and the mBRSET column each one needs, so
 # --inspect can say which tasks are actually runnable on this CSV.
@@ -130,6 +136,9 @@ TASK_REQUIREMENTS: Dict[str, str] = {
     "artifacts": "final_artifacts",
     "sex": "sex",
     "age": "age",
+    # Ophthalmic labels beyond DR (BRSET-only; in-domain tasks, see run_ophthalmic.sh).
+    **{c: c for c in OPHTHALMIC_MAP},
+    "ophthalmic": tuple(OPHTHALMIC_MAP),        # the multi-label head needs every column
 }
 
 
@@ -197,12 +206,23 @@ def _normalise_artifacts(s: pd.Series) -> pd.Series:
     return s
 
 
+def _normalise_flag(s: pd.Series) -> pd.Series:
+    """0/1 (or yes/no) -> 0.0/1.0; any other value -> NaN, never a confident 0."""
+    vals = set(pd.unique(s.dropna()))
+    if vals and all(isinstance(v, str) for v in vals):
+        m = s.astype(str).str.strip().str.lower().map({"yes": 1.0, "no": 0.0, "1": 1.0, "0": 0.0})
+        return m.astype(float)
+    num = pd.to_numeric(s, errors="coerce")
+    return num.where(num.isin([0, 1]))
+
+
 # mBRSET column -> re-encoder, applied after the rename. Keyed on the *destination*
 # name so it reads against the schema dataset.py consumes.
 VALUE_NORMALISERS = {
     "sex": _normalise_sex,
     "final_quality": _normalise_quality,
     "final_artifacts": _normalise_artifacts,
+    **{c: _normalise_flag for c in OPHTHALMIC_MAP},
 }
 
 
@@ -249,13 +269,13 @@ def load_brset(
             f"meant to be the auditable record of what was joined to what."
         )
 
-    rename = {src: dst for src, dst in {**REQUIRED_MAP, **OPTIONAL_MAP}.items()
+    rename = {src: dst for src, dst in {**REQUIRED_MAP, **OPTIONAL_MAP, **OPHTHALMIC_MAP}.items()
               if src in df.columns}
     out = df.rename(columns=rename).copy()
 
-    # Keep only the mBRSET-schema columns; carrying BRSET's other 15 label
-    # columns through would let a caller reach for e.g. 'drusens' and get a
-    # column that has no mBRSET counterpart to test against.
+    # Keep the mBRSET-schema columns plus the ophthalmic labels in OPHTHALMIC_MAP.
+    # Those have no mBRSET counterpart, so a task on them is in-domain only --
+    # train_mbrset.py refuses an external test set that lacks the column.
     keep = [c for c in rename.values() if c in out.columns]
     out = out[keep]
 
@@ -322,6 +342,9 @@ def _distribution(df: pd.DataFrame, task: str) -> Optional[Dict[int, int]]:
         return None
     y = np.array([spec.fn(dict(zip(spec.source_cols, row)))
                   for row in df[list(spec.source_cols)].to_numpy()], dtype=np.float64)
+    if spec.multilabel:
+        y = y[~_isnan_vector(y).any(axis=1)]
+        return {"n": int(len(y)), **{n: int((y[:, j] > 0.5).sum()) for j, n in enumerate(spec.label_names)}}
     y = y[~_isnan_vector(y)]
     if spec.dtype is not None and spec.num_classes:
         vals, counts = np.unique(y.astype(int), return_counts=True)
@@ -344,11 +367,12 @@ def main() -> int:
     print(f"\n{'='*74}\nBRSET CSV: {args.csv}\n  {len(raw)} rows, {len(raw.columns)} columns\n{'='*74}")
 
     print("\nCOLUMN MAPPING")
-    for src, dst in {**REQUIRED_MAP, **OPTIONAL_MAP}.items():
-        req = "required" if src in REQUIRED_MAP else "optional"
+    for src, dst in {**REQUIRED_MAP, **OPTIONAL_MAP, **OPHTHALMIC_MAP}.items():
+        req = ("required" if src in REQUIRED_MAP else
+               "ophthalmic" if src in OPHTHALMIC_MAP else "optional")
         mark = "OK  " if src in raw.columns else ("MISSING" if req == "required" else "absent ")
-        print(f"  {mark:8s} {src:<18} -> {dst:<18} ({req})")
-    unmapped = [c for c in raw.columns if c not in {**REQUIRED_MAP, **OPTIONAL_MAP}]
+        print(f"  {mark:8s} {src:<24} -> {dst:<24} ({req})")
+    unmapped = [c for c in raw.columns if c not in {**REQUIRED_MAP, **OPTIONAL_MAP, **OPHTHALMIC_MAP}]
     if unmapped:
         print(f"\n  not mapped ({len(unmapped)}): {', '.join(unmapped)}")
         print("  ^ BRSET-only labels with no mBRSET counterpart; they cannot be")
@@ -397,17 +421,28 @@ def main() -> int:
         else:
             print(f"\n  [warn] images_dir does not exist: {args.images_dir}")
 
+    print("\nOPHTHALMIC LABELS (BRSET-only, in-domain; raw -> 0/1 counts after _normalise_flag)")
+    for col in OPHTHALMIC_MAP:
+        if col not in df.columns:
+            print(f"  {col:<26} absent")
+            continue
+        raw_vals = sorted(map(str, pd.unique(raw[col].dropna())))[:8]
+        pos, n = int((df[col] == 1).sum()), int(df[col].notna().sum())
+        print(f"  {col:<26} raw={str(raw_vals):<24} pos={pos:>5}/{n:<6} ({(pos / n if n else 0):.2%})")
+    print("")
+
     print("\nTASK AVAILABILITY (rows with a usable label)")
     other = pd.read_csv(args.compare_mbrset) if args.compare_mbrset else None
     for task, need in TASK_REQUIREMENTS.items():
-        if need not in df.columns:
-            print(f"  {task:<14} unavailable (needs {need})")
+        needs = need if isinstance(need, tuple) else (need,)
+        if any(c not in df.columns for c in needs):
+            print(f"  {task:<26} unavailable (needs {', '.join(c for c in needs if c not in df.columns)})")
             continue
         d = _distribution(df, task)
-        line = f"  {task:<14} {d}"
+        line = f"  {task:<26} {d}"
         if other is not None:
             od = _distribution(other, task)
-            line += f"\n  {'':<14} mBRSET: {od}"
+            line += f"\n  {'':<26} mBRSET: {od if od is not None else 'unavailable (no such column)'}"
         print(line)
 
     if other is not None:

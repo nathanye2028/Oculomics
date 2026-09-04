@@ -96,6 +96,7 @@ class LabelSpec:
     num_classes: Optional[int] = None
     multilabel: bool = False
     description: str = ""
+    label_names: Tuple[str, ...] = ()      # multilabel only: name of each vector component
 
 
 def _yes_no(value, positive: str = "yes") -> float:
@@ -105,6 +106,45 @@ def _yes_no(value, positive: str = "yes") -> float:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return np.nan
     return float(value)
+
+
+_POS_TOKENS = frozenset({"yes", "y", "true", "t", "1", "1.0", "sim", "present", "positive"})
+_NEG_TOKENS = frozenset({"no", "n", "false", "f", "0", "0.0", "nao", "n\u00e3o", "absent", "negative"})
+
+
+def _binary_flag(value) -> float:
+    """Strict yes/no -> 1.0/0.0 for the systemic-comorbidity columns; NaN otherwise.
+
+    :func:`_yes_no` maps every unrecognised string to 0.0. That is acceptable for
+    the curated ophthalmic yes/no columns but not for self-reported / chart-derived
+    systemic fields whose encodings have not been audited on every release: an
+    unknown token ("unknown", "n/a", a 2 from a 1/2 release) must become NaN so
+    ``drop_missing_labels`` removes the row, rather than arriving as a confident
+    negative. If a column is encoded 1/2 the whole task comes out empty and the
+    trainer fails loudly — run ``inspect_mbrset.py`` on the CSV first.
+    """
+    if value is None:
+        return np.nan
+    if isinstance(value, (bool, np.bool_)):
+        return float(value)
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in _POS_TOKENS:
+            return 1.0
+        if t in _NEG_TOKENS:
+            return 0.0
+        return np.nan
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if np.isnan(f):
+        return np.nan
+    if f == 1.0:
+        return 1.0
+    if f == 0.0:
+        return 0.0
+    return np.nan
 
 
 def _icdr_grade(row: Dict[str, object]) -> float:
@@ -176,6 +216,49 @@ LABEL_REGISTRY: Dict[str, LabelSpec] = {
         description="Patient age in years (regression).",
     ),
 }
+
+# BRSET ophthalmic labels beyond DR ------------------------------------------- #
+# task name == BRSET column (brset_dataset.load_brset carries these through under
+# their own names). mBRSET has none of them, so they are IN-DOMAIN tasks on BRSET:
+# no smartphone transfer arm exists. ``ophthalmic`` is the multi-label head over
+# all of them (one model, one sigmoid logit per label, BCE); each name is also a
+# stand-alone binary task so run_ophthalmic.sh can pair multi-vs-single per label.
+OPHTHALMIC_TASKS: Dict[str, Tuple[str, str]] = {
+    "amd": ("amd", "Age-related macular degeneration (yes/no)."),
+    "drusens": ("drusens", "Drusen present (yes/no)."),
+    "increased_cup_disc": ("increased_cup_disc",
+                           "Increased cup-to-disc ratio, i.e. glaucoma suspect (yes/no)."),
+    "hypertensive_retinopathy": ("hypertensive_retinopathy", "Hypertensive retinopathy (yes/no)."),
+    "vascular_occlusion": ("vascular_occlusion", "Retinal vascular occlusion (yes/no)."),
+    "hemorrhage": ("hemorrhage", "Retinal hemorrhage (yes/no)."),
+    "myopic_fundus": ("myopic_fundus", "Myopic fundus (yes/no)."),
+    "retinal_detachment": ("retinal_detachment", "Retinal detachment (yes/no)."),
+    "scar": ("scar", "Chorioretinal scar (yes/no)."),
+    "nevus": ("nevus", "Choroidal nevus (yes/no)."),
+}
+OPHTHALMIC_LABELS: Tuple[str, ...] = tuple(OPHTHALMIC_TASKS)   # order of the multi-label vector
+
+
+def _flag_spec(col: str, description: str) -> LabelSpec:
+    # A factory, not a loop-body lambda: the closure must bind THIS column.
+    return LabelSpec(source_cols=(col,), fn=lambda r: _binary_flag(r[col]),
+                     dtype=torch.long, num_classes=2, description=description)
+
+
+for _task, (_col, _desc) in OPHTHALMIC_TASKS.items():
+    LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
+
+
+def _ophthalmic_vector(row: Dict[str, object]) -> List[float]:
+    # A NaN component marks the whole row unusable (see _row_invalid): a partially
+    # labelled image would otherwise train the missing label as a confident 0.
+    return [_binary_flag(row[c]) for c in OPHTHALMIC_LABELS]
+
+
+LABEL_REGISTRY["ophthalmic"] = LabelSpec(
+    source_cols=OPHTHALMIC_LABELS, fn=_ophthalmic_vector, dtype=torch.float32,
+    num_classes=len(OPHTHALMIC_LABELS), multilabel=True, label_names=OPHTHALMIC_LABELS,
+    description="Multi-label head over BRSET's ophthalmic labels (sigmoid/BCE, one logit each).")
 
 
 # ----------------------------------------------------------------------------- #
@@ -397,6 +480,7 @@ class MBRSETDataset(Dataset):
         self.task = label_col or task
         self.num_classes = spec.num_classes
         self.multilabel = spec.multilabel
+        self.label_names = tuple(spec.label_names)
         self._label_dtype = spec.dtype
 
         files = df[file_col].astype(str).to_numpy()
@@ -404,7 +488,7 @@ class MBRSETDataset(Dataset):
         # --- filter rows ---------------------------------------------------- #
         keep = np.ones(len(df), dtype=bool)
         if drop_missing_labels:
-            valid = ~_isnan_vector(label_values)
+            valid = ~_row_invalid(label_values)
             keep &= valid
         if drop_missing_files:
             existing = {f for f in os.listdir(images_dir)} if os.path.isdir(images_dir) else set()
@@ -544,6 +628,21 @@ class MBRSETDataset(Dataset):
             return None
         return torch.bincount(self.labels.long(), minlength=self.num_classes)
 
+    def label_pos_counts(self) -> Optional[torch.Tensor]:
+        """Multilabel only: positives per label, shape ``[L]`` (None otherwise)."""
+        if not self.multilabel:
+            return None
+        return (self.labels > 0.5).sum(0).long()
+
+    def pos_weight(self) -> Optional[torch.Tensor]:
+        """Multilabel only: ``neg/pos`` per label for ``BCEWithLogitsLoss(pos_weight=)``;
+        a label with no positives gets 1.0 rather than inf."""
+        pos = self.label_pos_counts()
+        if pos is None:
+            return None
+        n = float(len(self))
+        return torch.where(pos > 0, (n - pos.float()) / pos.float().clamp(min=1), torch.ones_like(pos, dtype=torch.float))
+
     def class_weights(self) -> Optional[torch.Tensor]:
         """Inverse-frequency class weights for imbalanced CE/Focal loss."""
         counts = self.class_counts()
@@ -554,7 +653,23 @@ class MBRSETDataset(Dataset):
         return w
 
     def sample_weights(self) -> Optional[torch.Tensor]:
-        """Per-sample weights for ``WeightedRandomSampler`` (balanced sampling)."""
+        """Per-sample weights for ``WeightedRandomSampler`` (balanced sampling).
+
+        Multilabel: a sample is weighted by the inverse frequency of its RAREST
+        positive label (all-negative rows by the inverse frequency of all-negative
+        rows), normalised to mean 1 -- so a retinal-detachment image is drawn about
+        as often as a drusen image, without a per-label sampler.
+        """
+        if self.multilabel:
+            y = self.labels > 0.5
+            n = len(self)
+            pos = y.sum(0).float().clamp(min=1)
+            freq = pos / n                                       # [L]
+            rarest = torch.where(y, freq.unsqueeze(0).expand_as(y), torch.full_like(y, 2.0, dtype=torch.float)).min(1).values
+            any_pos = y.any(1)
+            neg_freq = max(int((~any_pos).sum()), 1) / n
+            w = torch.where(any_pos, 1.0 / rarest, torch.full((n,), 1.0 / neg_freq))
+            return w / w.mean()
         cw = self.class_weights()
         if cw is None:
             return None
@@ -576,6 +691,28 @@ def _isnan_vector(arr: np.ndarray) -> np.ndarray:
     if arr.dtype.kind in "fc":
         return np.isnan(arr)
     return pd.isna(arr)
+
+
+def _row_invalid(values: np.ndarray) -> np.ndarray:
+    """Per-row unusable mask: NaN for scalar labels, ANY NaN component for vectors."""
+    m = _isnan_vector(values)
+    return m.any(axis=1) if m.ndim == 2 else m
+
+
+def _strat_key(y: np.ndarray) -> np.ndarray:
+    """1-D stratification key. Scalar labels are their own key; for a multilabel
+    matrix the key is the index of each row's RAREST positive label (-1 for an
+    all-negative row), so the split keeps the rare labels represented in every
+    partition instead of stratifying on one arbitrary column."""
+    if y.ndim == 1:
+        return y
+    pos = (y > 0.5)
+    freq = pos.sum(0).astype(np.float64)
+    freq[freq == 0] = np.inf
+    ranked = np.where(pos, freq[None, :], np.inf)
+    key = ranked.argmin(1)
+    key[~pos.any(1)] = -1
+    return key
 
 
 def stratified_split(
@@ -602,8 +739,10 @@ def stratified_split(
          for row in df[list(spec.source_cols)].to_numpy()],
         dtype=np.float64,
     )
-    df = df.loc[~_isnan_vector(y)].reset_index(drop=True)
-    y = y[~np.isnan(y)]
+    bad = _row_invalid(y)
+    df = df.loc[~bad].reset_index(drop=True)
+    y = y[~bad]
+    key = _strat_key(y)          # == y for scalar tasks; rarest-positive index for vectors
 
     # A requested group column that is absent is an error, not a fallback: the
     # per-image split below would let both eyes of a patient straddle train and
@@ -619,8 +758,8 @@ def stratified_split(
         # Hold out test by patient, then val by patient from the remainder.
         n_splits = max(2, int(round(1.0 / max(test_frac, 1e-6))))
         sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        train_val_idx, test_idx = next(sgkf.split(df, y, groups))
-        df_tv, y_tv, g_tv = df.iloc[train_val_idx], y[train_val_idx], groups[train_val_idx]
+        train_val_idx, test_idx = next(sgkf.split(df, key, groups))
+        df_tv, y_tv, g_tv = df.iloc[train_val_idx], key[train_val_idx], groups[train_val_idx]
 
         rel_val = val_frac / (1.0 - test_frac)
         n_splits_v = max(2, int(round(1.0 / max(rel_val, 1e-6))))
@@ -633,10 +772,13 @@ def stratified_split(
         }
 
     # No grouping -> plain stratified splits.
-    df_tv, df_test = train_test_split(df, test_size=test_frac, stratify=y, random_state=seed)
+    df_tv, df_test, k_tv, _ = train_test_split(df, key, test_size=test_frac, stratify=key,
+                                               random_state=seed)
     df_train, df_val = train_test_split(
         df_tv, test_size=val_frac / (1.0 - test_frac),
-        stratify=df_tv[list(spec.source_cols)[0]], random_state=seed,
+        # scalar tasks keep the historical behaviour (stratify on the raw source
+        # column); a multilabel spec has no single source column, so use the key.
+        stratify=(k_tv if spec.multilabel else df_tv[list(spec.source_cols)[0]]), random_state=seed,
     )
     return {
         "train": df_train.reset_index(drop=True),

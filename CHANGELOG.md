@@ -2,6 +2,14 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-09-04 ophthalmic multi-label head on BRSET  (branch `disease/ophthalmic-multilabel`)
+
+- `brset_dataset.py`: `OPHTHALMIC_MAP` carries AMD, drusen, increased cup-to-disc, hypertensive retinopathy, vascular occlusion, hemorrhage, myopic fundus, retinal detachment, scar, nevus through the adapter (0/1, else NaN); `--inspect` prints their raw encodings and prevalence.
+- `dataset.py`: `OPHTHALMIC_TASKS` (one binary task per label) and the `ophthalmic` multi-label spec (`LabelSpec.label_names`); vector labels drop rows with any missing component and stratify on the rarest positive label; `label_pos_counts` / `pos_weight` / rarest-label `sample_weights`.
+- `train_mbrset.py`: multilabel path — `BCEWithLogitsLoss` (+`pos_weight` under `--imbalance loss`), per-label AUROC with macro-mean selection (`per_label_auroc`), per-logit binary KD (`kd_loss_multilabel`), `multilabel`/`label_names` in the JSON; `--task` accepts every registry task.
+- `run_ophthalmic.sh`, `summarize_ophthalmic.py`, `make ophthalmic`; `tests/test_ophthalmic.py`.
+- Known gap: Core ML export / deploy evaluation still assume a softmax head.
+
 ## [Unreleased] — 2026-09-01 audit fixes
 
 Bugs that changed results (re-run affected sweeps):
