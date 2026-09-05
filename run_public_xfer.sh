@@ -21,6 +21,9 @@ usage: SRC=<root> SRC_DATASET=<name> TASK=glaucoma|amd EXT=<root> EXT_DATASET=<n
     SRC / SRC_DATASET   training set root + schema (airogs | refuge | papila | odir | brset)
     EXT / EXT_DATASET   primary external test set (scored inside every training run, with AdaBN)
     TASK                glaucoma | amd
+    Any root may be "kaggle:<owner>/<dataset>": it is downloaded (or reused) with kagglehub
+    into $KAGGLEHUB_CACHE (default ~/.cache/kagglehub) and replaced by the local path, e.g.
+    SRC=kaggle:deathtrooper/glaucoma-dataset-eyepacs-airogs-light-v2  EXT=kaggle:andrewmvd/ocular-disease-recognition-odir5k
   optional
     MORE                extra external sets, space-separated "<dataset>=<root>" pairs, scored
                         after training with score_external.py (zero-shot + AdaBN)
@@ -55,6 +58,26 @@ SIZE=${SIZE:-384}
 WORKERS=${WORKERS:-5}
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
 [ -x "$PY" ] || { echo "[fatal] no .venv — see README Quick start"; exit 1; }
+
+kaggle_root() {  # kaggle_root <root> -> local dir; "kaggle:<owner>/<dataset>" is fetched/reused via kagglehub
+  case "$1" in
+    kaggle:*) $PY - "${1#kaggle:}" <<'PY'
+import sys, kagglehub
+print(kagglehub.dataset_download(sys.argv[1]))
+PY
+    ;;
+    *) printf '%s\n' "$1";;
+  esac
+}
+SRC=$(kaggle_root "$SRC") || { echo "[fatal] could not fetch SRC"; exit 1; }
+EXT=$(kaggle_root "$EXT") || { echo "[fatal] could not fetch EXT"; exit 1; }
+resolved_more=""
+for pair in $MORE; do
+  r=$(kaggle_root "${pair#*=}") || { echo "[fatal] could not fetch ${pair#*=}"; exit 1; }
+  resolved_more="$resolved_more ${pair%%=*}=$r"
+done
+MORE=${resolved_more# }
+echo "[info] SRC=$SRC_DATASET @ $SRC"; echo "[info] EXT=$EXT_DATASET @ $EXT"; [ -n "$MORE" ] && echo "[info] MORE=$MORE"
 
 inspect() {  # inspect <dataset> <root>
   local ds=$1 root=$2

@@ -107,6 +107,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `requirements.txt`, `pyproject.toml` | Pins (per-Python markers), supported range, pytest config |
 | `setup_remote.sh`, `Dockerfile`, `Job*.sh` | GPU box bootstrap, container, SLURM jobs |
 | `reproduce.sh`, `Makefile` | One-command reproduction and the common targets |
+| `launch_disease_runs.sh` | Lab-box launcher: one git worktree + one tmux session per disease branch (`systemic`, `ophthalmic`), timestamped logs, `status` / `stop` |
 | `tests/` | CPU-only synthetic tests, run by GitHub Actions on every push |
 | `legacy/` | Superseded scripts kept for reference (`train.py`, placeholder-mask `train_seg.py`, old smoke tests) |
 
