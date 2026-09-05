@@ -172,23 +172,34 @@ def _airogs_from_folders(root: str, release: Optional[str] = None) -> Dict[str, 
 
 
 def load_airogs(root: str, image_ext: str = ".jpg", airogs_release: Optional[str] = None) -> Dict[str, object]:
-    csv = _find_table(root, ("train_labels", "labels", "airogs_labels"))
-    if csv is None:                                 # Kaggle light subsets: class folders, no CSV
+    # Zenodo: train_labels.csv at the root. AIROGS-light v2: metadata.csv one level
+    # down (file_name, label RG/NRG, folder). Light v1: class folders only.
+    subdirs = ("",) + tuple(sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))))
+    csv = _find_table(root, ("train_labels", "labels", "airogs_labels", "metadata"), subdirs=subdirs)
+    if csv is None:                                 # class folders, no CSV
         return _airogs_from_folders(root, release=airogs_release)
     t = _read_table(csv)
-    idc = _col(t, "challenge_id", "image_id", "id", "file")
-    labc = _col(t, "class", "label", "glaucoma", "referable")
+    # Prefer a FILENAME column over a bare numeric id (v2's `id` is the source image
+    # number, not the file), then fall back to the challenge id.
+    idc = _col(t, "file_name", "filename", "file", "image_id", "challenge_id", "id")
+    labc = _col(t, "class", "label", "label_binary", "glaucoma", "referable")
     if idc is None or labc is None:
-        raise KeyError(f"AIROGS: need an id column and a class column; found {list(t.columns)}")
+        raise KeyError(f"AIROGS: need an id/filename column and a class column; found {list(t.columns)}")
     lab = t[labc].astype(str).str.strip().str.upper().map(
         {"RG": 1.0, "NRG": 0.0, "1": 1.0, "0": 0.0, "1.0": 1.0, "0.0": 0.0})
     images_dir = _first_dir(root, ("train", "images", "img")) or root
     idx = _stem_index(images_dir)
     ids = t[idc].astype(str).str.strip()
-    files = [idx.get(os.path.splitext(i)[0].lower(), (i if os.path.splitext(i)[1] else i + image_ext))
-             for i in ids]
-    df = pd.DataFrame({"file": files, "patient": ids.to_numpy(), "glaucoma": lab.to_numpy()})
-    return _finalise(df, images_dir, "airogs", csv)
+    stems = [os.path.splitext(os.path.basename(i))[0] for i in ids]
+    files = [idx.get(st.lower(), (i if os.path.splitext(i)[1] else i + image_ext)) for st, i in zip(stems, ids)]
+    df = pd.DataFrame({"file": files, "patient": stems, "glaucoma": lab.to_numpy()})
+    fc = _col(t, "folder", "split")
+    if fc:
+        df["source_split"] = t[fc].astype(str).str.strip().str.lower().to_numpy()
+    out = _finalise(df, images_dir, "airogs", csv)
+    out["release"] = None
+    out["releases_available"] = []
+    return out
 
 
 # --------------------------------------------------------------------------- #

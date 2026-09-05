@@ -63,6 +63,20 @@ def test_airogs_light_folder_layout_reads_one_release(tmp_path):
     assert flat["release"] is None and sorted(flat["df"]["glaucoma"]) == [0.0, 1.0]
 
 
+def test_airogs_light_v2_metadata_csv_prefers_filename_over_numeric_id(tmp_path):
+    d = tmp_path / "eyepac-light-v2-512-jpg"
+    _img(d / "train" / "RG" / "EyePACS-TRAIN-RG-2580.jpg"); _img(d / "validation" / "NRG" / "EyePACS-TRAIN-NRG-11.jpg")
+    pd.DataFrame({"id": [2580, 11], "file_name": ["EyePACS-TRAIN-RG-2580.jpg", "EyePACS-TRAIN-NRG-11.jpg"],
+                  "label": ["RG", "NRG"], "label_binary": [1, 0], "folder": ["train", "validation"]}
+                 ).to_csv(d / "metadata.csv", index=False)
+    src = load_airogs(str(tmp_path))
+    df = src["df"]
+    assert src["csv"].endswith("metadata.csv") and len(df) == 2
+    assert df["file"].str.startswith("eyepac-light-v2-512-jpg/").all()      # found via the filename, not the id
+    assert list(df["glaucoma"]) == [1.0, 0.0] and list(df["source_split"]) == ["train", "validation"]
+    assert list(df["patient"]) == ["EyePACS-TRAIN-RG-2580", "EyePACS-TRAIN-NRG-11"]
+
+
 # ---- REFUGE ------------------------------------------------------------------- #
 def test_refuge_folder_labels_table_labels_and_mask_skipping(tmp_path):
     _img(tmp_path / "Training400" / "Glaucoma" / "g0001.jpg")
