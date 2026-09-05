@@ -3,11 +3,19 @@
 # its OWN git worktree and its OWN tmux session, logging to a timestamped file.
 #
 #   ssh arctrdgndev101
-#   cd ~/Oculomics && git pull && bash launch_disease_runs.sh            # both runs
-#   bash launch_disease_runs.sh systemic        # only the mBRSET systemic sweep (GPU 0)
-#   bash launch_disease_runs.sh ophthalmic      # only the BRSET ophthalmic sweep (GPU 1)
+#   cd ~/Oculomics && git pull && bash launch_disease_runs.sh systemic glaucoma   # any subset
+#   bash launch_disease_runs.sh systemic        # mBRSET systemic sweep            (GPU 0)
+#   bash launch_disease_runs.sh ophthalmic      # BRSET ophthalmic multi-label sweep (GPU 1)
+#   bash launch_disease_runs.sh glaucoma        # AIROGS-light v2 -> ODIR-5K glaucoma transfer (GPU 1);
+#                                               # data is fetched on the box with kagglehub (anonymous)
+#   bash launch_disease_runs.sh all             # all three (ophthalmic and glaucoma share GPU 1 unless
+#                                               # GPU_OPHTHALMIC / GPU_GLAUCOMA say otherwise)
 #   bash launch_disease_runs.sh status          # sessions, GPU load, finished runs, log tails
 #   bash launch_disease_runs.sh stop systemic   # kill that session (finished runs are kept)
+#
+# Data roots: B= / M= may point at a PARENT of the real directory (PhysioNet drops a
+# version dir, e.g. mBRSET/1.0/); the pre-flight resolves them to the directory that
+# holds the label CSV and fails with the CSVs it did find otherwise.
 #
 # Why worktrees: each run lives on its own branch (disease/systemic,
 # disease/ophthalmic-multilabel) and they run at the same time, so each gets a
@@ -29,6 +37,15 @@ DR_CK=${DR_CK:-$REPO/ck_kd_v4_384/kd_seed1.pt}     # the deployed DR student (RE
 WORKERS=${WORKERS:-5}
 GPU_SYSTEMIC=${GPU_SYSTEMIC:-0}
 GPU_OPHTHALMIC=${GPU_OPHTHALMIC:-1}
+GPU_GLAUCOMA=${GPU_GLAUCOMA:-1}
+# glaucoma: AIROGS-light v2 (9,540 imgs, kagglehub) -> ODIR-5K (6,392 eyes, kagglehub) with the ctrl /
+# teacher / kd design: roughly 1-1.5 h per student run and 2-3 h per teacher @384px -> ~15 h for 3 seeds.
+GLC_SEEDS=${GLC_SEEDS:-0 1 2}
+GLC_SRC=${GLC_SRC:-kaggle:deathtrooper/glaucoma-dataset-eyepacs-airogs-light-v2}
+GLC_EXT=${GLC_EXT:-kaggle:andrewmvd/ocular-disease-recognition-odir5k}
+REFUGE_ROOT=${REFUGE_ROOT:-}                       # optional extra external sets, scored after training
+PAPILA_ROOT=${PAPILA_ROOT:-}
+KAGGLEHUB_CACHE=${KAGGLEHUB_CACHE:-$HOME/.cache/kagglehub}   # where kagglehub puts the public sets (~2.2 GB)
 # systemic: 4 tasks x 2 arms x seeds on mBRSET (~5k images): roughly 25-30 min per run on an A100 @384px
 SYS_SEEDS=${SYS_SEEDS:-0 1 2 3 4}
 SYS_TASKS=${SYS_TASKS:-hypertension nephropathy neuropathy myocardial_infarction}
@@ -41,6 +58,7 @@ STAMP=$(date +%Y%m%d-%H%M)
 
 WT_SYSTEMIC=${WT_SYSTEMIC:-$HOME/Oculomics-systemic}
 WT_OPHTHALMIC=${WT_OPHTHALMIC:-$HOME/Oculomics-ophthalmic}
+WT_GLAUCOMA=${WT_GLAUCOMA:-$HOME/Oculomics-glaucoma}
 
 say() { printf '%s\n' "$*"; }
 
@@ -73,7 +91,7 @@ launch() {  # launch <session> <dir> <gpu> <log> <command>
   cat > "$runner" <<RUN
 #!/usr/bin/env bash
 set -o pipefail
-export CUDA_VISIBLE_DEVICES=$gpu PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES=$gpu PYTHONUNBUFFERED=1 KAGGLEHUB_CACHE="$KAGGLEHUB_CACHE"
 cd "$dir"
 echo "[launch] session=$session host=\$(hostname) gpu=\$CUDA_VISIBLE_DEVICES branch=\$(git branch --show-current) commit=\$(git rev-parse --short HEAD) start=\$(date)" | tee -a "$log"
 $cmd 2>&1 | tee -a "$log"
@@ -98,14 +116,36 @@ run_ophthalmic() {
     "B='$B' LABELS='$OPH_LABELS' WORKERS=$WORKERS bash run_ophthalmic.sh $OPH_SEEDS"
 }
 
+run_glaucoma() {
+  worktree disease/glaucoma-amd "$WT_GLAUCOMA"
+  local more=""
+  [ -n "$REFUGE_ROOT" ] && { [ -d "$REFUGE_ROOT" ] && more="$more refuge=$REFUGE_ROOT" || say "[warn] REFUGE_ROOT=$REFUGE_ROOT not found; skipped"; }
+  [ -n "$PAPILA_ROOT" ] && { [ -d "$PAPILA_ROOT" ] && more="$more papila=$PAPILA_ROOT" || say "[warn] PAPILA_ROOT=$PAPILA_ROOT not found; skipped"; }
+  launch oculomics-glaucoma-airogs2odir "$WT_GLAUCOMA" "$GPU_GLAUCOMA" "$WT_GLAUCOMA/exp_glaucoma/sweep-$STAMP.log" \
+    "SRC='$GLC_SRC' SRC_DATASET=airogs TASK=glaucoma EXT='$GLC_EXT' EXT_DATASET=odir MORE='${more# }' WORKERS=$WORKERS bash run_public_xfer.sh $GLC_SEEDS"
+}
+
+resolve() {  # resolve <VAR> <dataset> -- replace $VAR with the directory that holds the label CSV, or fail loudly
+  local var=$1 ds=$2 val out
+  val=${!var}
+  if out=$("$REPO/.venv/bin/python" -c "import sys; sys.path.insert(0, '$REPO'); from brset_dataset import resolve_root; print(resolve_root(sys.argv[1], sys.argv[2]))" "$val" "$ds" 2>&1); then
+    [ "$out" != "$val" ] && say "[preflight] $var: $val -> $out"
+    printf -v "$var" '%s' "$out"
+  else
+    say "[fatal] $var=$val: $out"
+    say "        contents: $(ls "$val" 2>/dev/null | head -8 | tr '\n' ' ')"
+    exit 1
+  fi
+}
+
 status() {
   say "=== tmux sessions ==="; tmux ls 2>/dev/null || say "(none)"
   say; say "=== GPUs ==="; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv 2>/dev/null || say "(nvidia-smi unavailable)"
-  for pair in "systemic:$WT_SYSTEMIC/exp_systemic" "ophthalmic:$WT_OPHTHALMIC/exp_ophthalmic"; do
+  for pair in "systemic:$WT_SYSTEMIC/exp_systemic" "ophthalmic:$WT_OPHTHALMIC/exp_ophthalmic" "glaucoma:$WT_GLAUCOMA/exp_glaucoma"; do
     local name=${pair%%:*} dir=${pair#*:}
     say; say "=== $name  ($dir) ==="
     [ -d "$dir" ] || { say "(not started)"; continue; }
-    say "finished runs: $(find "$dir" -name '*_seed*.json' | wc -l | tr -d ' ')   summaries: $(ls "$dir"/*/summary.md "$dir"/summary.md 2>/dev/null | wc -l | tr -d ' ')"
+    say "finished runs: $(find "$dir" -name '*_seed*.json' | wc -l | tr -d ' ')   summaries: $(ls "$dir"/*/summary.md "$dir"/summary*.md 2>/dev/null | wc -l | tr -d ' ')"
     local log; log=$(ls -t "$dir"/sweep-*.log 2>/dev/null | head -1)
     [ -n "$log" ] && { say "last log: $log"; grep -E "^=== |^\[(done|skip|fatal|warn)\]|AUROC=" "$log" | tail -6; }
   done
@@ -115,27 +155,38 @@ stop() {  # stop <systemic|ophthalmic>
   case "${1:-}" in
     systemic)   tmux kill-session -t oculomics-systemic-mbrset && say "[stopped] oculomics-systemic-mbrset";;
     ophthalmic) tmux kill-session -t oculomics-ophthalmic-brset && say "[stopped] oculomics-ophthalmic-brset";;
-    *) say "usage: bash launch_disease_runs.sh stop systemic|ophthalmic"; exit 2;;
+    glaucoma)   tmux kill-session -t oculomics-glaucoma-airogs2odir && say "[stopped] oculomics-glaucoma-airogs2odir";;
+    *) say "usage: bash launch_disease_runs.sh stop systemic|ophthalmic|glaucoma"; exit 2;;
   esac
 }
 
-preflight() {
+preflight() {  # preflight <targets...>
   [ -d "$REPO/.git" ] || { say "[fatal] $REPO is not the repo"; exit 1; }
   [ -x "$REPO/.venv/bin/python" ] || { say "[fatal] $REPO/.venv missing: bash setup_remote.sh first"; exit 1; }
   command -v tmux >/dev/null || { say "[fatal] tmux not installed"; exit 1; }
-  [ -d "$B" ] || { say "[fatal] BRSET root not found: $B  (set B=)"; exit 1; }
-  [ -d "$M" ] || { say "[fatal] mBRSET root not found: $M  (set M=)"; exit 1; }
-  say "[preflight] repo=$REPO  BRSET=$B  mBRSET=$M  DR_CK=$DR_CK $([ -f "$DR_CK" ] && echo '(found)' || echo '(MISSING -> ctrl only)')"
-  say "[preflight] GPUs: systemic->$GPU_SYSTEMIC  ophthalmic->$GPU_OPHTHALMIC   seeds: systemic [$SYS_SEEDS]  ophthalmic [$OPH_SEEDS]"
+  for t in "$@"; do
+    case "$t" in
+      systemic)   resolve M mbrset;;
+      ophthalmic) resolve B brset;;
+      glaucoma)   "$REPO/.venv/bin/python" -c "import kagglehub" 2>/dev/null || { say "[fatal] kagglehub missing in $REPO/.venv (pip install -r requirements.txt)"; exit 1; };;
+    esac
+  done
+  say "[preflight] repo=$REPO  DR_CK=$DR_CK $([ -f "$DR_CK" ] && echo '(found)' || echo '(MISSING -> systemic ctrl arm only)')"
+  say "[preflight] GPUs: systemic->$GPU_SYSTEMIC  ophthalmic->$GPU_OPHTHALMIC  glaucoma->$GPU_GLAUCOMA"
+  case " $* " in *" ophthalmic "*" glaucoma "*|*" glaucoma "*" ophthalmic "*)
+    [ "$GPU_OPHTHALMIC" = "$GPU_GLAUCOMA" ] && say "[warn] ophthalmic and glaucoma both on GPU $GPU_GLAUCOMA; set GPU_GLAUCOMA= to separate them";; esac
 }
 
 case "${1:-all}" in
-  status) status;;
-  stop)   stop "${2:-}";;
-  systemic)   [ "$DRY_RUN" = 1 ] || preflight; run_systemic;;
-  ophthalmic) [ "$DRY_RUN" = 1 ] || preflight; run_ophthalmic;;
-  all)        [ "$DRY_RUN" = 1 ] || preflight; run_systemic; run_ophthalmic
-              say; say "both started. 'bash launch_disease_runs.sh status' to check; 'tmux ls' lists sessions.";;
-  -h|--help)  sed -n '2,20p' "$0";;
-  *) say "unknown command '$1' (systemic | ophthalmic | all | status | stop <run>)"; exit 2;;
+  status) status; exit 0;;
+  stop)   stop "${2:-}"; exit 0;;
+  -h|--help) sed -n '2,24p' "$0"; exit 0;;
 esac
+TARGETS=("$@"); [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(all)
+[ "${TARGETS[*]}" = "all" ] && TARGETS=(systemic ophthalmic glaucoma)
+for t in "${TARGETS[@]}"; do
+  case "$t" in systemic|ophthalmic|glaucoma) ;; *) say "unknown target '$t' (systemic | ophthalmic | glaucoma | all | status | stop <run>)"; exit 2;; esac
+done
+[ "$DRY_RUN" = 1 ] || preflight "${TARGETS[@]}"
+for t in "${TARGETS[@]}"; do "run_$t"; done
+say; say "started: ${TARGETS[*]}.  'bash launch_disease_runs.sh status' to check;  'tmux ls' lists sessions."
