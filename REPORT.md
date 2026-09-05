@@ -1,12 +1,15 @@
-# Oculomics — Project Report, 20–31 August 2026
+# Oculomics — Project Report, 20 August – 5 September 2026
 
 On-device diabetic-retinopathy screening from smartphone fundus photographs.
-This report covers the work done between the 20th and 31st of August: a full
-audit of the codebase, the architecture decision that followed a null result on
-the original hypothesis, the two new levers that were built and tested
-(foundation-model distillation and test-time BatchNorm adaptation), the move to
-a MobileNetV4 backbone at 384 px, the resulting numbers with their statistics,
-and the deployment tooling that turns those numbers into an on-device claim.
+This report covers the work done from the 20th of August to the 5th of
+September: a full audit of the codebase, the architecture decision that followed
+a null result on the original hypothesis, the two new levers that were built and
+tested (foundation-model distillation and test-time BatchNorm adaptation), the
+move to a MobileNetV4 backbone at 384 px, the resulting numbers with their
+statistics, a replication of the headline sweep under the final code (which
+surfaced a reproducibility finding that changes how the statistics should be
+read), the deployment tooling that turns the numbers into an on-device claim,
+and the extension of the same harness to glaucoma / AMD on public fundus sets.
 
 **Headline.** The model's zero-shot AUROC on 4,884 never-seen smartphone images
 rose from **0.813 → 0.886** (control) and **0.907** with label-free test-time
@@ -165,7 +168,7 @@ V4 + kd + AdaBN: 0.9161 ± 0.0065. Paired kd − ctrl on V4: +0.0155, 3/3 seeds,
 95 % CI [−0.0011, +0.0320] — the same marginal n = 3 profile that had produced
 a false positive on 22 August, so two more seeds were run before claiming it.
 
-### 5.2 Seven seeds, V4-Small at 384 px (final, 31 August)
+### 5.2 Seven seeds, V4-Small at 384 px (31 August; number of record until the §5.3 replication completes)
 
 Five seeds (30 August) reproduced the 22-August lesson exactly: the 3-seed
 zero-shot distillation delta (+0.0155, 3/3) fell to +0.0064 with a CI spanning
@@ -206,20 +209,73 @@ Per-seed, first five seeds (in-domain / zero-shot / adapted):
 | 3 | 0.9683 / 0.8786 / 0.8955 | 0.9696 / 0.8489 / 0.9084 | 0.9826 / 0.9354 |
 | 4 | 0.9820 / 0.8696 / 0.8907 | 0.9736 / 0.8851 / 0.8876 | 0.9956 / 0.9349 |
 
-`kd_seed3` is the most informative run: val AUROC 0.9944 (excellent), zero-shot
-0.8489 (the worst), and AdaBN restores it to 0.9084. Its transfer failure was
-largely a BatchNorm-statistics mismatch — the mechanism AdaBN exists for. It
-also exposes the structural limit of the design: in-domain val is saturated
-(0.97–0.99) and cannot rank checkpoints by how well they transfer, and mBRSET
-cannot be used for selection without breaking the experiment.
+`kd_seed3` looked like the most informative run: val AUROC 0.9944 (excellent),
+zero-shot 0.8489 (the worst), and AdaBN restores it to 0.9084 — a
+BatchNorm-statistics mismatch, the mechanism AdaBN exists for. **The replication
+in §5.3 changed that reading:** re-run under the final code with the same seed,
+`kd_seed3` scored 0.8861 zero-shot. The collapse was an unlucky non-deterministic
+roll, not a property of the model, and individual runs should not be
+over-interpreted. What does survive is the structural point: in-domain val is
+saturated (0.97–0.99) and cannot rank checkpoints by how well they transfer,
+and mBRSET cannot be used for selection without breaking the experiment.
 
-### 5.3 The ladder
+### 5.3 Replication under the final code, and a reproducibility finding (3–5 September)
+
+The 1 September hardening commit touched the training script (teacher
+construction wrapped in `fork_rng`, so the kd arm's random stream is no longer
+offset from the control's; AdaBN loader shuffled; `.done` completion markers;
+GCG on a timm backbone is now an error). None of it changes the model, data,
+loss or selection on CUDA, but the RNG alignment does change the kd arm, so
+both student arms were re-run for all seven seeds with the seven teachers
+reused (`exp_kd_v4_384_v2`). Seeds 0–3 are in; 4–6 are running.
+
+**Fixed-seed runs are not bitwise reproducible.** The control's code path was
+unchanged, yet only one of four control seeds reproduced:
+
+| run | old in / zero-shot / adapted | v2 in / zero-shot / adapted | Δ zero-shot | Δ adapted |
+|---|---|---|---|---|
+| ctrl_seed0 | 0.9748 / 0.9020 / 0.9088 | 0.9631 / 0.9016 / 0.8995 | −0.0004 | −0.0092 |
+| ctrl_seed1 | 0.9729 / 0.8726 / 0.8904 | 0.9796 / 0.8815 / 0.8965 | +0.0089 | +0.0061 |
+| ctrl_seed2 | 0.9829 / 0.8868 / 0.8958 | 0.9776 / 0.8552 / 0.8743 | −0.0316 | −0.0215 |
+| ctrl_seed3 | 0.9683 / 0.8786 / 0.8955 | 0.9683 / 0.8786 / 0.8959 | 0.0000 | +0.0004 |
+| kd_seed0 | 0.9801 / 0.9179 / 0.9223 | 0.9809 / 0.9151 / 0.9147 | −0.0029 | −0.0075 |
+| kd_seed1 | 0.9882 / 0.8945 / 0.9189 | 0.9855 / 0.8927 / 0.9040 | −0.0018 | −0.0149 |
+| kd_seed2 | 0.9810 / 0.8954 / 0.9072 | 0.9895 / 0.9075 / 0.9142 | +0.0121 | +0.0070 |
+| kd_seed3 | 0.9696 / 0.8489 / 0.9084 | 0.9693 / 0.8861 / 0.9181 | +0.0371 | +0.0097 |
+
+Some GPU op still runs non-deterministically under
+`use_deterministic_algorithms(warn_only=True)`; tiny numeric differences
+diverge over training. The run-to-run SD at a *fixed* seed (≈0.02 over these
+eight pairs) is as large as the seed-to-seed SD (0.012). Three consequences:
+
+1. **AdaBN results are untouched** — that comparison is paired *within* a run
+   (same weights, adapted vs not), so training nondeterminism cannot reach it.
+   It remains the most solid finding.
+2. **The kd − ctrl contrast is legitimate but weaker than "paired by seed"
+   suggests.** Its CI was computed from the actual deltas, which already contain
+   this noise, so it is not wrong — but the pairing buys little power, and the
+   old and v2 sweeps are replicates, not extra seeds. The v2 7-seed result will
+   be the number of record.
+3. **Single runs are not evidence** (see `kd_seed3` above).
+
+**v2, seeds 0–3 so far** (zero-shot / BN-adapted mBRSET AUROC): ctrl 0.8792 ±
+0.0165 / 0.8916 ± 0.0100; kd 0.9003 ± 0.0115 / 0.9128 ± 0.0053. Paired kd −
+ctrl: zero-shot +0.0211, CI [−0.0122, +0.0544], 4/4; BN-adapted +0.0212, CI
+[−0.0008, +0.0432], 4/4. In-domain ctrl 0.9722, kd 0.9813; gap −0.093 / −0.081.
+Direction identical to the first sweep, magnitudes a little larger; n = 4 is
+too few to call. A deterministic-mode probe (`use_deterministic_algorithms`
+set to raise rather than warn) is queued to name the offending op; if it has a
+deterministic substitute, future sweeps become bitwise reproducible and the
+paired design recovers its power. Otherwise the run-to-run SD is reported
+alongside the seed SD.
+
+### 5.4 The ladder
 
 | | mBRSET AUROC |
 |---|---|
 | old baseline (V3-Small, 224 px, old recipe) | 0.813 |
 | V3-Small, new recipe, 384 px | 0.863 |
-| V4-Small, new recipe, 384 px (control, n = 7) | 0.886 |
+| V4-Small, new recipe, 384 px (control, n = 7, first sweep) | 0.886 |
 | + AdaBN | 0.896 |
 | + distillation + AdaBN | 0.907 |
 | teacher, zero-shot (49.7 M params) | 0.936 |
@@ -229,7 +285,7 @@ A 2.8 M-parameter student with test-time adaptation reaches 97 % of the
 in-domain ceiling and ~97 % of a 49.7 M-parameter teacher's transfer
 performance, at 1/18th the teacher's size.
 
-### 5.4 What is claimable
+### 5.5 What is claimable
 
 * **Robust:** the recipe + resolution + V4 backbone effect. Fourteen of the
   fifteen V4 runs land 0.85–0.92 zero-shot (kd_seed3: 0.849) against an old
@@ -243,6 +299,10 @@ performance, at 1/18th the teacher's size.
 * **Near-parity:** the adapted student (0.907) is within 0.026 of the
   mBRSET-trained ceiling (0.933); the residual gap after adaptation is small
   compared with the 0.12 that the recipe, resolution and backbone removed.
+* **Noise floor, restated:** two independent sources of run variance, seed
+  (SD 0.012) and fixed-seed nondeterminism (SD ≈ 0.02). Any claimed effect
+  smaller than ~0.02 needs many more than 7 runs; the levers above that cleared
+  significance did so *including* this noise, which is why they are believable.
 * **Accuracy:** 0.90–0.91 on mBRSET now clears the 82.4 % all-negative base
   rate meaningfully (BRSET in-domain: 5.5 % prevalence, so 95 % accuracy there
   is barely above chance). Lead with AUROC; never headline accuracy without the
@@ -277,19 +337,68 @@ std as the science and this checkpoint's numbers as the shipped model.
 
 1. ~~Ceiling~~ — done (0.9331 ± 0.0029, §5.2).
 2. ~~Seeds 5–6~~ — done; the 7-seed verdict is in §5.2.
-3. **`evaluate_deploy.py` on `kd_seed1.pt`** with `--external-root <mBRSET>`
+3. **v2 replication, seeds 4–6** (`exp_kd_v4_384_v2`) — running; the 7-seed v2
+   summary replaces the §5.2 numbers as the result of record.
+4. **Name the non-deterministic op** (§5.3 probe) and, if a deterministic
+   substitute exists, re-run once more bitwise-reproducibly.
+5. **`evaluate_deploy.py` on `kd_seed1.pt`** with `--external-root <mBRSET>`
    (server): target-domain sensitivity/specificity at a val-calibrated
    threshold, plus INT8 cost.
-4. **`export_coreml.py --checkpoint checkpoints/kd_seed1.pt`** (Mac) with the
+6. **`export_coreml.py --checkpoint checkpoints/kd_seed1.pt`** (Mac) with the
    real weights: verification on real weights; latency will match the probe.
-5. One pre-registered attempt at the teacher–student gap (DINOv2 teacher, or
+   The shipped checkpoint should come from the v2 sweep once it completes
+   (highest in-domain val AUROC, as before).
+7. One pre-registered attempt at the teacher–student gap (DINOv2 teacher, or
    α = 0.9 with feature matching), run at 5 seeds and judged by the same paired
    test — one configuration, not a sweep of variants.
-6. The segmentation track is unchanged apart from the audit fixes; its V4-M
-   encoder question (`run_arch_sweep.py`) remains open, and its pre-fix FGADR
-   numbers are not comparable to new ones.
+8. The segmentation track: the 1 September fix to `make_rng` (persistent
+   workers replayed the identical augmentation every epoch) means **every
+   `train_idrid.py` result with `--num-workers > 0` predates a result-changing
+   fix**, on top of the FGADR split change; its V4-M encoder question
+   (`run_arch_sweep.py`) remains open. Treat all prior segmentation numbers as
+   superseded until re-run.
 
-## 8. Reproduction
+## 8. Since 1 September: hardening, deployment tooling, and beyond DR
+
+Recorded in `CHANGELOG.md`; summarised here because some of it changes how
+earlier numbers should be read.
+
+**Result-changing fixes (1 September).** `fundus_utils.make_rng` — persistent
+DataLoader workers replayed the identical augmentation every epoch (≈one
+variant per worker per image for the whole run); every segmentation result
+trained with workers predates this. `model_seg.DecoderBlock` — GCG and control
+arms now share bit-identical non-gate initialisation at the same seed. The
+orchestrators pass `--eval-tiled-val` through by default with tiled evaluation.
+None of these touch the classification sweeps (the classifier's augmentation
+uses torch's own RNG, not `make_rng`).
+
+**Deployment tooling.** `export_coreml.py` gained `--bn-stats {source,adapted}`
+(the AdaBN weights are now saved in the checkpoint as `model_bnadapt`), a
+per-compute-unit benchmark, and real-image pass/fail verification
+(`--verify-images`). `evaluate_deploy.py` reports median latency and qualifies
+the CPU-proxy number.
+
+**Repository.** Supported Python range 3.9–3.13 stated and enforced; CUDA index
+`cu126`; GitHub Actions running the CPU suite on every push; MIT licence (code
+only); `reproduce.sh` / `Makefile`; `train.py`, `train_seg.py`, `seg_dataset.py`
+moved to `legacy/`. The `.venv` on the Mac is Python 3.9.6.
+
+**Beyond DR (4 September, branch `disease/glaucoma-amd`).** `public_fundus.py`
+adapts four public glaucoma / AMD sets — AIROGS (~101k, no patient id),
+REFUGE, PAPILA (suspects excluded by default), ODIR-5K — into the same mBRSET
+schema, so they flow through `train_mbrset.py`, `evaluate_deploy.py` and the
+paired runner unchanged (`run_public_xfer.sh`, `score_external.py`,
+`summarize_external.py`). The design is the DR design verbatim: train
+ctrl/teacher/kd on one source set, score zero-shot + AdaBN on an external set,
+paired by seed. One framing caveat is built into the scripts: no public
+*smartphone* glaucoma/AMD set exists, so those claims are transfer across
+cameras and populations (tabletop → tabletop), not tabletop → phone. Work is
+organised as four `disease/<target>` branches off the same `main` commit (DR,
+systemic, ophthalmic-multilabel, glaucoma-amd); dataset encodings on each
+branch are unverified until its `--inspect --strict` pass runs on the real
+files. No results from these branches are reported yet.
+
+## 9. Reproduction
 
 One command (env vars for the credentialed data; stages selectable):
 
