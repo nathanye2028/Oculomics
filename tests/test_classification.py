@@ -186,6 +186,9 @@ def test_resolve_root_searches_below_root_and_names_what_it_found(tmp_path):
     real = tmp_path / "mBRSET" / "1.0"; (real / "images").mkdir(parents=True)
     pd.DataFrame({"file": ["1.jpg"], "patient": ["p1"], "final_icdr": [0]}).to_csv(real / "labels_mbrset.csv", index=False)
     assert resolve_root(str(tmp_path / "mBRSET"), "mbrset") == str(real)          # one level down
+    deep = tmp_path / "deep" / "physionet.org" / "files" / "brset" / "1.0.1"; deep.mkdir(parents=True)
+    (deep / "labels_brset.csv").write_text("image_id\n")
+    assert resolve_root(str(tmp_path / "deep"), "brset") == str(deep)              # wget -r layout, 4 deep
     assert resolve_root(str(real), "mbrset") == str(real)                            # exact root
     src = load_any(str(tmp_path), "mbrset")                                          # two levels down
     assert src["csv"] == str(real / "labels_mbrset.csv") and src["images_dir"] == str(real / "images")
