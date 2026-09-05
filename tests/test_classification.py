@@ -197,3 +197,7 @@ def test_resolve_root_searches_below_root_and_names_what_it_found(tmp_path):
     dup = tmp_path / "mBRSET" / "copy"; dup.mkdir(); (dup / "labels_mbrset.csv").write_text("file\n")
     with pytest.raises(FileNotFoundError, match="several"):
         resolve_root(str(tmp_path / "mBRSET"), "mbrset")
+    # wget -r PhysioNet layout: the version dir sits four levels below the handed-over root
+    deep = tmp_path / "deep" / "physionet.org" / "files" / "brazilian-ophthalmological" / "1.0.1"
+    deep.mkdir(parents=True); (deep / "labels_brset.csv").write_text("image_id\n")
+    assert resolve_root(str(tmp_path / "deep"), "brset") == str(deep)

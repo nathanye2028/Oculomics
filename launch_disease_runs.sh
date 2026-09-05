@@ -31,8 +31,10 @@ set -euo pipefail
 
 REPO=${REPO:-$HOME/Oculomics}
 DATA=${DATA:-/data/users4/nshaik3/Datasets}
-B=${B:-$DATA/BRSET}
-M=${M:-$DATA/mBRSET}
+# The lab-box layout is a `wget -r` PhysioNet mirror; these are the directories that hold
+# the label CSV + images. A parent (e.g. $DATA/mBRSET) also works: the pre-flight resolves it.
+B=${B:-$DATA/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1}
+M=${M:-$DATA/mBRSET/physionet.org/files/mbrset/1.0}
 DR_CK=${DR_CK:-$REPO/ck_kd_v4_384/kd_seed1.pt}     # the deployed DR student (REPORT.md §6)
 WORKERS=${WORKERS:-5}
 GPU_SYSTEMIC=${GPU_SYSTEMIC:-0}
@@ -128,7 +130,13 @@ run_glaucoma() {
 resolve() {  # resolve <VAR> <dataset> -- replace $VAR with the directory that holds the label CSV, or fail loudly
   local var=$1 ds=$2 val out
   val=${!var}
-  if out=$("$REPO/.venv/bin/python" -c "import sys; sys.path.insert(0, '$REPO'); from brset_dataset import resolve_root; print(resolve_root(sys.argv[1], sys.argv[2]))" "$val" "$ds" 2>&1); then
+  if out=$("$REPO/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$REPO')
+from brset_dataset import resolve_root
+try:
+    print(resolve_root(sys.argv[1], sys.argv[2]))
+except FileNotFoundError as e:
+    sys.exit(str(e))" "$val" "$ds" 2>&1); then
     [ "$out" != "$val" ] && say "[preflight] $var: $val -> $out"
     printf -v "$var" '%s' "$out"
   else
