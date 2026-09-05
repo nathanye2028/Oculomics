@@ -31,8 +31,10 @@ set -euo pipefail
 
 REPO=${REPO:-$HOME/Oculomics}
 DATA=${DATA:-/data/users4/nshaik3/Datasets}
-B=${B:-$DATA/BRSET}
-M=${M:-$DATA/mBRSET}
+# The lab-box layout is a `wget -r` PhysioNet mirror; these are the directories that hold
+# the label CSV + images. A parent (e.g. $DATA/mBRSET) also works: the pre-flight resolves it.
+B=${B:-$DATA/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1}
+M=${M:-$DATA/mBRSET/physionet.org/files/mbrset/1.0}
 DR_CK=${DR_CK:-$REPO/ck_kd_v4_384/kd_seed1.pt}     # the deployed DR student (REPORT.md §6)
 WORKERS=${WORKERS:-5}
 GPU_SYSTEMIC=${GPU_SYSTEMIC:-0}
