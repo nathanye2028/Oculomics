@@ -72,9 +72,21 @@ mkdir -p "$OUT" "$CK"
 [ -d "$B" ] || { echo "[fatal] BRSET root not found: $B"; exit 1; }
 $PY -c "import timm" 2>/dev/null || { echo "[fatal] timm missing: .venv/bin/pip install -r requirements.txt"; exit 1; }
 
+# B may be a parent of the real directory (PhysioNet: BRSET/1.0.1/): resolve it to the
+# dir holding the label CSV, or fail naming the CSVs that were found.
+B=$($PY - "$B" <<'PY'
+import sys
+from brset_dataset import resolve_root
+try:
+    print(resolve_root(sys.argv[1], "brset"))
+except FileNotFoundError as e:
+    sys.exit(f"[fatal] {e}")
+PY
+) || exit 1
 # Pre-flight: the ophthalmic columns must survive the BRSET adapter with two classes each.
 CSV=$(ls "$B"/labels_brset.csv "$B"/labels.csv "$B"/dataframe_brset.csv 2>/dev/null | head -1 || true)
 [ -n "$CSV" ] || { echo "[fatal] no BRSET label CSV under $B"; exit 1; }
+echo "[info] BRSET root: $B  ($(basename "$CSV"))"
 $PY brset_dataset.py --csv "$CSV" --inspect | sed -n '/OPHTHALMIC/,/^$/p'
 
 STUDENT_GCG=()
