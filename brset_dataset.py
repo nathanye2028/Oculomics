@@ -296,10 +296,11 @@ LABEL_CSV_NAMES: Dict[str, List[str]] = {
 }
 
 
-def resolve_root(root: str, dataset: str, max_depth: int = 3) -> str:
+def resolve_root(root: str, dataset: str, max_depth: int = 5) -> str:
     """Return the directory that actually holds ``dataset``'s label CSV, searching
-    up to ``max_depth`` levels below ``root``. Raises FileNotFoundError naming
-    every CSV that WAS found, so a wrong root is fixed from the message."""
+    up to ``max_depth`` levels below ``root`` (a ``wget -r`` PhysioNet download sits
+    four deep: ``<root>/physionet.org/files/mbrset/1.0/``). Raises FileNotFoundError
+    naming every CSV that WAS found, so a wrong root is fixed from the message."""
     names = LABEL_CSV_NAMES[dataset]
     root = os.path.expanduser(root)
     if not os.path.isdir(root):
