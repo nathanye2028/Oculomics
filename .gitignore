@@ -17,6 +17,7 @@ exp_ceiling*/
 exp_kd*/
 exp_precision/
 exp_xfer*/
+exp_*/                # every sweep output dir (exp_systemic, exp_ophthalmic, exp_glaucoma, ...)
 results/
 deploy/
 runs/
