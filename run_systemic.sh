@@ -79,11 +79,24 @@ SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
 mkdir -p "$OUT" "$CK"
 [ -d "$M" ] || { echo "[fatal] mBRSET root not found: $M"; exit 1; }
 [ -x "$PY" ] || { echo "[fatal] no .venv — see README Quick start"; exit 1; }
+# M may be a parent of the real directory (PhysioNet: mBRSET/1.0/): resolve it to the
+# dir holding the label CSV, or fail naming the CSVs that were found.
+M=$($PY - "$M" <<'PY'
+import sys
+from brset_dataset import resolve_root
+try:
+    print(resolve_root(sys.argv[1], "mbrset"))
+except FileNotFoundError as e:
+    sys.exit(f"[fatal] {e}")
+PY
+) || exit 1
+CSV=$(ls "$M"/labels_mbrset.csv "$M"/dataframe_brsetmobile.csv 2>/dev/null | head -1)
+echo "[info] mBRSET root: $M  ($(basename "$CSV"))"
 if [ -n "$DR_CK" ] && [ ! -f "$DR_CK" ]; then echo "[fatal] DR_CK not found: $DR_CK"; exit 1; fi
 $PY -c "import timm" 2>/dev/null || { echo "[fatal] timm missing: .venv/bin/pip install -r requirements.txt"; exit 1; }
 
 # shellcheck disable=SC2086
-$PY inspect_mbrset.py --csv "$M/labels_mbrset.csv" --tasks $TASKS --features $COVARIATES --strict \
+$PY inspect_mbrset.py --csv "$CSV" --tasks $TASKS --features $COVARIATES --strict \
   || { echo "[fatal] pre-flight failed: fix the encoding (dataset._binary_flag tokens) or drop the task"; exit 1; }
 
 STUDENT_GCG=()
