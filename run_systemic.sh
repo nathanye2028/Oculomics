@@ -90,7 +90,7 @@ except FileNotFoundError as e:
     sys.exit(f"[fatal] {e}")
 PY
 ) || exit 1
-CSV=$(ls "$M"/labels_mbrset.csv "$M"/dataframe_brsetmobile.csv 2>/dev/null | head -1)
+CSV=$(ls "$M"/labels_mbrset.csv "$M"/dataframe_brsetmobile.csv 2>/dev/null | head -1 || true)   # || true: pipefail
 echo "[info] mBRSET root: $M  ($(basename "$CSV"))"
 if [ -n "$DR_CK" ] && [ ! -f "$DR_CK" ]; then echo "[fatal] DR_CK not found: $DR_CK"; exit 1; fi
 $PY -c "import timm" 2>/dev/null || { echo "[fatal] timm missing: .venv/bin/pip install -r requirements.txt"; exit 1; }
