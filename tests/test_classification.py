@@ -178,3 +178,22 @@ def test_mobilenet_probe_does_not_touch_bn_stats():
     bns = [b for b in m.modules() if isinstance(b, nn.modules.batchnorm._BatchNorm)]
     assert bns and all(int(b.num_batches_tracked) == 0 for b in bns)
     assert all(torch.equal(b.running_mean, torch.zeros_like(b.running_mean)) for b in bns)
+
+
+# ---- (e) dataset roots may be a parent of the real directory ----------------- #
+def test_resolve_root_searches_below_root_and_names_what_it_found(tmp_path):
+    from brset_dataset import load_any, resolve_root
+    real = tmp_path / "mBRSET" / "1.0"; (real / "images").mkdir(parents=True)
+    pd.DataFrame({"file": ["1.jpg"], "patient": ["p1"], "final_icdr": [0]}).to_csv(real / "labels_mbrset.csv", index=False)
+    assert resolve_root(str(tmp_path / "mBRSET"), "mbrset") == str(real)          # one level down
+    assert resolve_root(str(real), "mbrset") == str(real)                            # exact root
+    src = load_any(str(tmp_path), "mbrset")                                          # two levels down
+    assert src["csv"] == str(real / "labels_mbrset.csv") and src["images_dir"] == str(real / "images")
+    (tmp_path / "other.csv").write_text("a\n1\n")
+    with pytest.raises(FileNotFoundError, match="other.csv"):                       # names what it saw
+        resolve_root(str(tmp_path), "brset")
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        resolve_root(str(tmp_path / "nope"), "mbrset")
+    dup = tmp_path / "mBRSET" / "copy"; dup.mkdir(); (dup / "labels_mbrset.csv").write_text("file\n")
+    with pytest.raises(FileNotFoundError, match="several"):
+        resolve_root(str(tmp_path / "mBRSET"), "mbrset")
