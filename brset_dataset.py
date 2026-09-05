@@ -293,33 +293,65 @@ def load_brset(
     return out
 
 
+# Label CSV names per dataset. The name varies by release (PhysioNet 1.0.1 ships
+# labels_brset.csv, the Kaggle BRSET mirror labels.csv), and PhysioNet downloads
+# drop a version directory (mBRSET/1.0/labels_mbrset.csv), so a root is resolved
+# by SEARCHING a few levels for the CSV rather than by hardcoding one path.
+LABEL_CSV_NAMES: Dict[str, List[str]] = {
+    "mbrset": ["labels_mbrset.csv", "dataframe_brsetmobile.csv"],
+    "brset": ["labels_brset.csv", "labels.csv", "dataframe_brset.csv"],
+}
+
+
+def resolve_root(root: str, dataset: str, max_depth: int = 3) -> str:
+    """Return the directory that actually holds ``dataset``'s label CSV, searching
+    up to ``max_depth`` levels below ``root``. Raises FileNotFoundError naming
+    every CSV that WAS found, so a wrong root is fixed from the message."""
+    names = LABEL_CSV_NAMES[dataset]
+    root = os.path.expanduser(root)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"{dataset}: root does not exist: {root}")
+    if any(os.path.isfile(os.path.join(root, n)) for n in names):
+        return root
+    hits, csvs = [], []
+    for dirpath, dirnames, files in os.walk(root):
+        depth = dirpath[len(root):].count(os.sep)
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if d not in ("images", "fundus_photos", "photos")]
+        if any(n in files for n in names):
+            hits.append(dirpath)
+        csvs += [os.path.join(dirpath, f) for f in files if f.lower().endswith(".csv")]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise FileNotFoundError(f"{dataset}: label CSV found in several places under {root}: {hits}. "
+                                f"Pass the one you mean.")
+    raise FileNotFoundError(
+        f"{dataset}: none of {names} within {max_depth} levels of {root}. "
+        f"CSVs found there: {sorted(csvs)[:12] or 'none'}. Pass the directory that holds "
+        f"the label CSV and the images/ folder (e.g. the PhysioNet version dir mBRSET/1.0).")
+
+
 def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]:
     """Resolve ``root`` to a (DataFrame, images_dir) pair for either dataset.
 
     Lets a trainer accept ``--dataset {mbrset,brset}`` without branching on the
     schema everywhere. Returns a dict so the caller can log what it resolved.
+    ``root`` may be a parent of the real dataset directory (see resolve_root).
     """
     if dataset == "mbrset":
-        csv_path = os.path.join(root, "labels_mbrset.csv")
+        root = resolve_root(root, dataset)
+        csv_path = next(os.path.join(root, n) for n in LABEL_CSV_NAMES["mbrset"]
+                        if os.path.isfile(os.path.join(root, n)))
         img_dir = os.path.join(root, "images")
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"expected {csv_path}")
         return {"df": pd.read_csv(csv_path), "images_dir": img_dir,
                 "csv": csv_path, "source": "mbrset"}
     if dataset == "brset":
-        # The label CSV name varies by release: PhysioNet 1.0.1 ships
-        # labels_brset.csv, the Kaggle mirror ships labels.csv. Hardcoding one
-        # and raising "expected <path>" sends the caller hunting for a file that
-        # is sitting right there under a different name, so try each and name
-        # them all if none match.
-        csv_names = ["labels_brset.csv", "labels.csv", "dataframe_brset.csv"]
-        csv_path = next((os.path.join(root, n) for n in csv_names
-                         if os.path.isfile(os.path.join(root, n))), None)
-        if csv_path is None:
-            found = (sorted(f for f in os.listdir(root) if f.endswith(".csv"))
-                     if os.path.isdir(root) else "<root does not exist>")
-            raise FileNotFoundError(
-                f"no BRSET label CSV under {root}; tried {csv_names}; found {found}")
+        root = resolve_root(root, dataset)
+        csv_names = LABEL_CSV_NAMES["brset"]
+        csv_path = next(os.path.join(root, n) for n in csv_names
+                        if os.path.isfile(os.path.join(root, n)))
         # BRSET's image directory is named differently across releases too.
         candidates = ["fundus_photos", "images", "photos"]
         img_dir = next((os.path.join(root, c) for c in candidates
