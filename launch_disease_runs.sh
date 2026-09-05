@@ -128,7 +128,13 @@ run_glaucoma() {
 resolve() {  # resolve <VAR> <dataset> -- replace $VAR with the directory that holds the label CSV, or fail loudly
   local var=$1 ds=$2 val out
   val=${!var}
-  if out=$("$REPO/.venv/bin/python" -c "import sys; sys.path.insert(0, '$REPO'); from brset_dataset import resolve_root; print(resolve_root(sys.argv[1], sys.argv[2]))" "$val" "$ds" 2>&1); then
+  if out=$("$REPO/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$REPO')
+from brset_dataset import resolve_root
+try:
+    print(resolve_root(sys.argv[1], sys.argv[2]))
+except FileNotFoundError as e:
+    sys.exit(str(e))" "$val" "$ds" 2>&1); then
     [ "$out" != "$val" ] && say "[preflight] $var: $val -> $out"
     printf -v "$var" '%s' "$out"
   else
