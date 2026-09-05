@@ -41,6 +41,28 @@ def test_airogs_nested_images_and_rg_labels(tmp_path):
     assert len(ds) == 2 and ds[0]["image"].shape == (3, 32, 32)
 
 
+def test_airogs_light_folder_layout_reads_one_release(tmp_path):
+    for rel in ("release-crop", "release-raw", "release-pad"):
+        _img(tmp_path / rel / "train" / "RG" / "a.jpg"); _img(tmp_path / rel / "train" / "NRG" / "b.jpg")
+        _img(tmp_path / rel / "validation" / "RG" / "c.jpg"); _img(tmp_path / rel / "test" / "NRG" / "d.jpg")
+    src = load_airogs(str(tmp_path))
+    df = src["df"]
+    assert src["release"] == "release-crop" and len(df) == 4               # one release, not three
+    assert dict(zip(df["patient"], df["glaucoma"])) == {"a": 1.0, "b": 0.0, "c": 1.0, "d": 0.0}
+    assert set(df["source_split"]) == {"train", "validation", "test"}
+    assert all(f.startswith(("train", "validation", "test")) for f in df["file"])
+    assert load_airogs(str(tmp_path), airogs_release="release-raw")["images_dir"].endswith("release-raw")
+    with pytest.raises(FileNotFoundError):
+        load_airogs(str(tmp_path), airogs_release="release-nope")
+    ds = MBRSETDataset(csv=df, images_dir=src["images_dir"], task="glaucoma", split="val",
+                       image_size=32, drop_missing_files=True)
+    assert len(ds) == 4 and ds.class_counts().tolist() == [2, 2]
+    # no release dirs, plain RG/NRG folders also work
+    _img(tmp_path / "flat" / "RG" / "x.jpg"); _img(tmp_path / "flat" / "NRG" / "y.jpg")
+    flat = load_airogs(str(tmp_path / "flat"))
+    assert flat["release"] is None and sorted(flat["df"]["glaucoma"]) == [0.0, 1.0]
+
+
 # ---- REFUGE ------------------------------------------------------------------- #
 def test_refuge_folder_labels_table_labels_and_mask_skipping(tmp_path):
     _img(tmp_path / "Training400" / "Glaucoma" / "g0001.jpg")

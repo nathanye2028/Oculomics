@@ -8,11 +8,18 @@ column schema, so every one of them flows through ``dataset.MBRSETDataset``,
 is explicit and auditable, values that cannot be trusted become NaN (dropped),
 and ``--inspect`` shows what was actually joined before any GPU time is spent.
 
-    --dataset airogs   Rotterdam EyePACS AIROGS (Zenodo): train_labels.csv with
-                       challenge_id + class (RG / NRG); ~101k images, the big
-                       training set. No patient id is published, so ``patient``
-                       is the image id: assume one image per subject (documented
-                       caveat -- the split cannot group what it cannot see).
+    --dataset airogs   Rotterdam EyePACS AIROGS. Two layouts: the Zenodo release
+                       (train_labels.csv with challenge_id + class RG / NRG,
+                       ~101k images) and the Kaggle "EyePACS AIROGS Light" subsets
+                       (deathtrooper/eyepacs-airogs-light, ...-light-v2): balanced
+                       RG/ and NRG/ class folders under train/validation/test, in
+                       release-raw|pad|crop standardisations at 256 px -- no CSV.
+                       The folder layout is used when no CSV is found; ONE release
+                       directory is read (``airogs_release``, default release-crop)
+                       so an image is never counted three times. No patient id is
+                       published in either, so ``patient`` is the image id: assume
+                       one image per subject (the split cannot group what it
+                       cannot see). The light subsets are 50 % RG by construction.
     --dataset refuge   REFUGE: images in Glaucoma/ and Non-Glaucoma/ folders
                        (train) and/or a label table (ImgName, Label) for the
                        validation/test releases; mask folders are skipped.
@@ -135,10 +142,39 @@ def _finalise(df: pd.DataFrame, images_dir: str, dataset: str, csv: Optional[str
 # --------------------------------------------------------------------------- #
 # AIROGS
 # --------------------------------------------------------------------------- #
-def load_airogs(root: str, image_ext: str = ".jpg") -> Dict[str, object]:
+def _airogs_from_folders(root: str, release: Optional[str] = None) -> Dict[str, object]:
+    """Kaggle AIROGS-light layout: <release-*>/<train|validation|test>/<RG|NRG>/*.jpg."""
+    releases = sorted(d for d in os.listdir(root)
+                      if d.lower().startswith("release") and os.path.isdir(os.path.join(root, d)))
+    images_dir = root
+    if releases:
+        pick = release or ("release-crop" if "release-crop" in releases else releases[0])
+        if pick not in releases:
+            raise FileNotFoundError(f"AIROGS: release {pick!r} not under {root}; found {releases}")
+        images_dir = os.path.join(root, pick)
+    elif release:
+        raise FileNotFoundError(f"AIROGS: airogs_release={release!r} given but {root} has no release-* dirs")
+    rel = _walk_images(images_dir)
+    if not rel:
+        raise FileNotFoundError(f"AIROGS: neither a label CSV nor images under {root}")
+    rows = []
+    for r in rel:
+        parts = [p.lower() for p in r.split(os.sep)[:-1]]
+        lab = 1.0 if "rg" in parts else (0.0 if "nrg" in parts else np.nan)
+        split = next((p for p in parts if p in ("train", "training", "validation", "val", "test")), None)
+        rows.append({"file": r, "patient": os.path.splitext(os.path.basename(r))[0],
+                     "glaucoma": lab, "source_split": split})
+    df = pd.DataFrame(rows)
+    out = _finalise(df, images_dir, "airogs", None)
+    out["release"] = os.path.basename(images_dir) if releases else None
+    out["releases_available"] = releases
+    return out
+
+
+def load_airogs(root: str, image_ext: str = ".jpg", airogs_release: Optional[str] = None) -> Dict[str, object]:
     csv = _find_table(root, ("train_labels", "labels", "airogs_labels"))
-    if csv is None:
-        raise FileNotFoundError(f"AIROGS: no train_labels.csv under {root}")
+    if csv is None:                                 # Kaggle light subsets: class folders, no CSV
+        return _airogs_from_folders(root, release=airogs_release)
     t = _read_table(csv)
     idc = _col(t, "challenge_id", "image_id", "id", "file")
     labc = _col(t, "class", "label", "glaucoma", "referable")
@@ -302,12 +338,16 @@ def main() -> int:
     p.add_argument("--task", default=None, help="Task column to report (default: every one present).")
     p.add_argument("--image-ext", default=".jpg")
     p.add_argument("--papila-suspect", default="exclude", choices=["exclude", "positive", "negative"])
+    p.add_argument("--airogs-release", default=None,
+                   help="AIROGS-light only: which release-* directory to read (default release-crop).")
     p.add_argument("--inspect", action="store_true", help="(default behaviour)")
     p.add_argument("--strict", action="store_true",
                    help="Exit 1 if the task column is missing/single-class or no image is on disk.")
     args = p.parse_args()
 
     kw = {"papila_suspect": args.papila_suspect} if args.dataset == "papila" else {}
+    if args.dataset == "airogs" and args.airogs_release:
+        kw["airogs_release"] = args.airogs_release
     src = load_public(args.root, args.dataset, image_ext=args.image_ext, **kw)
     df = src["df"]
     print(f"\n{'='*74}\n{args.dataset.upper()} @ {args.root}\n  table: {src['csv']}\n  images_dir: {src['images_dir']}"
@@ -331,6 +371,12 @@ def main() -> int:
         print(f"  PAPILA diagnosis counts (0 healthy / 1 glaucoma / 2 suspect): "
               f"{df['papila_diagnosis'].value_counts(dropna=False).to_dict()}  suspect={args.papila_suspect}")
     if args.dataset == "airogs":
+        if src.get("release"):
+            print(f"  AIROGS-light release read: {src['release']}  (available: {src['releases_available']}; "
+                  f"--airogs-release to change)")
+        if "source_split" in df.columns:
+            print(f"  source folders: {df['source_split'].value_counts(dropna=False).to_dict()}  "
+                  f"(informational -- the trainer makes its own patient-grouped split)")
         print("  NB: AIROGS publishes no patient id; the patient-grouped split treats every image")
         print("      as its own subject. Say so when reporting an in-domain AIROGS number.")
     print(f"{'='*74}\n")

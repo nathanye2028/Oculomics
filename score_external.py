@@ -111,8 +111,11 @@ def main() -> int:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--image-ext", default=".jpg")
     p.add_argument("--papila-suspect", default="exclude", choices=["exclude", "positive", "negative"])
+    p.add_argument("--airogs-release", default=None, help="AIROGS-light: release-* dir (default release-crop).")
     args = p.parse_args()
     kw = {"papila_suspect": args.papila_suspect} if args.dataset == "papila" else {}
+    if args.dataset == "airogs" and args.airogs_release:
+        kw["airogs_release"] = args.airogs_release
     r = score_checkpoint(args.ckpt, args.root, args.dataset, task=args.task, bn_adapt=args.bn_adapt,
                          bn_adapt_batches=args.bn_adapt_batches, batch_size=args.batch_size,
                          num_workers=args.num_workers, image_ext=args.image_ext, **kw)

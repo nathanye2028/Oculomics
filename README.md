@@ -162,7 +162,7 @@ score zero-shot and after AdaBN on the others.
 
 | set | task | what the adapter reads | notes |
 |---|---|---|---|
-| AIROGS (Rotterdam EyePACS) | `glaucoma` | `train_labels.csv` (`challenge_id`, `class` RG/NRG); images in `train/` (nested OK) | ~101k images, the natural training set; **no patient id is published**, so the grouped split treats each image as its own subject |
+| AIROGS (Rotterdam EyePACS) | `glaucoma` | Zenodo: `train_labels.csv` (`challenge_id`, `class` RG/NRG), images in `train/` (nested OK). Kaggle *AIROGS-light* (`deathtrooper/eyepacs-airogs-light`, `…-light-v2`): `RG/` and `NRG/` folders under train/validation/test, one `release-*` dir read (`--airogs-release`, default `release-crop`) | Zenodo ~101k images; light v1 ≈ 6.5k balanced 256 px images. **No patient id is published**, so the grouped split treats each image as its own subject |
 | REFUGE | `glaucoma` | `Glaucoma/` vs `Non-Glaucoma/` folders and/or a label sheet (`ImgName`, `Label`); mask folders skipped | 1,200 images, 10 % glaucoma |
 | PAPILA | `glaucoma` | `ClinicalData/patient_data_od|os.xlsx` (Diagnosis 0/1/2), `FundusImages/RET<ID>OD|OS.jpg` | both eyes share a patient; **suspects excluded by default** (`--papila-suspect`) |
 | ODIR-5K | `glaucoma`, `amd` | `full_df.csv` (per eye) or the per-patient sheet; labels from the per-eye diagnostic keywords; low-quality eyes → NaN | ~7k eyes; `age`/`sex` present |
