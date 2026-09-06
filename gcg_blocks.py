@@ -22,6 +22,19 @@ Variants provided:
   * ``cbam``      — channel (SE) + spatial attention, self-attention on skip.
   * ``se``        — channel-only squeeze-and-excite gate.
   * ``none``      — identity (no gating) control, for an in-architecture A/B.
+
+Attention-map capture
+---------------------
+``save_gcg_maps.py`` (and ``model_seg.record_gcg_gates``) read the maps a
+block computes. The contract is one attribute and one flag: when
+``self.record_gates`` is True (default False — set only by the capture
+context manager, so training never keeps activations alive), the forward
+stores the *detached* maps it computed in ``self.last_gate``::
+
+    {"spatial": [B,1,h,w] in 0..1,   # where it attends   (if the block has one)
+     "channel": [B,C]     in 0..1}   # which channels     (if the block has one)
+
+A custom block that ignores the flag simply yields no maps.
 """
 from __future__ import annotations
 
@@ -41,6 +54,8 @@ def _match(guide: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
 class AttentionGate(nn.Module):
     """Attention U-Net additive attention gate, conditioned on the decoder guide."""
 
+    record_gates: bool = False
+
     def __init__(self, skip_channels: int, guide_channels: Optional[int] = None) -> None:
         super().__init__()
         inter = max(skip_channels // 2, 4)
@@ -51,11 +66,15 @@ class AttentionGate(nn.Module):
     def forward(self, skip: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
         g = _match(guide, skip) if guide is not None else skip
         att = torch.sigmoid(self.psi(F.relu(self.w_g(g) + self.w_x(skip), inplace=True)))
+        if self.record_gates:
+            self.last_gate = {"spatial": att.detach()}
         return skip * att
 
 
 class SEGate(nn.Module):
     """Channel-only squeeze-and-excite gate (self-attention on the skip)."""
+
+    record_gates: bool = False
 
     def __init__(self, skip_channels: int, guide_channels: Optional[int] = None, reduction: int = 8) -> None:
         super().__init__()
@@ -67,11 +86,16 @@ class SEGate(nn.Module):
         )
 
     def forward(self, skip: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return skip * torch.sigmoid(self.fc(skip))
+        ch = torch.sigmoid(self.fc(skip))
+        if self.record_gates:
+            self.last_gate = {"channel": ch.detach().flatten(1)}
+        return skip * ch
 
 
 class CBAMGate(nn.Module):
     """CBAM-style channel + spatial attention applied to the skip feature."""
+
+    record_gates: bool = False
 
     def __init__(self, skip_channels: int, guide_channels: Optional[int] = None, reduction: int = 8) -> None:
         super().__init__()
@@ -88,17 +112,21 @@ class CBAMGate(nn.Module):
         x = skip * ch
         sp = torch.sigmoid(self.spatial(torch.cat(
             [x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)], dim=1)))
+        if self.record_gates:
+            self.last_gate = {"spatial": sp.detach(), "channel": ch.detach().flatten(1)}
         return x * sp
 
 
 class NoGate(nn.Module):
     """Identity passthrough — in-architecture 'no gating' control."""
 
+    record_gates: bool = False
+
     def __init__(self, skip_channels: int, guide_channels: Optional[int] = None) -> None:
         super().__init__()
 
     def forward(self, skip: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return skip
+        return skip                                  # no map to record
 
 
 # name -> factory(skip_channels, guide_channels) -> nn.Module

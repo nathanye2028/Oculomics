@@ -8,6 +8,8 @@
 #   bash launch_disease_runs.sh ophthalmic      # BRSET ophthalmic multi-label sweep (GPU 1)
 #   bash launch_disease_runs.sh glaucoma        # AIROGS-light v2 -> ODIR-5K glaucoma transfer (GPU 1);
 #                                               # data is fetched on the box with kagglehub (anonymous)
+#   bash launch_disease_runs.sh retinalage      # BRSET healthy-cohort retinal age -> mBRSET (GPU 0);
+#                                               # branch disease/retinal-age, not part of "all"
 #   bash launch_disease_runs.sh all             # all three (ophthalmic and glaucoma share GPU 1 unless
 #                                               # GPU_OPHTHALMIC / GPU_GLAUCOMA say otherwise)
 #   bash launch_disease_runs.sh status          # sessions, GPU load, finished runs, log tails
@@ -40,6 +42,7 @@ WORKERS=${WORKERS:-5}
 GPU_SYSTEMIC=${GPU_SYSTEMIC:-0}
 GPU_OPHTHALMIC=${GPU_OPHTHALMIC:-1}
 GPU_GLAUCOMA=${GPU_GLAUCOMA:-1}
+GPU_RETINALAGE=${GPU_RETINALAGE:-0}
 # glaucoma: AIROGS-light v2 (9,540 imgs, kagglehub) -> ODIR-5K (6,392 eyes, kagglehub) with the ctrl /
 # teacher / kd design: roughly 1-1.5 h per student run and 2-3 h per teacher @384px -> ~15 h for 3 seeds.
 GLC_SEEDS=${GLC_SEEDS:-0 1 2}
@@ -55,12 +58,19 @@ SYS_TASKS=${SYS_TASKS:-hypertension nephropathy neuropathy myocardial_infarction
 # so the default is the five labels with clinical weight and 3 seeds (18 runs). Widen with OPH_LABELS / OPH_SEEDS.
 OPH_SEEDS=${OPH_SEEDS:-0 1 2}
 OPH_LABELS=${OPH_LABELS:-amd drusens increased_cup_disc hypertensive_retinopathy vascular_occlusion}
+# retinal age: student per seed on BRSET's healthy cohort (no diabetes, DR 0, adequate quality),
+# scored on held-out BRSET patients and zero-shot on mBRSET (+AdaBN). RA_TEACHER adds a large
+# backbone per seed as a capacity reference. ~30-60 min per student run on an A100 @384px.
+RA_SEEDS=${RA_SEEDS:-0 1 2}
+RA_HEALTHY=${RA_HEALTHY:-nodm}
+RA_TEACHER=${RA_TEACHER:-}                          # e.g. timm:convnext_small.fb_in22k_ft_in1k
 DRY_RUN=${DRY_RUN:-0}                              # 1 = print what would be launched, launch nothing
 STAMP=$(date +%Y%m%d-%H%M)
 
 WT_SYSTEMIC=${WT_SYSTEMIC:-$HOME/Oculomics-systemic}
 WT_OPHTHALMIC=${WT_OPHTHALMIC:-$HOME/Oculomics-ophthalmic}
 WT_GLAUCOMA=${WT_GLAUCOMA:-$HOME/Oculomics-glaucoma}
+WT_RETINALAGE=${WT_RETINALAGE:-$HOME/Oculomics-retinal-age}
 
 say() { printf '%s\n' "$*"; }
 
@@ -127,6 +137,12 @@ run_glaucoma() {
     "SRC='$GLC_SRC' SRC_DATASET=airogs TASK=glaucoma EXT='$GLC_EXT' EXT_DATASET=odir MORE='${more# }' WORKERS=$WORKERS bash run_public_xfer.sh $GLC_SEEDS"
 }
 
+run_retinalage() {
+  worktree disease/retinal-age "$WT_RETINALAGE"
+  launch oculomics-retinalage-brset "$WT_RETINALAGE" "$GPU_RETINALAGE" "$WT_RETINALAGE/exp_retinal_age/sweep-$STAMP.log" \
+    "B='$B' M='$M' HEALTHY=$RA_HEALTHY TEACHER='$RA_TEACHER' WORKERS=$WORKERS bash run_retinal_age.sh $RA_SEEDS"
+}
+
 resolve() {  # resolve <VAR> <dataset> -- replace $VAR with the directory that holds the label CSV, or fail loudly
   local var=$1 ds=$2 val out
   val=${!var}
@@ -149,13 +165,13 @@ except FileNotFoundError as e:
 status() {
   say "=== tmux sessions ==="; tmux ls 2>/dev/null || say "(none)"
   say; say "=== GPUs ==="; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv 2>/dev/null || say "(nvidia-smi unavailable)"
-  for pair in "systemic:$WT_SYSTEMIC/exp_systemic" "ophthalmic:$WT_OPHTHALMIC/exp_ophthalmic" "glaucoma:$WT_GLAUCOMA/exp_glaucoma"; do
+  for pair in "systemic:$WT_SYSTEMIC/exp_systemic" "ophthalmic:$WT_OPHTHALMIC/exp_ophthalmic" "glaucoma:$WT_GLAUCOMA/exp_glaucoma" "retinalage:$WT_RETINALAGE/exp_retinal_age"; do
     local name=${pair%%:*} dir=${pair#*:}
     say; say "=== $name  ($dir) ==="
     [ -d "$dir" ] || { say "(not started)"; continue; }
     say "finished runs: $(find "$dir" -name '*_seed*.json' | wc -l | tr -d ' ')   summaries: $(ls "$dir"/*/summary.md "$dir"/summary*.md 2>/dev/null | wc -l | tr -d ' ')"
     local log; log=$(ls -t "$dir"/sweep-*.log 2>/dev/null | head -1)
-    [ -n "$log" ] && { say "last log: $log"; grep -E "^=== |^\[(done|skip|fatal|warn)\]|AUROC=" "$log" | tail -6; }
+    [ -n "$log" ] && { say "last log: $log"; grep -E "^=== |^\[(done|skip|fatal|warn)\]|AUROC=|MAE=" "$log" | tail -6; }
   done
 }
 
@@ -164,7 +180,8 @@ stop() {  # stop <systemic|ophthalmic>
     systemic)   tmux kill-session -t oculomics-systemic-mbrset && say "[stopped] oculomics-systemic-mbrset";;
     ophthalmic) tmux kill-session -t oculomics-ophthalmic-brset && say "[stopped] oculomics-ophthalmic-brset";;
     glaucoma)   tmux kill-session -t oculomics-glaucoma-airogs2odir && say "[stopped] oculomics-glaucoma-airogs2odir";;
-    *) say "usage: bash launch_disease_runs.sh stop systemic|ophthalmic|glaucoma"; exit 2;;
+    retinalage) tmux kill-session -t oculomics-retinalage-brset && say "[stopped] oculomics-retinalage-brset";;
+    *) say "usage: bash launch_disease_runs.sh stop systemic|ophthalmic|glaucoma|retinalage"; exit 2;;
   esac
 }
 
@@ -177,10 +194,11 @@ preflight() {  # preflight <targets...>
       systemic)   resolve M mbrset;;
       ophthalmic) resolve B brset;;
       glaucoma)   "$REPO/.venv/bin/python" -c "import kagglehub" 2>/dev/null || { say "[fatal] kagglehub missing in $REPO/.venv (pip install -r requirements.txt)"; exit 1; };;
+      retinalage) resolve B brset; resolve M mbrset;;
     esac
   done
   say "[preflight] repo=$REPO  DR_CK=$DR_CK $([ -f "$DR_CK" ] && echo '(found)' || echo '(MISSING -> systemic ctrl arm only)')"
-  say "[preflight] GPUs: systemic->$GPU_SYSTEMIC  ophthalmic->$GPU_OPHTHALMIC  glaucoma->$GPU_GLAUCOMA"
+  say "[preflight] GPUs: systemic->$GPU_SYSTEMIC  ophthalmic->$GPU_OPHTHALMIC  glaucoma->$GPU_GLAUCOMA  retinalage->$GPU_RETINALAGE"
   case " $* " in *" ophthalmic "*" glaucoma "*|*" glaucoma "*" ophthalmic "*)
     [ "$GPU_OPHTHALMIC" = "$GPU_GLAUCOMA" ] && say "[warn] ophthalmic and glaucoma both on GPU $GPU_GLAUCOMA; set GPU_GLAUCOMA= to separate them";; esac
 }
@@ -193,7 +211,7 @@ esac
 TARGETS=("$@"); [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(all)
 [ "${TARGETS[*]}" = "all" ] && TARGETS=(systemic ophthalmic glaucoma)
 for t in "${TARGETS[@]}"; do
-  case "$t" in systemic|ophthalmic|glaucoma) ;; *) say "unknown target '$t' (systemic | ophthalmic | glaucoma | all | status | stop <run>)"; exit 2;; esac
+  case "$t" in systemic|ophthalmic|glaucoma|retinalage) ;; *) say "unknown target '$t' (systemic | ophthalmic | glaucoma | retinalage | all | status | stop <run>)"; exit 2;; esac
 done
 [ "$DRY_RUN" = 1 ] || preflight "${TARGETS[@]}"
 for t in "${TARGETS[@]}"; do "run_$t"; done

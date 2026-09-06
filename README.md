@@ -77,6 +77,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
+| `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py` | Retinal age regression on BRSET's healthy cohort → mBRSET; MAE by age bin, bias-corrected age gap, per-image predictions table (branch `disease/retinal-age`) |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -85,6 +86,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_experiment.py` | `{GCG, control} × seeds` harness with paired CI; `--eval-tiled-val` on by default with tiled eval; `--quick` writes to `*_quick/` scratch dirs; non-default configs get their own `experiments/<slug>/` |
 | `run_arch_sweep.py` | Encoder / decoder sweep on the same harness |
 | `eval_fgadr.py` | Score a checkpoint on FGADR (gating and GCG variant read from the checkpoint) |
+| `save_gcg_maps.py` | Save the GCG attention maps (spatial + channel gates at every gated skip) as `.npz`, overlay panels and an on-lesion vs off-lesion stats CSV; whole-image or tiled; seg or classifier checkpoints |
 | `idrid_dataset.py`, `fgadr_dataset.py`, `multi_seg_dataset.py`, `retlesion_dataset.py`, `vessel_dataset.py`, `ddr_dataset.py`, `rfmid_dataset.py` | Lesion / vessel / classification sources; every seg source implements `load_full(idx) -> (img, masks)` + a per-channel `valid` vector |
 | `pretrain_encoder.py`, `pretrain_vessel.py`, `pretrain_retlesion.py` | In-domain pretraining options (`--init-encoder`, `--init-weights`) |
 | `losses.py` | `lesion_seg` loss (focal Tversky + focal BCE) via `--loss lesion_seg` |
@@ -148,6 +150,40 @@ Design points that the code enforces:
 - **Imbalance** is corrected once (`--imbalance sampler`); `--amp` is bf16 on
   MPS, fp16 + GradScaler on CUDA, identically for every arm.
 
+## Retinal age: BRSET healthy cohort → mBRSET (branch `disease/retinal-age`)
+
+Retinal age is regressed from the fundus photograph on BRSET's **healthy**
+cohort (no diabetes, every image DR grade 0 at the patient level, adequate
+quality — `--healthy nodm`; `dr0` keeps diabetics without retinopathy,
+`--exclude-pathology` also drops BRSET's other ophthalmic flags). The
+patient-grouped, age-stratified 70/10/20 split is drawn over *all* patients
+first, so the diseased ones are never trained on and can all be scored. Same
+loader, model (`regression=True`), recipe and AdaBN as the classifier.
+
+```bash
+# cohort report only (no images touched): how many healthy images/patients survive, age bins per split
+python train_retinal_age.py --root <BRSET> --external-test-root <mBRSET> --inspect
+# one seed: healthy val MAE selects the checkpoint; BRSET test (healthy / all / non-healthy) and
+# mBRSET (zero-shot, then AdaBN) are reported with MAE by age bin and a DR-grade breakdown
+python train_retinal_age.py --root <BRSET> --external-test-root <mBRSET> --seed 0 --bn-adapt \
+    --results-json exp_retinal_age/student_seed0.json
+# seeds (+ optional large-backbone reference on the same split), then mean ± SD, per-bin table,
+# paired contrast and a pooled per-image predictions table for the disease-association step
+B=<BRSET> M=<mBRSET> [TEACHER=timm:convnext_small.fb_in22k_ft_in1k] bash run_retinal_age.sh 0 1 2
+python summarize_retinal_age.py --dir exp_retinal_age
+```
+
+Outputs per run: the results JSON (MAE / RMSE / r / R² / mean gap, **MAE by
+age bin** — BRSET is 40-70 heavy, so expect the tails to be worse — patient-level
+MAE, mBRSET by DR grade) and `<ckpt-dir>/<run>_predictions.csv` with one row per
+scored image: age, prediction, raw gap and **bias-corrected gap** (`gap = a +
+b·age` fit on healthy val and subtracted, Beheshti et al. 2019 — the raw gap is
+anti-correlated with age and would confound any disease association). Every
+mBRSET patient is diabetic and the camera differs, so the mBRSET MAE mixes device
+and biology; read the within-mBRSET DR-grade breakdown for the biological part.
+The lab-box launcher has a `retinalage` target (`bash launch_disease_runs.sh
+retinalage`) once the branch is pushed.
+
 ## Segmentation: GCG vs control
 
 The control for "does gating help?" is the **same backbone with gating off**
@@ -173,6 +209,32 @@ python eval_fgadr.py --checkpoint checkpoints/gcg_seed0.pt --tiled
 Plug in a custom GCG block: implement `forward(skip, guide) -> skip-shaped` in
 `gcg_blocks.py`, register it in `GCG_VARIANTS`, benchmark with
 `run_experiment.py --gcg-variant <name>`.
+
+### What the gates attend to
+
+```bash
+# every gated level (strides 16, 8, 4, 2, 1) on FGADR test images, with ground truth
+python save_gcg_maps.py --checkpoint checkpoints/fgadr_gcg.pt --dataset fgadr --split test --limit 8
+python save_gcg_maps.py --checkpoint checkpoints/fgadr_gcg.pt --dataset idrid --tiled --limit 6   # native res, stitched
+python save_gcg_maps.py --checkpoint ck/gcg_seed0.pt --images <mBRSET>/images --limit 16          # classifier gate
+```
+
+Per image you get `<stem>.npz` (each gate's spatial map at its own resolution
+plus its channel vector), `<stem>.png` (image, ground truth, prediction and one
+heat-map per gate; `--separate-pngs` for individual files, `--stretch` for
+min-max-stretched overlays), and `gate_stats.csv` with the mean attention on
+lesion pixels vs off them per gate and lesion class. In code:
+
+```python
+from model_seg import record_gcg_gates, collect_gcg_gates
+with record_gcg_gates(net):
+    logits = net(x)
+    gates = collect_gcg_gates(net)   # {"decoders.0.gcg": {"spatial": [B,1,h,w], "channel": [B,C]}, ...}
+```
+
+Recording is off outside the context, so training never holds activations.
+A custom block joins in by storing `self.last_gate` when `self.record_gates`
+is set (see `gcg_blocks.py`).
 
 Recorded in every results JSON and checkpoint: git commit, FGADR
 `split_seed`/fractions, `eval_tiled`, `eval_tiled_val`, `tile_overlap`,

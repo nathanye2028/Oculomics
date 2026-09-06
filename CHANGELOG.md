@@ -2,6 +2,19 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-09-06 GCG attention maps
+
+- `save_gcg_maps.py`: saves the attention maps every GCG gate produces (spatial map + channel vector per gated skip) as `.npz`, labelled overlay panels, per-gate PNGs and an on-lesion vs off-lesion `gate_stats.csv`; whole-image or tiled (stitched like the prediction); segmentation or classifier checkpoints; refuses `--no-gcg` checkpoints.
+- `model_seg.record_gcg_gates` / `collect_gcg_gates` / `gcg_gate_modules`: opt-in capture, off by default. Every block in `gcg_blocks.py` records what it computes; custom blocks follow the same one-flag contract.
+- Tests: `tests/test_gcg_maps.py` (capture, variants, classifier gate, tiled == whole, end-to-end on a folder, stats, refusal).
+
+## [Unreleased] — 2026-09-06 retinal age track (branch `disease/retinal-age`)
+
+- `train_retinal_age.py`: age regression on BRSET's healthy cohort (`--healthy nodm|dr0|gradable|all`, `--exclude-pathology`), patient-level cohort rule, age-stratified patient-grouped split drawn over all patients (diseased patients scored, never trained on), healthy-val-MAE selection, L1/Huber/MSE on standardised age, optional age-bin-balanced sampling, MAE by age bin, patient-level MAE, mBRSET zero-shot + AdaBN with DR-grade breakdown, Beheshti-style age-gap bias correction fit on healthy val, per-image predictions CSV. `--inspect` prints the cohort without touching images.
+- `run_retinal_age.sh` (student per seed, optional teacher reference, cohort pre-flight), `summarize_retinal_age.py` (mean ± SD, per-bin table, paired contrast, pooled predictions), `launch_disease_runs.sh retinalage`.
+- `brset_dataset.py`: BRSET `diabetes` mapped through the adapter (optional; mBRSET has none).
+- Tests: `tests/test_retinal_age.py` (cohort rule, split, metrics, bias correction, 1-epoch end-to-end on synthetic trees).
+
 ## [Unreleased] — 2026-09-01 audit fixes
 
 Bugs that changed results (re-run affected sweeps):

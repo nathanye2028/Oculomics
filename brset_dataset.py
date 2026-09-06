@@ -50,6 +50,9 @@ error naming the columns that were present instead.
     exam_eye     (1/2)    -> laterality
     quality               -> final_quality     optional; absent in some releases
     artifacts             -> final_artifacts   optional
+    diabetes              -> diabetes          optional; the healthy-cohort filter in
+                                               train_retinal_age.py (mBRSET has no such
+                                               column: every mBRSET patient is diabetic)
 
 Value re-encoding (verified against a real BRSET CSV, n=1619)
 -------------------------------------------------------------
@@ -114,6 +117,7 @@ OPTIONAL_MAP: Dict[str, str] = {
     "quality": "final_quality",
     "artifacts": "final_artifacts",
     "comorbidities": "comorbidities",
+    "diabetes": "diabetes",             # yes/no; absent in mBRSET (all-diabetic cohort)
     "diabetes_time_y": "dm_time",
     "insuline": "insulin",
     "camera": "camera",

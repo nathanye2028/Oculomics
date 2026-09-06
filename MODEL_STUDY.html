@@ -1,0 +1,505 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0">
+<title>Oculomics Model Study</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --bg:#FFFFFF; --ink:#1C2430; --muted:#5B6875; --accent:#0F6E73; --accent-ink:#0B5257;
+  --warn:#B8521F; --warn-bg:#FBF1EA; --rule:#DFE5E9; --panel:#F3F6F7; --code-bg:#EEF2F4;
+  --good:#2E7D4F; --sel:#D8EEEF;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E1418; --ink:#E4E9ED; --muted:#97A3AD; --accent:#4FB3B7; --accent-ink:#8ED3D6;
+    --warn:#E4885A; --warn-bg:#241812; --rule:#263038; --panel:#151C22; --code-bg:#121A20;
+    --good:#6CC292; --sel:#163538;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E1418; --ink:#E4E9ED; --muted:#97A3AD; --accent:#4FB3B7; --accent-ink:#8ED3D6;
+  --warn:#E4885A; --warn-bg:#241812; --rule:#263038; --panel:#151C22; --code-bg:#121A20;
+  --good:#6CC292; --sel:#163538;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Source Sans 3","Segoe UI",Helvetica,Arial,sans-serif;font-size:17px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent-ink);text-decoration:none;border-bottom:1px solid var(--rule)}
+a:hover{border-bottom-color:var(--accent)}
+a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wrap{display:grid;grid-template-columns:1fr;max-width:1180px;margin:0 auto;padding:0 24px}
+@media(min-width:1080px){.wrap{grid-template-columns:250px minmax(0,1fr);gap:56px}}
+nav.toc{display:none}
+@media(min-width:1080px){
+  nav.toc{display:block;position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:40px 0 40px}
+}
+nav.toc .lbl{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+nav.toc ol{list-style:none;margin:0;padding:0}
+nav.toc li{margin:0 0 6px}
+nav.toc a{display:block;border:0;font-size:14px;color:var(--muted);padding:2px 0 2px 10px;border-left:2px solid transparent;line-height:1.35}
+nav.toc a:hover{color:var(--ink)}
+nav.toc a.on{color:var(--ink);border-left-color:var(--accent)}
+nav.toc .n{display:inline-block;width:2.1em;color:var(--accent);font-variant-numeric:tabular-nums}
+main{max-width:72ch;padding:40px 0 120px}
+header.top{padding:56px 0 28px;border-bottom:1px solid var(--rule);margin-bottom:40px}
+.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+h1{font-family:"Source Serif 4",Georgia,serif;font-weight:700;font-size:44px;line-height:1.08;margin:12px 0 18px;letter-spacing:-.01em;text-wrap:balance}
+.lede{font-size:19px;color:var(--muted);margin:0;max-width:60ch}
+h2{font-family:"Source Serif 4",Georgia,serif;font-weight:700;font-size:30px;line-height:1.15;margin:72px 0 6px;letter-spacing:-.01em;text-wrap:balance;scroll-margin-top:24px}
+h2 .n{color:var(--accent);font-weight:400;margin-right:10px;font-variant-numeric:tabular-nums}
+h3{font-family:"Source Serif 4",Georgia,serif;font-weight:600;font-size:21px;margin:36px 0 6px;text-wrap:balance}
+p{margin:0 0 16px}
+.sub{color:var(--muted);font-size:15px;margin:0 0 20px}
+code,pre{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+code{font-size:.86em;background:var(--code-bg);padding:1px 5px;border-radius:3px}
+pre{background:var(--code-bg);padding:14px 16px;border-radius:6px;overflow-x:auto;font-size:13.5px;line-height:1.5;margin:0 0 18px}
+pre code{background:none;padding:0;font-size:inherit}
+.eq{margin:8px 0 18px;overflow-x:auto;padding:4px 0}
+aside.note{border-left:3px solid var(--accent);background:var(--panel);padding:12px 16px 12px 18px;margin:18px 0 22px;border-radius:0 6px 6px 0;font-size:15.5px}
+aside.note .k{display:block;font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;color:var(--accent);margin-bottom:4px}
+aside.note.paper{border-left-color:var(--muted)}
+aside.note.paper .k{color:var(--muted)}
+aside.note.warn{border-left-color:var(--warn);background:var(--warn-bg)}
+aside.note.warn .k{color:var(--warn)}
+aside.note p:last-child{margin-bottom:0}
+table{border-collapse:collapse;width:100%;font-size:14.5px;margin:6px 0 22px;font-variant-numeric:tabular-nums}
+.tbl{overflow-x:auto;margin:0 0 22px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+td.num,th.num{text-align:right}
+tr.hi td{background:var(--sel)}
+ul,ol{padding-left:22px;margin:0 0 16px}
+li{margin:0 0 6px}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0 0 20px;font-size:15.5px}
+.kv dt{color:var(--muted);margin:0}
+.kv dd{margin:0}
+.q{border-top:1px solid var(--rule);padding-top:12px;margin-top:18px}
+.q summary{cursor:pointer;font-weight:600}
+.q p{margin:8px 0 0;color:var(--muted)}
+figure{margin:0 0 22px}
+figcaption{font-size:13.5px;color:var(--muted);margin-top:6px}
+svg text{fill:var(--ink)}
+.small{font-size:14px;color:var(--muted)}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
+</style>
+<script>
+window.MathJax={tex:{inlineMath:[['\\(','\\)']],displayMath:[['\\[','\\]']]},svg:{fontCache:'global'}};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.js"></script>
+
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <div class="lbl">Contents</div>
+  <ol>
+    <li><a href="#s0"><span class="n">0</span>The model in one paragraph</a></li>
+    <li><a href="#s1"><span class="n">1</span>Data and the split</a></li>
+    <li><a href="#s2"><span class="n">2</span>Preprocessing</a></li>
+    <li><a href="#s3"><span class="n">3</span>Augmentation</a></li>
+    <li><a href="#s4"><span class="n">4</span>Architecture</a></li>
+    <li><a href="#s5"><span class="n">5</span>Loss and optimization</a></li>
+    <li><a href="#s6"><span class="n">6</span>Metrics and selection</a></li>
+    <li><a href="#s7"><span class="n">7</span>Domain shift</a></li>
+    <li><a href="#s8"><span class="n">8</span>Knowledge distillation</a></li>
+    <li><a href="#s9"><span class="n">9</span>Test-time BN adaptation</a></li>
+    <li><a href="#s10"><span class="n">10</span>Statistics</a></li>
+    <li><a href="#s11"><span class="n">11</span>Results, read correctly</a></li>
+    <li><a href="#s12"><span class="n">12</span>Deployment</a></li>
+    <li><a href="#s13"><span class="n">13</span>The operating point</a></li>
+    <li><a href="#s14"><span class="n">14</span>Writing the paper</a></li>
+    <li><a href="#s15"><span class="n">15</span>Self-test</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="top">
+  <div class="eyebrow">Oculomics · BRSET → mBRSET · referable DR</div>
+  <h1>Everything your model does, and why</h1>
+  <p class="lede">A study guide for the classification track: the methods, the reasoning behind each one, the equations, and how each piece becomes a sentence in a research paper. Written against the code as it stands on 5 September 2026.</p>
+</header>
+
+<p>Each section has three kinds of notes. <strong>Why</strong> gives the reason a method was chosen. <strong>In the code</strong> points to the file and function so you can read the implementation next to the math. <strong>In the paper</strong> tells you how to write it up, including what you may and may not claim. Section 15 is a set of questions. If you can answer all of them without looking, you can write the paper.</p>
+
+<h2 id="s0"><span class="n">0</span>The model in one paragraph</h2>
+<p>You train a small convolutional network to read a fundus photograph and output the probability that the eye has referable diabetic retinopathy. You train it on BRSET, a dataset of tabletop-camera photographs, and you test it on mBRSET, photographs taken with a smartphone attachment, without ever training on a smartphone image. That test is called zero-shot transfer. The network is MobileNetV4-Conv-Small at 384 px, 2.82 M parameters, chosen because it runs in 0.7 ms on an Apple Neural Engine. Four things make it work: a cleaned training recipe, a larger input resolution, distillation from a 49.7 M-parameter ConvNeXt-Small teacher, and re-estimating the network's BatchNorm statistics on unlabelled smartphone images at test time (AdaBN). The last of these is the one lever that is statistically significant in two independent seven-seed sweeps. Its effect is about +0.010 AUROC. The final adapted model scores 0.904 to 0.907 AUROC on 4,884 smartphone images, within 0.03 of a model trained directly on smartphone images. The most important deployment finding is not an AUROC at all: a decision threshold calibrated on tabletop images halves sensitivity on smartphone images (0.88 → 0.54), so the threshold must be calibrated or the network adapted before it ships.</p>
+
+<h3>Three terms in that paragraph, in plain words</h3>
+<p><strong>Distillation.</strong> You first train a big, accurate network (the teacher, ConvNeXt-Small, 49.7 M parameters) on the same BRSET images. It is too large to run on a phone. Then you train the small network (the student) on two targets at once: the true label of each image, and the teacher's full output distribution for that image. The teacher's output carries more information than a one-word label. For a borderline eye it might say "70% referable, 30% not", and that 30% tells the student the image looks partly healthy. To make those small probabilities visible the outputs are softened with a temperature \(T = 4\) before comparison. The student's loss is 30% ordinary cross-entropy on the label plus 70% a penalty for disagreeing with the teacher (Section 8 has the equation). The student ends up the same size and the same speed as before; only its weights change. In your results, distillation on its own did not help zero-shot transfer. It helped only after AdaBN, by about +0.011 AUROC.</p>
+<p><strong>Sensitivity on smartphone images.</strong> Sensitivity is the fraction of eyes that truly have referable DR that the model flags as referable: \(\text{Sens} = TP/(TP+FN)\). It answers the screening question "of the sick patients, how many do we catch?" The model outputs a probability, and you turn it into a yes/no by picking a threshold; anything above the threshold is flagged. The threshold was chosen on tabletop (BRSET) validation images so that sensitivity there was 0.90; on the BRSET test set it reached 0.88. When the same threshold is applied to smartphone (mBRSET) images, sensitivity falls to 0.54: the model misses 46% of the eyes that need a referral. The cause is that the model's probabilities are systematically lower on smartphone images, so most true positives land under a threshold set for tabletop images. AUROC does not see this, because AUROC only measures ranking, not where the threshold sits (Sections 6 and 13).</p>
+<p><strong>AdaBN.</strong> Every convolutional layer in the network is followed by BatchNorm, which subtracts a mean and divides by a standard deviation for each channel. Those means and standard deviations are measured during training, so they describe BRSET images: tabletop color, brightness and contrast. Smartphone images have different color, brightness and contrast, so at every layer the features arrive shifted relative to what the next layer expects. AdaBN (adaptive BatchNorm) fixes this without any labels: you push the smartphone images through the trained network once, record the per-channel means and standard deviations they produce, and swap those in for the BRSET ones. No weight changes. It costs one forward pass over the unlabelled images. In your results it adds about +0.010 AUROC, significant in both seven-seed sweeps, and it is the one lever you can call proven (Section 9 has the equations).</p>
+
+<h2 id="s1"><span class="n">1</span>Data and the split</h2>
+<h3>The two datasets</h3>
+<dl class="kv">
+  <dt>BRSET</dt><dd>Brazilian Multilabel Ophthalmological Dataset. About 16k tabletop fundus photographs (Canon CR-2 class cameras). Source domain. After label filtering and the patient-grouped split, about 11,405 images train the model and 3,239 form the held-out in-domain test split.</dd>
+  <dt>mBRSET</dt><dd>Mobile BRSET. Photographs taken with a Phelcom Eyer smartphone-based camera in primary-care settings. Target domain. 4,884 gradable images are scored, all of them, and none are used for training or model selection.</dd>
+  <dt>Grading</dt><dd>Both use the ICDR scale (International Clinical Diabetic Retinopathy severity): 0 none, 1 mild NPDR, 2 moderate NPDR, 3 severe NPDR, 4 PDR.</dd>
+  <dt>Task</dt><dd><code>dr_referable</code>: label 1 if ICDR ≥ 2, else 0. This is the clinical screening question ("refer to an ophthalmologist").</dd>
+  <dt>Prevalence</dt><dd>Referable rate about 5.5% in BRSET's held-out test split and 17.6% in mBRSET (so an all-negative classifier scores 82.4% accuracy on mBRSET).</dd>
+</dl>
+<aside class="note"><span class="k">Why one loader for both</span><p>BRSET's CSV is renamed and re-encoded into mBRSET's column schema (<code>brset_dataset.load_any</code>) and then both datasets go through the same <code>MBRSETDataset</code>. If each dataset had its own loader, any measured domain gap would be confounded by whatever the two loaders did differently (crop, resize, normalization). With one loader the only thing that differs is the pixels, which is the claim you want to make.</p></aside>
+
+<h3>Patient-grouped, label-stratified split</h3>
+<p>The split is 70 / 10 / 20 by patient, not by image. Each patient has up to two eyes, and both eyes must land in the same partition. The split is stratified on the label so each partition has about the same referable rate.</p>
+<p>The implementation uses scikit-learn's <code>StratifiedGroupKFold</code> twice. First, hold out the test fold: with test fraction 0.20 the number of folds is \(n_{\text{splits}} = \operatorname{round}(1/0.20) = 5\), and the first fold is the test set. Then, from the remainder, hold out validation with the relative fraction</p>
+<div class="eq">\[ f_{\text{val}}^{\text{rel}} = \frac{f_{\text{val}}}{1-f_{\text{test}}} = \frac{0.10}{0.80} = 0.125, \qquad n_{\text{splits}} = \operatorname{round}(1/0.125) = 8. \]</div>
+<p>Both fold generators are seeded with the run seed. Two runs with the same seed therefore see the same patients in the same partitions, which is what makes the control and treatment arms of an experiment paired (Section 10).</p>
+<aside class="note warn"><span class="k">Why grouping is mandatory</span><p>The left and right eyes of one patient share vasculature, pigmentation and often disease stage. If one eye is in train and the other in test, the network can score the test eye by recognizing the patient. The test AUROC goes up and nothing about generalization has been measured. The code refuses to run if the <code>patient</code> column is missing rather than silently falling back to a per-image split.</p></aside>
+<aside class="note"><span class="k">In the code</span><p><code>dataset.stratified_split</code>; label derivation in <code>dataset.LABEL_REGISTRY</code>; schema mapping in <code>brset_dataset.py</code>.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods → Data: "Images were partitioned 70/10/20 at the patient level using stratified group k-fold so that both eyes of a patient fell in the same partition; partitions were stratified on referable status. The external test set (mBRSET, n = 4,884) was patient-disjoint from training data and was used neither for training nor for model selection."</p></aside>
+
+<h2 id="s2"><span class="n">2</span>Preprocessing</h2>
+<h3>Field-of-view crop</h3>
+<p>A fundus photograph is a bright disc on a black background. Before resizing, the black border is removed so the resize spends resolution on retina. The bounding box is computed from the per-pixel channel maximum:</p>
+<div class="eq">\[ g(r,c) = \max_{k \in \{R,G,B\}} I_k(r,c), \qquad \text{rows} = \{ r : \max_c g(r,c) > \tau \}, \quad \text{cols} = \{ c : \max_r g(r,c) > \tau \}, \]</div>
+<p>with \(\tau = 12\) on the 0–255 scale, and the crop is the smallest rectangle containing all such rows and columns. If nothing exceeds the threshold, the whole image is kept.</p>
+
+<h3>Resize: full-frame, not center-crop</h3>
+<p>The ImageNet evaluation convention resizes to \(1.14\times\) the target and then center-crops. Applied to an already FOV-cropped fundus, the crop keeps a fraction</p>
+<div class="eq">\[ \left(\frac{1}{1.14}\right)^2 \approx 0.77 \]</div>
+<p>of the retinal area and discards about 23% at the periphery, which is where dot and blot haemorrhages sit. The val and test pipeline therefore does a plain resize to \(S \times S\) (\(S = 384\) for the final model). Training uses <code>RandomResizedCrop</code> with scale in \([0.85, 1.0]\), so train and eval see comparable fields of view.</p>
+
+<h3>Normalization</h3>
+<p>Pixels are scaled to \([0,1]\) and standardized per channel with the ImageNet statistics the pretrained backbone expects:</p>
+<div class="eq">\[ \tilde{x}_k = \frac{x_k - \mu_k}{\sigma_k}, \qquad \mu = (0.485, 0.456, 0.406), \quad \sigma = (0.229, 0.224, 0.225). \]</div>
+<p>At export time this normalization is folded into the Core ML graph so the phone passes raw pixels.</p>
+<aside class="note"><span class="k">Why draft decoding</span><p>JPEG draft mode (<code>PIL.Image.draft</code>) decodes at the smallest DCT scale that is still at least the target size. A 3000 px capture decoded at 1/4 scale costs a fraction of the CPU of a full decode with no loss for a 384 px target.</p></aside>
+<aside class="note"><span class="k">In the code</span><p><code>fundus_utils.fov_bbox</code> / <code>crop_to_fov</code>; <code>dataset.build_transforms</code> (val branch); <code>dataset.MBRSETDataset._load_image</code>.</p></aside>
+
+<h2 id="s3"><span class="n">3</span>Augmentation</h2>
+<p>Training augmentation is designed around the artifacts of handheld capture: uneven flash, defocus, motion blur, compression, and occlusion by eyelashes or dust. Every op runs on tensors, and every op has a fixed parameter range.</p>
+<div class="tbl"><table>
+<tr><th>Op</th><th>Parameters</th><th>Models</th></tr>
+<tr><td>RandomResizedCrop</td><td>scale (0.85, 1.0), ratio (0.9, 1.1)</td><td>framing variation</td></tr>
+<tr><td>Horizontal / vertical flip</td><td>p = 0.5 each</td><td>laterality, orientation</td></tr>
+<tr><td>RandomRotation</td><td>±15°</td><td>camera roll</td></tr>
+<tr><td>ColorJitter</td><td>brightness 0.2, contrast 0.2, saturation 0.15, hue 0.02</td><td>illumination, white balance</td></tr>
+<tr><td>GaussianBlur</td><td>kernel 5, σ ∈ (0.1, 2.0), p = 0.3</td><td>defocus, motion</td></tr>
+<tr><td>Normalize</td><td>ImageNet μ, σ</td><td></td></tr>
+<tr><td>RandomErasing</td><td>p = 0.25, area (0.02, 0.08), aspect (0.3, 3.3)</td><td>eyelash, dust, reflection</td></tr>
+</table></div>
+<p>The ColorJitter and blur ranges are deliberately mild. A fundus is mostly one hue; a large hue shift would produce images that never occur. The vertical flip is legitimate for this task because referable DR is defined by lesion presence, not by anatomical position.</p>
+<h3>DeviceAug: same ops, moved to the GPU</h3>
+<p>The photometric, blur and erasing half of the pipeline was CPU-bound: about 23 ms per image single-threaded, of which ColorJitter alone was 11 ms, capping throughput near 145 img/s. <code>DeviceAug</code> applies the same ops with the same ranges on the GPU, per sample, after the batch is transferred. Per-sample application matters: a torchvision transform called on a \([B,3,H,W]\) tensor draws one set of random parameters for the whole batch, which would make the 32 images in a batch share one blur and one color shift.</p>
+<aside class="note"><span class="k">Why this is not a "trick"</span><p>The augmentation set is identical in the control and treatment arms of every experiment, so it cannot create a difference between them. Its job is throughput and robustness of the baseline, not the contrast you are measuring.</p></aside>
+<aside class="note"><span class="k">In the code</span><p><code>dataset.build_transforms</code> (train branch), <code>dataset.DeviceAug</code>; wired in <code>train_mbrset.main</code> as <code>dev_aug(x)</code> before autocast.</p></aside>
+
+<h2 id="s4"><span class="n">4</span>Architecture</h2>
+<p>Three networks appear in the project. The deployable student, the teacher it is distilled from, and the earlier MobileNetV3-Small student that the ladder in Section 11 starts from.</p>
+
+<h3>4.1 Depthwise-separable convolution, the building block of every mobile net</h3>
+<p>A standard convolution with kernel \(K\times K\), \(C_{\text{in}}\) input channels and \(C_{\text{out}}\) output channels on an \(H\times W\) map costs</p>
+<div class="eq">\[ \text{MACs}_{\text{std}} = K^2 \, C_{\text{in}} \, C_{\text{out}} \, H W . \]</div>
+<p>A depthwise-separable convolution factors this into a per-channel spatial filter (depthwise) followed by a \(1\times 1\) mixing convolution (pointwise):</p>
+<div class="eq">\[ \text{MACs}_{\text{dw+pw}} = K^2 C_{\text{in}} H W + C_{\text{in}} C_{\text{out}} H W, \qquad \frac{\text{MACs}_{\text{dw+pw}}}{\text{MACs}_{\text{std}}} = \frac{1}{C_{\text{out}}} + \frac{1}{K^2}. \]</div>
+<p>For \(K=3\) and \(C_{\text{out}} = 96\) the ratio is about \(0.12\): an 8× reduction in multiply-accumulates. This is why MobileNets are small. It is also why they are memory-bound on accelerators (Section 12): few operations per byte moved.</p>
+
+<h3>4.2 Inverted residual block and squeeze-and-excitation</h3>
+<p>MobileNetV2/V3 blocks expand channels by a factor \(t\) (typically 3 to 6) with a \(1\times1\) conv, apply the depthwise conv in the wide space, then project back down with another \(1\times1\), with a residual connection when stride is 1 and channels match:</p>
+<div class="eq">\[ y = x + P\big(\,\phi(\text{DW}(\phi(E x)))\,\big), \qquad E: C \to tC, \quad P: tC \to C. \]</div>
+<p>Squeeze-and-excitation (SE) re-weights channels by a global descriptor: with \(z = \text{GAP}(u) \in \mathbb{R}^C\),</p>
+<div class="eq">\[ s = \sigma\big(W_2 \,\delta(W_1 z)\big), \qquad \tilde{u}_c = s_c \, u_c , \]</div>
+<p>where \(\delta\) is ReLU, \(\sigma\) the sigmoid, and \(W_1\) reduces to \(C/r\) channels. MobileNetV3 uses the hard-swish activation instead of ReLU in later stages,</p>
+<div class="eq">\[ \operatorname{h\text{-}swish}(x) = x \cdot \frac{\operatorname{ReLU6}(x+3)}{6}, \]</div>
+<p>a piecewise-linear approximation of swish that costs one add, one clamp and one multiply, and quantizes cleanly. The same <code>Hardswish</code> is used in your classification head.</p>
+
+<h3>4.3 MobileNetV4-Conv-Small, the deployed student</h3>
+<p>MobileNetV4 (Qin et al., 2024) replaces the fixed inverted-residual block with the Universal Inverted Bottleneck (UIB), which optionally places a depthwise conv before the expansion as well as after it, and searches the block layout under a latency objective that targets several hardware classes at once, including mobile NPUs. The <code>conv_small</code> variant is the smallest all-convolutional member (no attention blocks), about 2.8 M parameters at your head width. The timm checkpoint you load is <code>mobilenetv4_conv_small.e2400_r224_in1k</code>: ImageNet-1k weights, trained 2400 epochs at 224 px.</p>
+<p>After global average pooling, MobileNetV4 has a \(1\times1\) conv head that widens 960 → 1280 channels. Your code probes the true pooled width with a forward pass instead of trusting timm's <code>num_features</code> (which reports 960), because a wrong width would silently build a mismatched head.</p>
+
+<h3>4.4 The head</h3>
+<div class="eq">\[ \text{logits} = W_2\, \mathrm{Drop}_{0.2}\!\Big(\operatorname{h\text{-}swish}\big(W_1\, \mathrm{Drop}_{0.2}(f)\big)\Big), \qquad W_1: d \to 256,\; W_2: 256 \to 2 . \]</div>
+<p>Here \(f\) is the pooled embedding, \(d = 1280\) for the V4 student, \(d = 768\) for the ConvNeXt-Small teacher, and \(d = 576 + c_{\text{mid}}\) for the MobileNetV3-Small student described next. Two logits and a softmax are used for a binary task rather than one logit and a sigmoid so that the same cross-entropy and distillation code serves the 5-class <code>dr_grade</code> task unchanged.</p>
+
+<h3>4.5 MobileNetV3-Small with the mid-level concat and GCG (the earlier student)</h3>
+<p>The original student read two feature maps from the backbone: the deep stride-32 map (576 channels) and the last stride-16 map (\(c_{\text{mid}}\) channels, located by probing the backbone at build time). Both are global-average-pooled and concatenated for the head. In the GCG arm, the deep map gates the mid map before pooling:</p>
+<div class="eq">\[ h = \delta\big(W_s * m + W_g * \text{up}(d)\big), \qquad a_{\text{sp}} = \sigma(W_2 * \delta(W_1 * h)) \in \mathbb{R}^{1\times H \times W}, \qquad a_{\text{ch}} = \sigma\big(V_2\, \delta(V_1\, \text{GAP}(h))\big) \in \mathbb{R}^{C}, \]</div>
+<div class="eq">\[ \tilde{m} = m \odot a_{\text{sp}} \odot a_{\text{ch}} . \]</div>
+<p>\(m\) is the mid-level skip, \(d\) the deep guide upsampled bilinearly to \(m\)'s size, \(*\) a \(1\times1\) convolution. This is an Attention U-Net additive gate (spatial) multiplied by an SE gate (channel), conditioned on deep context. The control arm concatenates the ungated \(m\), so the only difference between arms is the gate.</p>
+<aside class="note warn"><span class="k">Why GCG was abandoned for the classifier</span><p>At 5 seeds the paired GCG − control difference on mBRSET was +0.0038 with a 95% CI of [−0.011, +0.019]. The paired seed-to-seed noise floor was 0.0119. An attention gate moves a global-pooled classifier by a fraction of the noise. The deployed V4 student uses a plain timm backbone, has no mid-level concat and no gate; the code raises an error rather than silently building an ungated model if you ask for GCG on a timm backbone, so a "GCG arm" can never secretly be a control.</p></aside>
+
+<h3>4.6 ConvNeXt-Small, the teacher</h3>
+<p>ConvNeXt (Liu et al., 2022) is a ResNet modernized with the design choices of vision transformers: \(7\times7\) depthwise convs, LayerNorm instead of BatchNorm, GELU, an inverted bottleneck with expansion 4, and a patchify stem. The <code>fb_in22k_ft_in1k</code> weights were pretrained on ImageNet-22k and fine-tuned on 1k. 49.7 M parameters, 768-dimensional pooled features. It is fine-tuned on the same BRSET split as the student with the same script and a lower learning rate (1e-4). Because it has no BatchNorm, AdaBN cannot be applied to it; that is why the teacher's mBRSET number is reported zero-shot only.</p>
+<aside class="note"><span class="k">In the code</span><p><code>model.MBRSETClassifier</code> (both branches: timm and torchvision), <code>embed</code>, <code>forward_with_feat</code>; <code>model_seg.GuidedContextGating</code>; variants in <code>gcg_blocks.py</code>.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods → Model: state the backbone, the pretrained weights by exact checkpoint name, the input size, the head, and the parameter count. Cite Howard et al. 2019 (MobileNetV3), Qin et al. 2024 (MobileNetV4), Liu et al. 2022 (ConvNeXt), Hu et al. 2018 (SE). Report GCG as a negative result in a single sentence with the CI, or omit it; do not spend a figure on it.</p></aside>
+<h2 id="s5"><span class="n">5</span>Loss and optimization</h2>
+<h3>5.1 Cross-entropy</h3>
+<p>For logits \(z \in \mathbb{R}^K\) the softmax probability of class \(k\) is \(p_k = e^{z_k} / \sum_j e^{z_j}\), and the loss for a sample with label \(y\) is</p>
+<div class="eq">\[ \mathcal{L}_{\text{CE}} = -\log p_y = -z_y + \log \sum_j e^{z_j}. \]</div>
+<p>With label smoothing \(\varepsilon\) the target becomes \((1-\varepsilon)\,\mathbf{e}_y + \varepsilon/K\), which prevents logits from growing without bound and slightly improves calibration. It is available (<code>--label-smoothing</code>) and off by default.</p>
+
+<h3>5.2 Class imbalance: correct it once</h3>
+<p>Referable DR is 5.5% of BRSET. With \(n_c\) samples of class \(c\), \(N\) total and \(K\) classes, the inverse-frequency weight is</p>
+<div class="eq">\[ w_c = \frac{N}{K\, n_c}, \]</div>
+<p>which is 1 for a class at the average frequency and about 9 for the 5.5% positive class. There are two places to apply it: as a per-sample weight in a <code>WeightedRandomSampler</code> (so batches are drawn roughly class-balanced) or as the <code>weight</code> argument to cross-entropy (so positive errors cost more). The old recipe did both. The two corrections multiply: balanced batches already contain about 50% positives, and each positive is then weighted \(\sim 9\times\) again in the loss, so relative to a single correction the positive class is over-weighted by another factor of about 9 (quadratic in \(w_c\) relative to the raw data). The current default is the sampler only.</p>
+<aside class="note"><span class="k">Why the sampler and not the loss weight</span><p>Balanced batches give every step a non-trivial number of positives, which stabilizes BatchNorm statistics and gradient variance for the minority class. Loss weights leave batches with one or two positives whose gradients are then multiplied by 9. For AUROC, which is rank-based, both corrections move the decision boundary but neither changes the ranking much; the sampler is chosen for optimization stability, not for the metric.</p></aside>
+
+<h3>5.3 AdamW</h3>
+<p>For gradient \(g_t\), with \(\beta_1 = 0.9\), \(\beta_2 = 0.999\), \(\epsilon = 10^{-8}\):</p>
+<div class="eq">\[ m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t, \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2, \]</div>
+<div class="eq">\[ \hat m_t = \frac{m_t}{1-\beta_1^t}, \quad \hat v_t = \frac{v_t}{1-\beta_2^t}, \qquad \theta_t = \theta_{t-1} - \eta_t \left( \frac{\hat m_t}{\sqrt{\hat v_t} + \epsilon} + \lambda\, \theta_{t-1} \right). \]</div>
+<p>The weight decay term \(\lambda \theta\) is applied directly to the parameters (decoupled), not added to the gradient before the adaptive scaling. That is the difference between AdamW and Adam with L2 regularization (Loshchilov & Hutter, 2019). Your values: \(\eta_{\max} = 3\times10^{-4}\) for the student, \(10^{-4}\) for the teacher, \(\lambda = 10^{-4}\), batch size 32.</p>
+
+<h3>5.4 Warmup then cosine</h3>
+<p>The learning rate rises linearly from \(0.1\,\eta_{\max}\) to \(\eta_{\max}\) over the first \(E_w = 2\) epochs and then follows cosine annealing over the remaining \(E - E_w\) epochs:</p>
+<div class="eq">\[ \eta(e) = \begin{cases} \eta_{\max}\left(0.1 + 0.9\,\dfrac{e}{E_w}\right) & e < E_w \\[8pt] \dfrac{\eta_{\max}}{2}\left(1 + \cos\!\left(\pi \dfrac{e - E_w}{E - E_w}\right)\right) & e \ge E_w \end{cases} \]</div>
+<p>stepped once per epoch. Warmup protects the pretrained backbone from the large, noisy early updates of a randomly initialized head. Training runs up to 25 epochs with early stopping on validation AUROC after 8 epochs without improvement.</p>
+
+<h3>5.5 Weight EMA (optional)</h3>
+<p>With decay \(\rho\) (0.999 when enabled), after every optimizer step</p>
+<div class="eq">\[ \theta^{\text{EMA}}_t = \rho\, \theta^{\text{EMA}}_{t-1} + (1-\rho)\, \theta_t , \]</div>
+<p>applied to every floating-point tensor in the state dict, which includes BatchNorm running statistics. Integer buffers (<code>num_batches_tracked</code>) are copied. The EMA weights are what get validated, selected and saved, because they are what would ship. The class is hand-written because <code>torch.optim.swa_utils.AveragedModel</code> either freezes BN statistics at copy time or tries to average the integer buffer.</p>
+
+<h3>5.6 Mixed precision and determinism</h3>
+<p>On CUDA the forward and backward run in fp16 under autocast with a <code>GradScaler</code>: the loss is multiplied by a scale \(s\) before backward so small gradients do not underflow fp16's range, and unscaled before the optimizer step. On Apple MPS or CPU there is no scaler, so bf16 is used instead; it keeps fp32's exponent range. The distillation softmax (Section 8) is computed in fp32 regardless because a softmax at temperature 4 on fp16 logits loses precision.</p>
+<p><code>seed_everything</code> seeds Python, NumPy and torch, sets <code>cudnn.deterministic = True</code>, and disables TF32. The TF32 point is a measured one: with TF32 on (10-bit mantissa) the segmentation model's microaneurysm Dice collapsed to 0.000 on an overfit test, and with it off reached 0.974. Sparse classes carry the smallest gradients and are destroyed first by reduced precision. Section 10 explains why deterministic kernels still did not make fixed-seed runs bitwise reproducible.</p>
+<aside class="note"><span class="k">In the code</span><p><code>train_mbrset.main</code>: <code>crit</code>, <code>opt</code>, <code>sched</code>, <code>scaler</code>, the training loop; <code>ModelEMA</code>; <code>fundus_utils.seed_everything</code>; <code>dataset.MBRSETDataset.class_weights</code> / <code>sample_weights</code>.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods → Training: one paragraph with every number above. Reviewers check for: optimizer and its hyperparameters, schedule, batch size, epochs, early-stopping rule, imbalance handling, precision, and the seed policy. The sentence "class imbalance was addressed by balanced sampling" is enough; the double-correction story belongs in a footnote or the repository, not the paper.</p></aside>
+
+<h2 id="s6"><span class="n">6</span>Metrics and model selection</h2>
+<h3>6.1 AUROC</h3>
+<p>The area under the receiver operating characteristic curve equals the probability that a randomly chosen positive is scored above a randomly chosen negative (Hanley & McNeil, 1982):</p>
+<div class="eq">\[ \text{AUROC} = \Pr\big(s(x^+) > s(x^-)\big) = \frac{1}{n_+ n_-} \sum_{i \in +} \sum_{j \in -} \mathbb{1}\big[s_i > s_j\big] \;(+\tfrac{1}{2}\,\mathbb{1}[s_i = s_j]). \]</div>
+<p>This is the Mann–Whitney U statistic normalized. Three properties drive how you use it. It is threshold-free, so it measures ranking quality, not a deployed decision. It is invariant to any monotone transformation of the scores, so a network whose outputs are all shifted down still has the same AUROC (Section 13 is the consequence). And it does not depend on prevalence, which is why it is the one metric you compare across BRSET (5.5% positive) and mBRSET (17.6%).</p>
+<h3>6.2 Accuracy, macro-F1, quadratic-weighted kappa</h3>
+<p>All three are reported and all three move with prevalence. Accuracy on BRSET at 95% is barely above the 94.5% all-negative baseline. Never headline accuracy without the base rate beside it. Quadratic-weighted kappa, used for the 5-class ordinal grade task, is</p>
+<div class="eq">\[ \kappa_w = 1 - \frac{\sum_{i,j} w_{ij} O_{ij}}{\sum_{i,j} w_{ij} E_{ij}}, \qquad w_{ij} = \frac{(i-j)^2}{(K-1)^2}, \]</div>
+<p>with \(O\) the observed confusion matrix and \(E\) the expected one under independence. It penalizes a prediction two grades off four times more than one grade off.</p>
+<h3>6.3 Selection rule</h3>
+<p>After every epoch the (EMA) model is scored on the in-domain validation split. The checkpoint with the best validation AUROC is kept; test and external sets are scored once, at the end, with that checkpoint. If validation AUROC is NaN (a single-class validation split), selection falls back to accuracy and says so in the results JSON; before that fallback existed a degenerate split meant no checkpoint was ever saved and the run crashed at the end.</p>
+<aside class="note warn"><span class="k">Why mBRSET can never select</span><p>Validation AUROC on BRSET is saturated at 0.97–0.99 and cannot rank checkpoints by how well they transfer. It is tempting to pick the epoch with the best mBRSET score. That turns the test set into a validation set and the zero-shot number stops being zero-shot. The code never looks at mBRSET labels until the final evaluation.</p></aside>
+<aside class="note"><span class="k">In the code</span><p><code>train_mbrset.evaluate</code>; <code>metrics.quadratic_weighted_kappa</code>; selection in the epoch loop of <code>train_mbrset.main</code>.</p></aside>
+
+<h2 id="s7"><span class="n">7</span>Domain shift</h2>
+<p>A tabletop fundus camera has a fixed working distance, a controlled flash, a large sensor and an aligned optical axis. A smartphone attachment has none of these. The shift shows up as different color balance, lower and more variable illumination, more blur, more vignetting, and more compression, with the anatomy unchanged. In distribution terms the label-conditional \(p(y \mid \text{anatomy})\) is the same and the marginal \(p(x)\) is different: a covariate shift concentrated in low-order image statistics.</p>
+<p>The domain gap is defined as</p>
+<div class="eq">\[ \Delta = \text{AUROC}_{\text{mBRSET}} - \text{AUROC}_{\text{BRSET test}}, \]</div>
+<p>negative when transfer loses AUROC. It went from −0.144 (old baseline) to −0.090 (final control). It is descriptive only. A method can narrow the gap by improving in-domain less than out-of-domain, or widen it by improving in-domain more, while being strictly better on both. The number that matters is the external AUROC.</p>
+<aside class="note paper"><span class="k">In the paper</span><p>Report the gap in a table next to the two AUROCs, never on its own. State the two prevalences in the same table. Reviewers will ask whether the gap is a prevalence artefact; the answer is that AUROC is rank-based and prevalence-invariant, so it is not, and accuracy/F1/kappa are shown only for completeness.</p></aside>
+
+<h2 id="s8"><span class="n">8</span>Knowledge distillation</h2>
+<h3>8.1 The loss</h3>
+<p>Hinton, Vinyals & Dean (2015). With student logits \(z^s\), teacher logits \(z^t\), temperature \(T\), define softened distributions</p>
+<div class="eq">\[ q_k = \frac{e^{z^s_k / T}}{\sum_j e^{z^s_j / T}}, \qquad p_k = \frac{e^{z^t_k / T}}{\sum_j e^{z^t_j / T}}. \]</div>
+<p>The training loss is</p>
+<div class="eq">\[ \mathcal{L} = (1-\alpha)\,\mathcal{L}_{\text{CE}}(z^s, y) \;+\; \alpha\, T^2\, \operatorname{KL}(p \,\|\, q), \qquad \operatorname{KL}(p\|q) = \sum_k p_k \log \frac{p_k}{q_k}, \]</div>
+<p>with \(\alpha = 0.7\), \(T = 4\), averaged over the batch. Optionally a feature term \(\gamma\,(1 - \cos(P f^s, f^t))\) matches the student's pooled embedding through a learned linear projection \(P\) to the teacher's; \(\gamma = 0\) in the reported runs.</p>
+<h3>8.2 Why \(T^2\)</h3>
+<p>Differentiate the KL term with respect to a student logit. Using \(\partial q_k / \partial z^s_i = q_k(\delta_{ki} - q_i)/T\),</p>
+<div class="eq">\[ \frac{\partial}{\partial z^s_i} \operatorname{KL}(p\|q) = -\sum_k p_k \frac{\partial \log q_k}{\partial z^s_i} = \frac{1}{T}\,(q_i - p_i). \]</div>
+<p>In the high-temperature limit, with zero-mean logits, \(q_i - p_i \approx (z^s_i - z^t_i)/(T \cdot K)\), so the gradient scales as \(1/T^2\). Multiplying the loss by \(T^2\) keeps the distillation gradient the same order as the hard-label gradient as you change \(T\), so \(\alpha\) means the same thing at \(T=1\) and \(T=4\).</p>
+<h3>8.3 Why the direction \(\operatorname{KL}(p\|q)\), and why \(T = 4\)</h3>
+<p>\(\operatorname{KL}(p\|q)\) is large wherever the teacher puts mass and the student does not. Minimizing it forces the student to cover every mode the teacher assigns probability to (mode-covering), which is what you want when the teacher's "dark knowledge" is in its small probabilities. The other direction, \(\operatorname{KL}(q\|p)\), lets the student collapse onto one teacher mode. A temperature above 1 flattens both distributions so those small probabilities carry gradient; at \(T=1\) a confident teacher's soft labels are almost one-hot and the KL term degenerates to cross-entropy on the teacher's argmax.</p>
+<h3>8.4 The pairing discipline</h3>
+<p>The teacher is trained with the same script on the same seed, so its patient split matches the student's and it has never seen the student's in-domain test images. The code refuses a teacher trained on a different dataset, or on the student's external test root (its soft labels would leak the test set). The teacher is built inside <code>torch.random.fork_rng</code> so that constructing it does not advance the global RNG; otherwise the distilled arm's initialization and dropout stream would differ from the control's and the paired contrast would contain a difference that is not distillation.</p>
+<h3>8.5 What distillation did</h3>
+<p>Zero-shot on mBRSET, nothing: +0.0022 [−0.0149, +0.0193] in sweep 1, +0.0011 [−0.0347, +0.0368] in v2. After AdaBN, the distilled student is consistently a little better than the adapted control: +0.0109 [+0.0020, +0.0198] (6/7 seeds) in sweep 1, +0.0119 [−0.0094, +0.0332] (5/7) in v2. The reading is that the teacher's representation is more transferable, but the advantage only shows once the student's BatchNorm statistics match the target domain. Section 11 says how much of this you can claim.</p>
+<aside class="note"><span class="k">In the code</span><p><code>train_mbrset.kd_loss</code> (note <code>F.kl_div(log q, p)</code> computes \(\sum p (\log p - \log q)\), which is \(\operatorname{KL}(p\|q)\)); <code>load_teacher</code>; the <code>teacher is not None</code> branch of the training loop; <code>run_kd_xfer.sh</code> for the ctrl → teacher → kd design.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods: give the loss exactly as in 8.1 with \(\alpha\) and \(T\). Results: "Distillation alone did not improve zero-shot transfer (paired Δ = +0.002, 95% CI [−0.015, +0.019], n = 7). Combined with test-time adaptation, the distilled student exceeded the adapted control by about one seed-SD in both sweeps (+0.011 and +0.012), reaching significance in one." Do not write "distillation improved transfer."</p></aside>
+
+<h2 id="s9"><span class="n">9</span>Test-time BatchNorm adaptation (AdaBN)</h2>
+<h3>9.1 BatchNorm in training and in evaluation</h3>
+<p>For a channel with mini-batch activations \(u_1, \dots, u_B\) (Ioffe & Szegedy, 2015), during training</p>
+<div class="eq">\[ \mu_{\mathcal{B}} = \frac{1}{B}\sum_i u_i, \qquad \sigma^2_{\mathcal{B}} = \frac{1}{B}\sum_i (u_i - \mu_{\mathcal{B}})^2, \qquad \hat{u}_i = \frac{u_i - \mu_{\mathcal{B}}}{\sqrt{\sigma^2_{\mathcal{B}} + \epsilon}}, \qquad y_i = \gamma \hat{u}_i + \beta, \]</div>
+<p>and running estimates are kept with momentum \(m\) (0.1 in PyTorch):</p>
+<div class="eq">\[ \mu_{\text{run}} \leftarrow (1-m)\,\mu_{\text{run}} + m\,\mu_{\mathcal{B}}, \qquad \sigma^2_{\text{run}} \leftarrow (1-m)\,\sigma^2_{\text{run}} + m\,\sigma^2_{\mathcal{B}}. \]</div>
+<p>At evaluation the running estimates replace the batch statistics. They are statistics of the <em>training</em> domain: BRSET's color, illumination and contrast, at every layer.</p>
+<h3>9.2 The adaptation</h3>
+<p>AdaBN (Li et al., 2016) keeps every learned weight, including \(\gamma\) and \(\beta\), and replaces only \(\mu_{\text{run}}, \sigma^2_{\text{run}}\) with statistics of the target domain. Your implementation deep-copies the model, sets it to eval mode (dropout off), then for every BatchNorm layer resets the running statistics, sets <code>momentum = None</code>, and puts that layer alone in train mode. With <code>momentum = None</code> PyTorch uses a cumulative average, so after \(n\) batches</p>
+<div class="eq">\[ \mu_{\text{run}} = \frac{1}{n}\sum_{b=1}^{n} \mu_{\mathcal{B}_b}, \qquad \sigma^2_{\text{run}} = \frac{1}{n}\sum_{b=1}^{n} \sigma^2_{\mathcal{B}_b}, \]</div>
+<p>the exact mean over batches, independent of batch order. Then all mBRSET images (shuffled, seeded, batch 32, no labels) are pushed through once. Single-image batches are skipped since train-mode BN needs more than one value per channel. The adapted copy is scored on the same images it adapted on; that is transductive, and the paper must say so. The zero-shot model is scored first and separately.</p>
+<h3>9.3 Why it works here</h3>
+<p>The tabletop → smartphone shift is mostly a shift in first and second moments of the pixel distribution and of every intermediate feature map: darker, warmer, lower contrast, blurrier. Every one of those moves the per-channel means and variances that BN normalizes away. Re-estimating them on target images undoes the shift at each layer without touching a weight. That is also why the effect is paired within a run and immune to training nondeterminism: same weights, adapted versus not.</p>
+<p>The measured effect on the control is +0.0104 [+0.0024, +0.0185] in sweep 1 and +0.0102 [+0.0007, +0.0197] in v2. It replicated. It is the one lever in the project that is significant twice.</p>
+<h3>9.4 What it cannot do</h3>
+<p>It has no effect on LayerNorm networks (ConvNeXt, ViT), because LayerNorm normalizes per sample with no running statistics. The code returns the BN layer count so that a no-op is never reported as an adapted number. It also does not change the head, so a bias in the output probabilities that is not explained by feature statistics stays. And on device, AdaBN would require re-estimating statistics from the phone's own unlabelled captures; the exported Core ML model carries source-domain statistics unless exported with <code>--bn-stats adapted</code>.</p>
+<aside class="note"><span class="k">In the code</span><p><code>train_mbrset.adapt_bn</code>; the <code>--bn-adapt</code> block at the end of <code>main</code>, which saves the adapted weights as <code>model_bnadapt</code> in the same checkpoint; <code>export_coreml.py --bn-stats</code>.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods: "Test-time adaptation re-estimated BatchNorm running statistics on the unlabelled external images (transductive AdaBN); no label or weight was changed." Results: report zero-shot and adapted in separate columns with the paired within-run effect and its CI. Limitations: name the transductive setting and that the shipped model is zero-shot unless adaptation runs on device.</p></aside>
+<h2 id="s10"><span class="n">10</span>Statistics</h2>
+<h3>10.1 The paired design</h3>
+<p>Every comparison in the project is between two conditions run on the same seed: control versus distilled, or zero-shot versus adapted. Same seed means the same patient split, the same initialization stream and the same augmentation stream, so the per-seed difference \(\Delta_s = a_s - b_s\) removes the split-to-split variance that dominates an unpaired comparison. With \(n\) seeds,</p>
+<div class="eq">\[ \bar\Delta = \frac{1}{n}\sum_s \Delta_s, \qquad s_\Delta = \sqrt{\frac{1}{n-1}\sum_s (\Delta_s - \bar\Delta)^2}, \qquad \text{CI}_{95} = \bar\Delta \pm t_{0.975,\,n-1}\, \frac{s_\Delta}{\sqrt{n}} . \]</div>
+<p>For \(n = 7\), \(t_{0.975, 6} = 2.447\). The result is called significant when the interval excludes zero. A sign count (\(k\) of \(n\) seeds positive) is printed beside it as a distribution-free sanity check. The t critical value is looked up from a small table rather than approximated by 1.96, which would be anti-conservative at \(n = 7\).</p>
+<h3>10.2 Noise floors and power</h3>
+<p>Two noise floors were measured. The seed-to-seed SD of mBRSET AUROC is about 0.012. The run-to-run SD at a <em>fixed</em> seed is about 0.02 (Section 10.3). If the paired deltas inherit an SD of about 0.012, the half-width of the 95% interval at \(n=7\) is</p>
+<div class="eq">\[ 2.447 \times \frac{0.012}{\sqrt{7}} \approx 0.011, \]</div>
+<p>which is the smallest effect you can call significant with seven seeds. The AdaBN effect (+0.010) sits right at that line and cleared it twice. Inverting the formula, detecting an effect \(\delta\) needs about \(n \approx (t\, s_\Delta / \delta)^2\) seeds: for \(\delta = 0.005\), around 35. This is why a 0.004 GCG effect was never going to be resolved, and why the project stopped chasing it.</p>
+<h3>10.3 Fixed-seed runs are not reproducible</h3>
+<p>Under the final code, only one of the first four control seeds reproduced its earlier number exactly; the others moved by up to 0.03. A probe with <code>torch.use_deterministic_algorithms(True)</code> set to raise found no non-deterministic op. <code>cudnn.deterministic = True</code> guarantees that each cuDNN algorithm is deterministic, not that the same algorithm is chosen: selection depends on available workspace memory, and the v2 runs shared their GPU with other jobs. Three consequences hold whatever the cause turns out to be:</p>
+<ul>
+  <li>AdaBN results are immune: they are paired within one run, same weights adapted versus not.</li>
+  <li>The kd − ctrl contrast is legitimate but weaker than "paired by seed" implies, because pairing no longer removes all the shared variance. The two sweeps are replicates, not 14 seeds; they share seven patient splits and are not pooled.</li>
+  <li>A single run is not evidence. <code>kd_seed3</code> scored 0.849 zero-shot in sweep 1 and 0.886 in v2 with nothing changed.</li>
+</ul>
+<h3>10.4 The ceiling</h3>
+<p>To know how far transfer is from the best possible, the same V4-Small was trained directly on mBRSET (patient-grouped, 3 seeds, \(n \approx 964\) per test split): 0.9331 ± 0.0029. The adapted transfer student at 0.904 to 0.907 is within 0.026 to 0.029 of that, about 97%. The teacher's zero-shot 0.936 already sits at the ceiling.</p>
+<aside class="note"><span class="k">In the code</span><p><code>run_experiment.paired_stats</code> and <code>_tcrit</code>; <code>summarize_xfer.py</code>, which calls them for the external AUROC, the gap, and the BN-adaptation table.</p></aside>
+<aside class="note paper"><span class="k">In the paper</span><p>Methods → Statistics: "Conditions were compared within seed. We report the mean paired difference with a 95% t-interval (n = 7 seeds) and the number of seeds favoring each condition; an effect is called significant when the interval excludes zero." Add one sentence on the fixed-seed nondeterminism and that sweeps were treated as replicates. Reviewers respect this; hiding it is worse.</p></aside>
+
+<h2 id="s11"><span class="n">11</span>Results, read correctly</h2>
+<h3>11.1 The ladder</h3>
+<figure>
+<svg viewBox="0 0 560 250" width="100%" role="img" aria-label="mBRSET AUROC ladder">
+  <g font-family="Source Sans 3, sans-serif" font-size="12">
+    <line x1="140" y1="10" x2="140" y2="222" stroke="var(--rule)"/>
+    <g fill="var(--muted)">
+      <text x="140" y="240" text-anchor="middle">0.78</text>
+      <text x="264" y="240" text-anchor="middle">0.83</text>
+      <text x="387" y="240" text-anchor="middle">0.88</text>
+      <text x="511" y="240" text-anchor="middle">0.93</text>
+    </g>
+    <g stroke="var(--rule)" stroke-dasharray="2 3"><line x1="264" y1="10" x2="264" y2="222"/><line x1="387" y1="10" x2="387" y2="222"/><line x1="511" y1="10" x2="511" y2="222"/></g>
+    <g>
+      <text x="132" y="24" text-anchor="end">V3, 224 px, old recipe</text><rect x="140" y="14" width="82" height="14" fill="var(--muted)"/><text x="228" y="25">0.813</text>
+      <text x="132" y="54" text-anchor="end">V3, 384 px, new recipe</text><rect x="140" y="44" width="205" height="14" fill="var(--accent)" opacity=".55"/><text x="351" y="55">0.863</text>
+      <text x="132" y="84" text-anchor="end">V4, control</text><rect x="140" y="74" width="252" height="14" fill="var(--accent)" opacity=".7"/><text x="398" y="85">0.882</text>
+      <text x="132" y="114" text-anchor="end">+ AdaBN</text><rect x="140" y="104" width="277" height="14" fill="var(--accent)" opacity=".85"/><text x="423" y="115">0.892</text>
+      <text x="132" y="144" text-anchor="end" font-weight="700">+ distillation + AdaBN</text><rect x="140" y="134" width="306" height="14" fill="var(--accent)"/><text x="452" y="145" font-weight="700">0.904</text>
+      <text x="132" y="174" text-anchor="end">teacher, zero-shot</text><rect x="140" y="164" width="385" height="14" fill="var(--warn)" opacity=".8"/><text x="531" y="175">0.936</text>
+      <text x="132" y="204" text-anchor="end">mBRSET-trained ceiling</text><rect x="140" y="194" width="378" height="14" fill="var(--muted)" opacity=".5"/><text x="524" y="205">0.933</text>
+    </g>
+  </g>
+</svg>
+<figcaption>mBRSET AUROC, v2 sweep values for the V4 rows (sweep 1: 0.886 / 0.896 / 0.907). Axis starts at 0.78.</figcaption>
+</figure>
+<h3>11.2 The two sweeps side by side</h3>
+<div class="tbl"><table>
+<tr><th></th><th class="num">sweep 1 zero-shot</th><th class="num">sweep 1 adapted</th><th class="num">v2 zero-shot</th><th class="num">v2 adapted</th></tr>
+<tr><td>ctrl</td><td class="num">0.8855 ± 0.0115</td><td class="num">0.8959 ± 0.0073</td><td class="num">0.8822 ± 0.0151</td><td class="num">0.8924 ± 0.0088</td></tr>
+<tr><td>kd</td><td class="num">0.8877 ± 0.0193</td><td class="num">0.9068 ± 0.0113</td><td class="num">0.8832 ± 0.0297</td><td class="num">0.9043 ± 0.0183</td></tr>
+<tr><td>adapt effect, ctrl</td><td class="num" colspan="2">+0.0104 [+0.0024, +0.0185] sig.</td><td class="num" colspan="2">+0.0102 [+0.0007, +0.0197] sig.</td></tr>
+<tr><td>adapt effect, kd</td><td class="num" colspan="2">+0.0191 [+0.0013, +0.0369] sig.</td><td class="num" colspan="2">+0.0210 [−0.0024, +0.0445] n.s.</td></tr>
+<tr><td>kd − ctrl, zero-shot</td><td class="num" colspan="2">+0.0022 [−0.0149, +0.0193] 4/7</td><td class="num" colspan="2">+0.0011 [−0.0347, +0.0368] 5/7</td></tr>
+<tr class="hi"><td>kd − ctrl, adapted</td><td class="num" colspan="2">+0.0109 [+0.0020, +0.0198] 6/7</td><td class="num" colspan="2">+0.0119 [−0.0094, +0.0332] 5/7</td></tr>
+</table></div>
+<p>Seven seeds each, mean ± SD, paired 95% CIs. Teacher zero-shot mean 0.936. In-domain BRSET test AUROC is 0.974 to 0.978 in every arm.</p>
+<h3>11.3 What each result is</h3>
+<div class="tbl"><table>
+<tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Recipe + 384 px + V4 backbone lift zero-shot AUROC from 0.81 to 0.88</td><td>Robust</td><td>14 of 15 V4 runs land 0.85–0.92 against an old baseline of 0.80–0.82. No single-seed dependence.</td></tr>
+<tr><td>AdaBN improves the control by ≈ +0.010</td><td>Significant, replicated</td><td>Two independent 7-seed sweeps, both CIs exclude zero.</td></tr>
+<tr><td>Distillation + AdaBN beats AdaBN alone by ≈ +0.011</td><td>Suggestive, replicated in direction</td><td>Stable point estimate; significant in one sweep, not the other; 11 of 14 paired deltas positive but the 14 share 7 splits.</td></tr>
+<tr><td>Distillation improves zero-shot transfer</td><td>Null</td><td>+0.002 and +0.001, both CIs span zero.</td></tr>
+<tr><td>Adapted student reaches 97% of the in-domain ceiling at 1/18 the teacher's size</td><td>Robust</td><td>0.904–0.907 versus 0.933; 2.82 M versus 49.7 M parameters.</td></tr>
+<tr><td>A tabletop-calibrated threshold halves sensitivity on smartphone images</td><td>Robust, single checkpoint so far</td><td>0.880 → 0.535 at threshold 0.9182 (Section 13). Extending it to all 14 v2 checkpoints is open item 4.</td></tr>
+</table></div>
+<aside class="note warn"><span class="k">Sentences you may not write</span><p>"Distillation significantly improved transfer." "Our method closes the domain gap." "Accuracy of 95%." "The model generalizes to smartphone images" without the operating-point caveat. Each of these is contradicted by a number in this document.</p></aside>
+
+<h2 id="s12"><span class="n">12</span>Deployment</h2>
+<h3>12.1 Export</h3>
+<p><code>export_coreml.py</code> rebuilds the architecture from the checkpoint, folds the ImageNet normalization and the softmax into the graph, converts to a Core ML <code>.mlpackage</code> in fp16, and benchmarks on the Apple Neural Engine and on CPU. The Core ML output is compared with PyTorch's on the same input; the maximum absolute difference was \(1.2\times10^{-4}\) on a noise input, and <code>--verify-images</code> runs the same check on real fundus images as a pass/fail.</p>
+<div class="tbl"><table>
+<tr><th>Compute unit</th><th class="num">median</th><th class="num">p10 / p90</th></tr>
+<tr><td>Apple Neural Engine (Mac)</td><td class="num">0.7 ms</td><td class="num">0.6 / 0.8 ms</td></tr>
+<tr><td>CPU only</td><td class="num">2.8 ms</td><td class="num">2.7 / 3.5 ms</td></tr>
+</table></div>
+<h3>12.2 Why the network is memory-bound, and what that changes</h3>
+<p>The roofline model says the time for a layer is bounded below by both compute and memory traffic:</p>
+<div class="eq">\[ t \ge \max\!\left( \frac{\text{FLOPs}}{P_{\text{peak}}},\; \frac{\text{bytes moved}}{\text{BW}} \right), \qquad \text{arithmetic intensity } I = \frac{\text{FLOPs}}{\text{bytes}} . \]</div>
+<p>Depthwise convolutions have very low \(I\): each weight is used \(H W\) times but each activation byte is touched only \(K^2\) times, so at the ANE's compute-to-bandwidth ratio they sit on the memory side of the roofline. Two measured facts follow from this. A 4.3× reduction in MACs bought 0% latency, because latency was set by bytes, not by FLOPs. And there was about 4× latency headroom to spend on resolution, since a larger input raises FLOPs and bytes together but the budget was 9 ms. That is the argument for 384 px, and it is also why the 0.7 ms figure is a lower bound: a Mac has far more memory bandwidth than a phone, so a bandwidth-bound network will be slower on the phone by roughly the bandwidth ratio. The literal device number comes from an Xcode Core ML performance report.</p>
+<h3>12.3 INT8 quantization</h3>
+<p>Post-training static quantization maps a floating tensor to 8-bit integers with an affine map fitted on calibration data:</p>
+<div class="eq">\[ q = \operatorname{clip}\!\left(\operatorname{round}\!\left(\frac{x}{s}\right) + z,\; 0,\; 255\right), \qquad \hat{x} = s\,(q - z), \qquad s = \frac{x_{\max} - x_{\min}}{255}, \quad z = \operatorname{round}\!\left(-\frac{x_{\min}}{s}\right), \]</div>
+<p>with \(x_{\min}, x_{\max}\) taken from a few calibration batches (MinMax calibration; percentile and entropy calibrators are alternatives). Weights are quantized once; activations get a scale per layer from calibration. The method is selected on the validation split, never on test; the earlier code selected it on test and then reported that same test AUROC, which was fixed in the audit.</p>
+<div class="tbl"><table>
+<tr><th></th><th class="num">fp32</th><th class="num">INT8</th></tr>
+<tr><td>size (ONNX)</td><td class="num">11.26 MB</td><td class="num">3.13 MB</td></tr>
+<tr><td>BRSET test AUROC</td><td class="num">0.9882</td><td class="num">0.9867</td></tr>
+<tr><td>sensitivity / specificity at re-calibrated threshold</td><td class="num">0.880 / 0.991</td><td class="num">0.870 / 0.990</td></tr>
+</table></div>
+<p>The −0.0015 AUROC change is well inside the seed SD, so RQ3 (quantize without significant degradation) is answered yes for INT8 on the in-domain test. Note that the fp32 threshold (0.9182) does not carry over to the INT8 model (0.7848): quantization changes the output scale, so the operating point is re-calibrated on the INT8 model's own validation scores. MobileNetV3 with Hardswish and SE is known to be hostile to naive post-training quantization; the calibration sweep exists for that reason.</p>
+<aside class="note"><span class="k">In the code</span><p><code>export_coreml.py</code> (classifier path, <code>--bn-stats</code>, <code>--verify-images</code>); <code>evaluate_deploy.py</code> (<code>--calib sweep</code>, <code>quantize_static</code>, <code>bench_onnx</code>).</p></aside>
+
+<h2 id="s13"><span class="n">13</span>The operating point</h2>
+<h3>13.1 Choosing a threshold</h3>
+<p>A screening tool ships a threshold, not an AUROC. The threshold \(\theta\) is chosen on the in-domain validation split as the <em>highest</em> score cut such that sensitivity still meets a target (0.90 here), which gives up as little specificity as the sensitivity floor allows:</p>
+<div class="eq">\[ \theta^\star = \max\{\theta : \text{TPR}(\theta) \ge 0.90\}, \qquad \text{fallback: } \theta_J = \arg\max_\theta \big(\text{TPR}(\theta) - \text{FPR}(\theta)\big) \;\text{(Youden's J)}. \]</div>
+<p><code>roc_curve</code> is called with <code>drop_intermediate=False</code>; the default prunes collinear ROC points and can drop exactly the threshold that first reaches the target. At \(\theta^\star = 0.9182\): validation sensitivity 0.905, specificity 0.996.</p>
+<h3>13.2 The four numbers a clinician asks for</h3>
+<div class="eq">\[ \text{Sens} = \frac{TP}{TP+FN}, \quad \text{Spec} = \frac{TN}{TN+FP}, \quad \text{PPV} = \frac{TP}{TP+FP}, \quad \text{NPV} = \frac{TN}{TN+FN}. \]</div>
+<p>PPV and NPV depend on prevalence; sensitivity and specificity do not. Under Bayes' rule with prevalence \(\pi\),</p>
+<div class="eq">\[ \text{PPV} = \frac{\pi\,\text{Sens}}{\pi\,\text{Sens} + (1-\pi)(1-\text{Spec})}, \]</div>
+<p>which is why a 0.876 PPV on mBRSET (\(\pi = 0.176\)) and a 0.867 PPV on BRSET (\(\pi = 0.055\)) are not comparable head to head.</p>
+<h3>13.3 The finding</h3>
+<div class="tbl"><table>
+<tr><th>scored on, same θ = 0.9182</th><th class="num">AUROC</th><th class="num">Sens</th><th class="num">Spec</th><th class="num">PPV</th><th class="num">NPV</th><th class="num">n</th></tr>
+<tr><td>BRSET test (in-domain)</td><td class="num">0.9882</td><td class="num">0.880</td><td class="num">0.991</td><td class="num">0.867</td><td class="num">–</td><td class="num">3,230</td></tr>
+<tr class="hi"><td>mBRSET (smartphone)</td><td class="num">0.8945</td><td class="num">0.535</td><td class="num">0.984</td><td class="num">0.876</td><td class="num">0.908</td><td class="num">4,884</td></tr>
+</table></div>
+<p>Checkpoint <code>kd_seed1.pt</code>, sweep 1, selected by in-domain validation AUROC (0.9979), not by its mBRSET score. AUROC drops by 0.09; sensitivity drops by 0.35. The model misses nearly half of referable DR on smartphone images while remaining highly specific.</p>
+<h3>13.4 Why AUROC hid it</h3>
+<p>AUROC is invariant to any monotone transformation of the scores (Section 6.1). If every smartphone image's probability is pushed down by the same monotone map, the ranking is intact and the AUROC barely moves, but a fixed threshold now sits above most of the positives. That is exactly what a BatchNorm-statistics mismatch does: features shift, the head's logits shift, and the output probabilities on smartphone captures are systematically lower. AdaBN corrects the feature statistics and is the mechanism-level fix; calibrating the threshold on target-domain data is the practical one. Either requires target-domain images, and the second requires labels.</p>
+<aside class="note paper"><span class="k">In the paper</span><p>This is a Results subsection and a paragraph in the Discussion, and it should be in the abstract. "At a threshold calibrated for 90% sensitivity on tabletop images, sensitivity on smartphone images fell to 0.54 (specificity 0.98) despite an AUROC of 0.89. Threshold-free metrics do not capture deployability under domain shift; the operating point must be calibrated on, or the network adapted to, the target device." Open item 4 (run <code>operating_point_sweep.py</code> across the 14 v2 checkpoints, with and without AdaBN) turns this from one checkpoint into a result with a CI. Do that before submission.</p></aside>
+
+<h2 id="s14"><span class="n">14</span>Writing the paper</h2>
+<h3>14.1 Structure and what goes where</h3>
+<div class="tbl"><table>
+<tr><th>Section</th><th>Content from this document</th></tr>
+<tr><td>Abstract</td><td>Task, datasets, zero-shot setting, headline AUROC before/after, the AdaBN effect with CI, latency and size, the operating-point finding in one sentence.</td></tr>
+<tr><td>Introduction</td><td>DR screening in primary care; smartphone capture; why on-device (latency, privacy, connectivity); the gap between tabletop-trained models and handheld images; contributions as a list of exactly what Section 11.3 marks robust or significant.</td></tr>
+<tr><td>Related work</td><td>DR classification on fundus; smartphone fundus datasets (BRSET, mBRSET); mobile architectures; knowledge distillation; test-time / BN adaptation; deployment and quantization of medical models.</td></tr>
+<tr><td>Methods</td><td>Sections 1–5, 8, 9, 10, 12, 13 in that order. Every hyperparameter. The paired design and the CI rule.</td></tr>
+<tr><td>Results</td><td>Table 1: the ladder. Table 2: the two sweeps (Section 11.2). Table 3: operating point in both domains. Table 4: fp32 vs INT8 with size and latency. Figure: ROC curves in both domains with the threshold marked.</td></tr>
+<tr><td>Discussion</td><td>Why AdaBN works for this shift; why distillation alone does not; the interaction as suggestive; the ceiling framing; the operating-point lesson for any threshold-free evaluation.</td></tr>
+<tr><td>Limitations</td><td>Transductive AdaBN; one target device; fixed-seed nondeterminism; single-checkpoint operating point until open item 4 is done; Mac ANE latency as proxy; no prospective clinical evaluation.</td></tr>
+</table></div>
+<h3>14.2 References you will need</h3>
+<ul>
+  <li>Howard et al., "Searching for MobileNetV3," ICCV 2019.</li>
+  <li>Qin et al., "MobileNetV4: Universal Models for the Mobile Ecosystem," ECCV 2024.</li>
+  <li>Liu et al., "A ConvNet for the 2020s," CVPR 2022 (ConvNeXt).</li>
+  <li>Hu, Shen & Sun, "Squeeze-and-Excitation Networks," CVPR 2018.</li>
+  <li>Hinton, Vinyals & Dean, "Distilling the Knowledge in a Neural Network," arXiv 1503.02531, 2015.</li>
+  <li>Ioffe & Szegedy, "Batch Normalization," ICML 2015.</li>
+  <li>Li et al., "Revisiting Batch Normalization for Practical Domain Adaptation," arXiv 1603.04779, 2016 (AdaBN).</li>
+  <li>Loshchilov & Hutter, "Decoupled Weight Decay Regularization," ICLR 2019 (AdamW).</li>
+  <li>Hanley & McNeil, "The meaning and use of the area under a ROC curve," Radiology 1982.</li>
+  <li>Youden, "Index for rating diagnostic tests," Cancer 1950.</li>
+  <li>Wilkinson et al., "Proposed international clinical diabetic retinopathy and diabetic macular edema disease severity scales," Ophthalmology 2003 (ICDR).</li>
+  <li>Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference," CVPR 2018.</li>
+  <li>Williams, Waterman & Patterson, "Roofline: an insightful visual performance model," CACM 2009.</li>
+  <li>Nakayama et al., BRSET dataset paper (PLOS Digital Health, 2024) and the mBRSET dataset paper (Wu, Nakayama et al.); cite the PhysioNet records and check the exact venues at submission time.</li>
+  <li>Oktay et al., "Attention U-Net," MIDL 2018, only if GCG is mentioned.</li>
+</ul>
+<h3>14.3 Before you submit</h3>
+<ol>
+  <li>Run open item 4: the operating point across all fourteen v2 checkpoints, zero-shot and adapted. This is one command and it converts the paper's most important finding from one checkpoint into a distribution.</li>
+  <li>Run the two-identical-runs test on an idle GPU so the nondeterminism sentence in Limitations can say what the cause was.</li>
+  <li>Export the chosen v2 checkpoint with real weights on the Mac and, if you can, get an iPhone Xcode performance report so the latency number is a device number.</li>
+  <li>Decide whether to run the one pre-registered teacher–student attempt (DINOv2 teacher, or α = 0.9 with feature matching, 5 seeds, same paired test). If you run it, report it whatever it says.</li>
+</ol>
+
+<h2 id="s15"><span class="n">15</span>Self-test</h2>
+<p class="sub">Answer each without looking. Open the answer to check.</p>
+<details class="q"><summary>Why does the split group by patient, and what is the symptom if it does not?</summary><p>Both eyes share identity-level features; the network can score a test eye by recognizing the patient. The only symptom is an inflated test score.</p></details>
+<details class="q"><summary>Derive the fraction of retina lost by a 1.14× resize + center crop.</summary><p>\((1/1.14)^2 \approx 0.77\) kept, so about 23% lost, all at the periphery.</p></details>
+<details class="q"><summary>What is the MAC ratio of a depthwise-separable 3×3 conv to a standard one with 96 output channels?</summary><p>\(1/96 + 1/9 \approx 0.12\).</p></details>
+<details class="q"><summary>Write the distillation loss and explain the \(T^2\).</summary><p>\((1-\alpha)\,\text{CE} + \alpha T^2 \operatorname{KL}(p\|q)\). The KL gradient with respect to a logit is \((q_i - p_i)/T\) and \(q_i - p_i\) itself scales as \(1/T\) at high temperature, so the gradient scales as \(1/T^2\); \(T^2\) restores it to the scale of the CE gradient.</p></details>
+<details class="q"><summary>Which direction of KL is used, and what would the other direction do?</summary><p>\(\operatorname{KL}(\text{teacher}\|\text{student})\), mode-covering. The reverse is mode-seeking and lets the student ignore teacher modes.</p></details>
+<details class="q"><summary>What exactly changes in the network under AdaBN?</summary><p>Only the BatchNorm running mean and variance per channel. No weight, no \(\gamma\), no \(\beta\).</p></details>
+<details class="q"><summary>Why does <code>momentum = None</code> matter in the adaptation loop?</summary><p>It makes the running statistics a cumulative average over all adaptation batches, exact and independent of batch order, instead of an exponential average dominated by the last batches.</p></details>
+<details class="q"><summary>Why can AdaBN not be applied to the ConvNeXt teacher?</summary><p>It has LayerNorm, which normalizes per sample with no running statistics. There is nothing to re-estimate.</p></details>
+<details class="q"><summary>Why is the AdaBN result immune to the training nondeterminism, and the kd − ctrl result not?</summary><p>AdaBN is compared within one run on the same weights. kd − ctrl compares two separate training runs, each of which carries run-to-run variance even at a fixed seed.</p></details>
+<details class="q"><summary>With seed SD 0.012 and n = 7, what is the smallest effect you can call significant, and how many seeds would 0.005 need?</summary><p>About 0.011. About 35.</p></details>
+<details class="q"><summary>Why may you not pool the two sweeps into 14 seeds?</summary><p>They share the same seven patient splits, so the 14 deltas are not independent; they are replicates.</p></details>
+<details class="q"><summary>State the property of AUROC that let the operating-point collapse hide.</summary><p>Invariance to monotone transformations of the scores. A uniform downward shift of smartphone probabilities keeps the ranking, and the AUROC, while moving most positives below a fixed threshold.</p></details>
+<details class="q"><summary>Why does the INT8 model need its own threshold?</summary><p>Quantization changes the output scale; the fp32 threshold 0.9182 became 0.7848 on the INT8 model's validation scores.</p></details>
+<details class="q"><summary>Why did a 4.3× MAC cut buy no latency on the ANE?</summary><p>The network is memory-bandwidth-bound: latency is set by bytes moved, not FLOPs. The roofline's memory term dominates for low-arithmetic-intensity depthwise convolutions.</p></details>
+<details class="q"><summary>Give the one-sentence honest statement of the distillation result.</summary><p>Distillation does not improve zero-shot transfer in either sweep; combined with adaptation it is consistently about one seed-SD better than adaptation alone, significant in one of two sweeps.</p></details>
+<details class="q"><summary>Why is the shipped Core ML model's mBRSET number 0.8945 and not 0.9189?</summary><p>The exported model carries source-domain BN statistics (zero-shot). 0.9189 is the transductive AdaBN number, which requires exporting with <code>--bn-stats adapted</code> or re-estimating statistics on the phone.</p></details>
+
+<p class="small" style="margin-top:56px;border-top:1px solid var(--rule);padding-top:16px">Sources: <code>REPORT.md</code>, <code>model.py</code>, <code>train_mbrset.py</code>, <code>dataset.py</code>, <code>brset_dataset.py</code>, <code>fundus_utils.py</code>, <code>run_experiment.py</code>, <code>summarize_xfer.py</code>, <code>evaluate_deploy.py</code>, <code>export_coreml.py</code>, <code>run_kd_xfer.sh</code>, <code>gcg_blocks.py</code>, <code>model_seg.py</code> in the Oculomics repository, 5 September 2026.</p>
+</main>
+</div>
+<script>
+(function(){
+  var links=[].slice.call(document.querySelectorAll('nav.toc a'));
+  var secs=links.map(function(a){return document.querySelector(a.getAttribute('href'));});
+  function update(){
+    var line=window.innerHeight*0.3, idx=0;
+    for(var i=0;i<secs.length;i++){ if(secs[i] && secs[i].getBoundingClientRect().top<=line) idx=i; }
+    links.forEach(function(a,i){ a.classList.toggle('on', i===idx); });
+  }
+  var t=null;
+  window.addEventListener('scroll',function(){ if(t) return; t=setTimeout(function(){t=null;update();},80); },{passive:true});
+  update();
+})();
+</script>
+
+</body></html>
