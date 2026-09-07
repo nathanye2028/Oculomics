@@ -3,7 +3,8 @@
 # BRSET patients and zero-shot on mBRSET (+ label-free AdaBN). Run on the GPU box:
 #
 #   tmux new -s ra
-#   cd ~/Oculomics && B=<BRSET root> M=<mBRSET root> bash run_retinal_age.sh 0 1 2 2>&1 | tee -a exp_retinal_age/sweep.log
+#   cd ~/Oculomics && mkdir -p exp_retinal_age && \
+#     B=<BRSET root> M=<mBRSET root> bash run_retinal_age.sh 0 1 2 2>&1 | tee -a exp_retinal_age/sweep.log
 #
 # Per seed it trains the deployable student ($STUDENT) and, if TEACHER is set, a
 # large timm backbone on the SAME patient split as a capacity reference:
