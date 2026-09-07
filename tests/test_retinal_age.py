@@ -11,9 +11,11 @@ import pandas as pd
 import pytest
 from PIL import Image
 
-from train_retinal_age import (AGE_BIN_LABELS, _flag, age_bin, bias_apply, bias_fit,
-                               build_cohort, main, recalibrate_external, regression_metrics,
-                               split_by_patient)
+import torch
+
+from train_retinal_age import (AGE_BIN_LABELS, PhoneAug, RetinalAgeModel, _flag, age_bin, bias_apply,
+                               bias_fit, build_cohort, ldl_centers, load_age_teacher, main,
+                               recalibrate_external, regression_metrics, soft_labels, split_by_patient)
 
 
 # ---- flags ------------------------------------------------------------------ #
@@ -159,6 +161,62 @@ def test_recalibrate_external_is_out_of_fold_and_restores_scale():
     assert info2["group"] == "all" and info2["n_pool"] == n
 
 
+# ---- model wrapper, LDL head, TTA, phone augmentation ---------------------- #
+def test_soft_labels_and_ldl_expectation():
+    c = torch.as_tensor(ldl_centers(20, 90, 1.0))
+    assert c[0] == 20 and c[-1] == 90 and len(c) == 71
+    t = soft_labels(torch.tensor([25.0, 63.4]), c, sigma=2.0)
+    assert t.shape == (2, 71) and torch.allclose(t.sum(1), torch.ones(2))
+    assert c[t[0].argmax()] == 25 and c[t[1].argmax()] == 63
+    # a peaked distribution's expectation recovers the age
+    assert abs(float(t[1] @ c) - 63.4) < 0.05
+
+
+def test_retinal_age_model_heads_and_tta():
+    torch.manual_seed(0)
+    x = torch.rand(2, 3, 64, 64)
+    lin = RetinalAgeModel("mobilenetv3_small", 64, "linear", None, mean=50.0, std=15.0, pretrained=False).eval()
+    y, out, feat = lin.forward_with_feat(x)
+    assert y.shape == (2,) and out.shape == (2,) and feat.shape[0] == 2
+    assert torch.allclose(y, out * 15.0 + 50.0) and lin.head_spec() == {"type": "linear", "centers": None}
+    ldl = RetinalAgeModel("mobilenetv3_small", 64, "ldl", ldl_centers(20, 90), pretrained=False).eval()
+    y, out, _ = ldl.forward_with_feat(x)
+    assert out.shape == (2, 71) and (y >= 20).all() and (y <= 90).all() and ldl.n_bins == 71
+    assert torch.allclose(y, torch.softmax(out, 1) @ ldl.centers)
+    with torch.no_grad():
+        plain = ldl(x)
+        ldl.tta = True
+        views = [x, x.flip(-1), x.flip(-2), x.flip(-1).flip(-2)]
+        ldl.tta = False
+        manual = torch.stack([ldl(v) for v in views]).mean(0)
+        ldl.tta = True
+        assert torch.allclose(ldl(x), manual, atol=1e-5) and plain.shape == (2,)
+    with pytest.raises(ValueError):
+        RetinalAgeModel("mobilenetv3_small", 64, "ldl", None, pretrained=False)
+
+
+def test_phone_aug_keeps_shape_and_range():
+    torch.manual_seed(1)
+    x = torch.rand(3, 48, 56)
+    aug = PhoneAug(p_down=1, p_blur=1, p_vignette=1, p_cast=1, p_jpeg=1, p_noise=1)
+    y = aug(x)
+    assert y.shape == x.shape and float(y.min()) >= 0 and float(y.max()) <= 1 and not torch.allclose(x, y)
+    off = PhoneAug(0, 0, 0, 0, 0, 0)
+    assert torch.allclose(off(x), x)
+
+
+def test_load_age_teacher_refuses_wrong_task(tmp_path):
+    torch.save({"task": "dr_referable", "args": {}}, tmp_path / "t.pt")
+    with pytest.raises(SystemExit, match="checkpoint"):
+        load_age_teacher(str(tmp_path / "t.pt"), torch.device("cpu"), "brset", "/x")
+    m = RetinalAgeModel("mobilenetv3_small", 64, "linear", None, 50.0, 15.0, pretrained=False)
+    torch.save({"task": "retinal_age", "args": {"dataset": "mbrset", "backbone": "mobilenetv3_small",
+                                                 "image_size": 64, "root": "/x"},
+                "model": m.net.state_dict(), "target_norm": {"mean": 50.0, "std": 15.0}}, tmp_path / "u.pt")
+    with pytest.raises(SystemExit, match="dataset"):
+        load_age_teacher(str(tmp_path / "u.pt"), torch.device("cpu"), "brset", "/x")
+
+
 # ---- end to end -------------------------------------------------------------- #
 def _fundus(rng, path, age):
     a = np.zeros((72, 80, 3), np.uint8)
@@ -195,7 +253,7 @@ def _make_trees(tmp_path, n_pat=40, n_ext=320):
     return str(B), str(M)
 
 
-def _fake_predict(model, loader, device, mean, std):
+def _fake_predict(model, loader, device):
     """Stand-in for train_retinal_age.predict: a compressed, offset, noisy reading of the
     TRUE ages (20 + 0.5*age), so the plumbing — selection, scoring, bias correction,
     device calibration, tables — is exercised deterministically instead of depending on
@@ -269,6 +327,39 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert pooled["n_seeds"].max() == 2 and {"condition", "dataset", "file", "pred_age"} <= set(pooled.columns)
     assert "gap_recal_corrected" in pooled.columns
 
+    # LDL head + TTA + phone augmentation, then a same-architecture teacher and a distilled student
+    rc = main(common + ["--head", "ldl", "--tta", "--phone-aug", "--seed", "0", "--run-name", "ldl_seed0",
+                        "--results-json", str(out / "ldl_seed0.json")])
+    assert rc == 0
+    l = json.load(open(out / "ldl_seed0.json"))
+    assert l["head"]["type"] == "ldl" and len(l["head"]["centers"]) > 10 and l["tta"] and l["phone_aug"]
+    ck_l = torch.load(ck / "ldl_seed0.pt", map_location="cpu")
+    assert ck_l["head"]["type"] == "ldl" and "target_norm" in ck_l
+    assert main(common + ["--seed", "0", "--run-name", "teacher_seed0",
+                          "--results-json", str(out / "teacher_seed0.json")]) == 0
+    rc = main(common + ["--seed", "0", "--run-name", "kd_seed0", "--teacher", str(ck / "teacher_seed0.pt"),
+                        "--kd-alpha", "0.5", "--distill-feat-weight", "0.1",
+                        "--results-json", str(out / "kd_seed0.json")])
+    assert rc == 0
+    k = json.load(open(out / "kd_seed0.json"))
+    assert k["teacher_backbone"] == "mobilenetv3_small" and k["kd"] == {"alpha": 0.5, "feat_weight": 0.1}
+    # mixed-domain training: mBRSET DR-0 patients join training; external = its held-out rows
+    rc = main(common + ["--extra-train-root", M, "--extra-train-dataset", "mbrset", "--extra-healthy", "dr0",
+                        "--extra-weight", "2.0", "--age-balance", "--bn-adapt", "--seed", "0",
+                        "--run-name", "student_mix_seed0", "--results-json", str(out / "student_mix_seed0.json")])
+    assert rc == 0
+    mx = json.load(open(out / "student_mix_seed0.json"))
+    assert mx["extra_dataset"] == "mbrset" and mx["external_held_out"] and mx["n_extra_train"] > 0
+    assert mx["extra_test_healthy"]["n"] > 0 and mx["external"]["n"] == mx["n_extra_scored"]
+    assert mx["extra_bias_correction"]["fit_on"] == "val_healthy_mbrset" and mx["external_recal"] is not None
+    assert mx["n_train"] == mx["cohort"]["n_images"] - mx["n_val"] - mx["n_scored"] + mx["n_extra_train"]
+    pm = pd.read_csv(mx["predictions_csv"])
+    mb = pm[pm["dataset"] == "mbrset"]
+    assert set(mb["cohort"]) == {"healthy", "nonhealthy"}          # held-out rows, never 'external'
+    assert (mb.loc[mb["cohort"] == "healthy", "split"] == "test").all()
+    assert len(mb) == mx["n_extra_scored"] and mb["pred_age_recal"].notna().all()
+    assert mb["pred_age_bnadapt_recal"].notna().all() and pm[pm["dataset"] == "brset"]["pred_age_recal"].isna().all()
+
     # the ceiling direction: train on mBRSET DR-0 patients, external = BRSET (as CEILING=1 does)
     rc = main(common + ["--dataset", "mbrset", "--root", M, "--external-test-root", B,
                         "--external-test-dataset", "brset", "--healthy", "dr0", "--seed", "0",
@@ -283,3 +374,6 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert res.returncode == 0, res.stderr
     assert "## ceiling" in res.stdout and "device-calibrated" in res.stdout
     assert "paired ceiling" not in res.stdout                  # different train set: never paired
+    assert "## student_mix" in res.stdout and "mixed-domain: + mbrset" in res.stdout
+    assert "mbrset test, healthy (mixed-in domain)" in res.stdout
+    assert "seed-ensemble" in res.stdout and "distilled from mobilenetv3_small" in res.stdout

@@ -10,6 +10,8 @@
 # large timm backbone on the SAME patient split as a capacity reference:
 #   student_seed<s>   $STUDENT (MobileNetV4-Small @384 by default)
 #   teacher_seed<s>   $TEACHER (off by default; e.g. timm:convnext_small.fb_in22k_ft_in1k)
+#   kd_seed<s>        with TEACHER (and KD=1, the default): $STUDENT distilled from teacher_seed<s>
+#                     (regression KD: matches the teacher's predicted age; same split, same seed)
 #   ceiling_seed<s>   CEILING=1: $STUDENT trained IN-DOMAIN on mBRSET's DR-grade-0 patients
 #                     (--dataset mbrset --healthy dr0), scored on held-out mBRSET patients and
 #                     on all of BRSET as the reverse transfer. This is the phone-domain ceiling:
@@ -17,6 +19,9 @@
 #                     the age signal and the transfer is what fails.
 # Every run also reports the external set DEVICE-CALIBRATED (2-fold linear fit on the
 # external DR-0 patients, out-of-fold), next to zero-shot and AdaBN.
+# Recipe knobs (each off by default): HEAD=ldl, TTA=1, PHONE_AUG=1, AGE_BALANCE=1, and
+# MIX=1 for mixed-domain training (mBRSET DR-0 patients join training; the external numbers
+# are then computed on mBRSET's held-out rows and conditions are named *_mix).
 # Pre-flight: train_retinal_age.py --inspect prints the cohort (how many healthy
 # images/patients survive the --healthy rule, age histogram per split) and fails
 # loudly if the rule needs a column the CSV lacks (nodm needs BRSET's `diabetes`).
@@ -38,6 +43,17 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
     AGE_BALANCE    1 = sample train images by 1/sqrt(age-bin frequency)          (default 0)
     CEILING        1 = also train the in-domain mBRSET DR-0 ceiling per seed      (default 0)
     RECAL_GROUP    dr0 | all: external rows the device calibration is fit on    (default dr0)
+    MIX            1 = mixed-domain training: mBRSET DR-0 train/val rows join training;
+                   external = mBRSET held-out rows; run names get TAG=_mix          (default 0)
+    EXTRA_WEIGHT   sampling weight multiplier for the mixed-in images              (default 1.0)
+  recipe
+    HEAD           linear | ldl (label-distribution head)                          (default linear)
+    TTA            1 = average four flip views at evaluation                       (default 0)
+    PHONE_AUG      1 = smartphone-capture augmentation in training                 (default 0)
+    KD             1 = with TEACHER, also distil it into the student (kd_seed<s>)  (default 1)
+    KD_ALPHA       weight of the teacher-matching term                             (default 0.5)
+    FEAT_W         cosine feature-matching weight                                  (default 0.0)
+    TAG            suffix on condition names, e.g. _512 (MIX=1 defaults to _mix)   (default "")
   outputs
     OUT            results JSONs + summary + pooled predictions   (default exp_retinal_age)
     CK             checkpoints + per-run predictions CSVs         (default ck_retinal_age)
@@ -68,6 +84,16 @@ EXCLUDE_PATHOLOGY=${EXCLUDE_PATHOLOGY:-0}
 AGE_BALANCE=${AGE_BALANCE:-0}
 CEILING=${CEILING:-0}
 RECAL_GROUP=${RECAL_GROUP:-dr0}
+MIX=${MIX:-0}
+EXTRA_WEIGHT=${EXTRA_WEIGHT:-1.0}
+HEAD=${HEAD:-linear}
+TTA=${TTA:-0}
+PHONE_AUG=${PHONE_AUG:-0}
+KD=${KD:-1}
+KD_ALPHA=${KD_ALPHA:-0.5}
+FEAT_W=${FEAT_W:-0.0}
+TAG=${TAG:-}
+[ "$MIX" = 1 ] && [ -z "$TAG" ] && TAG=_mix
 OUT=${OUT:-exp_retinal_age}
 CK=${CK:-ck_retinal_age}
 STUDENT=${STUDENT:-timm:mobilenetv4_conv_small.e2400_r224_in1k}
@@ -95,6 +121,14 @@ COMMON=(--dataset brset --root "$B" --external-test-root "$M" --external-test-da
 CEIL=(--dataset mbrset --root "$M" --external-test-root "$B" --external-test-dataset brset --healthy dr0)
 [ "$EXCLUDE_PATHOLOGY" = 1 ] && COMMON+=(--exclude-pathology)
 [ "$AGE_BALANCE" = 1 ] && COMMON+=(--age-balance)
+COMMON+=(--head "$HEAD")
+[ "$TTA" = 1 ] && COMMON+=(--tta)
+[ "$PHONE_AUG" = 1 ] && COMMON+=(--phone-aug)
+[ "$MIX" = 1 ] && COMMON+=(--extra-train-root "$M" --extra-train-dataset mbrset --extra-healthy dr0 \
+                           --extra-weight "$EXTRA_WEIGHT")
+if [ "$MIX" = 1 ] && [ "$CEILING" = 1 ]; then
+  echo "[warn] CEILING=1 ignored with MIX=1 (the ceiling trains on mBRSET, which MIX already mixes in)"; CEILING=0
+fi
 
 echo "=== pre-flight: cohort under --healthy $HEALTHY   $(date) ==="
 # shellcheck disable=SC2086
@@ -117,12 +151,21 @@ run() {  # run <name> <flags...>
 }
 
 for s in "${SEEDS[@]}"; do
-  run "student_seed$s" --seed "$s" --backbone "$STUDENT"
+  run "student${TAG}_seed$s" --seed "$s" --backbone "$STUDENT"
   if [ -n "$TEACHER" ]; then
-    run "teacher_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR"
+    run "teacher${TAG}_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR"
+    if [ "$KD" = 1 ]; then
+      tpt="$CK/teacher${TAG}_seed$s.pt"
+      if [ -f "$tpt" ] && [ -f "$CK/teacher${TAG}_seed$s.done" ]; then
+        run "kd${TAG}_seed$s" --seed "$s" --backbone "$STUDENT" --teacher "$tpt" \
+            --kd-alpha "$KD_ALPHA" --distill-feat-weight "$FEAT_W"
+      else
+        echo "[warn] teacher${TAG}_seed$s has no finished checkpoint ($tpt); kd${TAG}_seed$s skipped"
+      fi
+    fi
   fi
   if [ "$CEILING" = 1 ]; then
-    run "ceiling_seed$s" --seed "$s" --backbone "$STUDENT" "${CEIL[@]}"
+    run "ceiling${TAG}_seed$s" --seed "$s" --backbone "$STUDENT" "${CEIL[@]}"
   fi
 done
 

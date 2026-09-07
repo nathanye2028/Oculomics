@@ -197,6 +197,18 @@ mBRSET's DR-0 patients, `--dataset mbrset --healthy dr0`, with BRSET as the
 reverse external set). The lab-box launcher has a `retinalage` target
 (`bash launch_disease_runs.sh retinalage`).
 
+Levers for a sharper clock, each a knob of `run_retinal_age.sh` (all off by
+default): `HEAD=ldl` (label-distribution head over 1-year bins), `TTA=1` (four
+flip views at evaluation), `PHONE_AUG=1` (smartphone-capture simulation in
+training), `AGE_BALANCE=1`, `SIZE=512`, `TEACHER=<timm backbone>` (a large
+model on the same split; with `KD=1`, the default, the student is then
+distilled from it — regression KD on the predicted age), and `MIX=1`
+(mixed-domain training: mBRSET's DR-0 patients join training with their own
+cohort rule, split and bias correction; the external numbers are then computed
+on mBRSET's held-out rows only, and conditions are named `*_mix`). The
+summariser adds a seed-ensemble line (per-image mean over seeds) to every
+table.
+
 Step 2 — the gap against disease — is `analyze_age_gap.py`, run automatically at
 the end of the sweep and usable on any predictions table:
 

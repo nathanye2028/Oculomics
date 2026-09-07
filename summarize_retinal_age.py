@@ -35,9 +35,12 @@ from train_retinal_age import AGE_BIN_LABELS          # noqa: E402
 # (JSON key, label) — {tr} / {ex} are the run's train / external dataset names.
 SETS = [("test_healthy", "{tr} test, healthy"), ("test_all", "{tr} test, all"),
         ("test_nonhealthy", "{tr} test, non-healthy"), ("unseen_nonhealthy", "{tr} non-healthy, never trained"),
-        ("external", "{ex} zero-shot"), ("external_recal", "{ex} device-calibrated"),
+        ("extra_test_healthy", "{xt} test, healthy (mixed-in domain)"), ("extra_test_all", "{xt} test, all (mixed-in)"),
+        ("extra_test_nonhealthy", "{xt} test, non-healthy (mixed-in)"),
+        ("extra_unseen_nonhealthy", "{xt} non-healthy, never trained (mixed-in)"),
+        ("external", "{ex} {zs}"), ("external_recal", "{ex} device-calibrated"),
         ("external_bnadapt", "{ex} + AdaBN"), ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
-BIN_SETS = [("test_healthy", "{tr} test healthy"), ("external", "{ex} zero-shot"),
+BIN_SETS = [("test_healthy", "{tr} test healthy"), ("external", "{ex} {zs}"),
             ("external_recal", "{ex} device-calibrated"), ("external_bnadapt", "{ex} + AdaBN"),
             ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
 
@@ -70,17 +73,70 @@ def fmt(m, sd, n, prec=2):
     return "-" if n == 0 else (f"{m:.{prec}f} ± {sd:.{prec}f}" if n > 1 else f"{m:.{prec}f}")
 
 
+def pool_predictions(runs):
+    """Per-image mean over seeds of every prediction / gap column, per condition."""
+    frames = []
+    for cond, by_seed in runs.items():
+        for s, r in by_seed.items():
+            pth = r.get("predictions_csv")
+            if pth and os.path.isfile(pth):
+                df = pd.read_csv(pth); df["condition"] = cond; df["seed"] = s
+                frames.append(df)
+            else:
+                print(f"[warn] {cond}_seed{s}: predictions CSV missing ({pth})", file=sys.stderr)
+    if not frames:
+        return None
+    allp = pd.concat(frames, ignore_index=True)
+    num = [c for c in ("pred_age", "gap", "gap_corrected", "pred_age_recal", "gap_recal", "gap_recal_corrected",
+                       "pred_age_bnadapt", "gap_bnadapt", "gap_bnadapt_corrected", "pred_age_bnadapt_recal",
+                       "gap_bnadapt_recal", "gap_bnadapt_recal_corrected") if c in allp.columns]
+    keys = ["condition", "dataset", "file"]
+    meta = [c for c in allp.columns if c not in num + keys + ["seed"]]
+    return allp.groupby(keys, as_index=False).agg(
+        **{c: (c, "mean") for c in num}, n_seeds=("seed", "nunique"), **{c: (c, "first") for c in meta})
+
+
+def ensemble_lines(pooled, cond, r0):
+    """MAE / r of the seed-ensemble (mean prediction) on the same sets as the per-seed table."""
+    import numpy as np
+    d = pooled[pooled["condition"] == cond]
+    if d.empty or d["n_seeds"].max() < 2:
+        return []
+    tr, xt, ex = r0.get("train_dataset"), r0.get("extra_dataset"), r0.get("external_dataset")
+    out = [f"\n   seed-ensemble (per-image mean over {int(d['n_seeds'].max())} seeds):"]
+
+    def line(label, f, col):
+        f = f[f[col].notna()]
+        if len(f) < 2:
+            return
+        err = np.abs(f[col] - f["age"]); r = np.corrcoef(f["age"], f[col])[0, 1]
+        out.append(f"   {label:<46}{err.mean():<16.2f}{r:<16.3f}{'':<32}{len(f):>6}")
+
+    line(f"{tr} test, healthy", d[(d["dataset"] == tr) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
+    if xt:
+        line(f"{xt} test, healthy (mixed-in)", d[(d["dataset"] == xt) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
+    if ex:
+        e = d[d["dataset"] == ex]
+        for col, label in (("pred_age", "zero-shot" if not r0.get("external_held_out") else "held-out"),
+                           ("pred_age_recal", "device-calibrated"), ("pred_age_bnadapt", "+ AdaBN"),
+                           ("pred_age_bnadapt_recal", "+ AdaBN, device-calibrated")):
+            if col in e.columns:
+                line(f"{ex} {label}", e, col)
+    return out if len(out) > 1 else []
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Summarise retinal-age runs (mean ± SD over seeds, "
-                                            "MAE by age bin, pooled predictions).")
+                                            "MAE by age bin, seed-ensemble, pooled predictions).")
     p.add_argument("--dir", default="exp_retinal_age")
-    p.add_argument("--no-pool", action="store_true", help="Skip the pooled predictions CSV.")
+    p.add_argument("--no-pool", action="store_true", help="Skip the pooled predictions CSV and the ensemble lines.")
     args = p.parse_args()
 
     runs = load(args.dir)
     if not runs:
         print(f"[fatal] no retinal_age result JSONs in {args.dir}", file=sys.stderr)
         return 2
+    pooled = None if args.no_pool else pool_predictions(runs)
     L = [f"\n{'='*78}", f"RETINAL AGE: {args.dir}", f"{'='*78}"]
     for cond, by_seed in runs.items():
         seeds = sorted(by_seed)
@@ -91,8 +147,17 @@ def main() -> int:
         L.append(f"   cohort: {c.get('n_healthy_images')}/{c.get('n_images')} healthy images, "
                  f"{c.get('n_healthy_patients')}/{c.get('n_patients')} patients; "
                  f"excluded {c.get('exclusions')}")
-        names = {"tr": r0.get("train_dataset", "train"), "ex": r0.get("external_dataset") or "external"}
-        L.append(f"\n   {'set':<40}{'MAE (y)':<16}{'r':<16}{'mean gap':<16}{'corrected gap':<16}{'n':>6}")
+        names = {"tr": r0.get("train_dataset", "train"), "ex": r0.get("external_dataset") or "external",
+                 "xt": r0.get("extra_dataset") or "extra",
+                 "zs": "held-out (mixed-in domain)" if r0.get("external_held_out") else "zero-shot"}
+        if r0.get("extra_dataset"):
+            L.append(f"   mixed-domain: + {r0['extra_dataset']} healthy={r0.get('extra_healthy')} "
+                     f"(train {r0.get('n_extra_train')}, val {r0.get('n_extra_val')}); external = held-out rows")
+        if r0.get("teacher"):
+            L.append(f"   distilled from {r0.get('teacher_backbone')} (alpha={r0.get('kd', {}).get('alpha')})")
+        L.append(f"   head={r0.get('head', {}).get('type', 'linear')}  tta={r0.get('tta', False)}  "
+                 f"phone_aug={r0.get('phone_aug', False)}")
+        L.append(f"\n   {'set':<46}{'MAE (y)':<16}{'r':<16}{'mean gap':<16}{'corrected gap':<16}{'n':>6}")
         for key, label in SETS:
             recs = [by_seed[s].get(key) for s in seeds]
             recs = [x for x in recs if x and x.get("n")]
@@ -100,10 +165,12 @@ def main() -> int:
                 continue
             mae = agg([x["mae"] for x in recs]); r = agg([x["r"] for x in recs])
             g = agg([x["mean_gap"] for x in recs]); gc = agg([x.get("mean_gap_corrected") for x in recs])
-            L.append(f"   {label.format(**names):<40}{fmt(*mae):<16}{fmt(*r, prec=3):<16}{fmt(*g):<16}"
+            L.append(f"   {label.format(**names):<46}{fmt(*mae):<16}{fmt(*r, prec=3):<16}{fmt(*g):<16}"
                      f"{fmt(*gc):<16}{recs[0]['n']:>6}")
         L.append("   (corrected gap: zero-shot / AdaBN rows use the in-domain fit, which is NOT valid on the "
                  "external set; device-calibrated rows use a fit within the external set)")
+        if pooled is not None:
+            L += ensemble_lines(pooled, cond, r0)
         # non-healthy minus healthy corrected gap, per seed then averaged
         deltas = []
         for s in seeds:
@@ -186,28 +253,10 @@ def main() -> int:
         f.write("```\n" + text.strip("\n") + "\n```\n")
     print(f"\n[info] wrote {os.path.join(args.dir, 'summary.md')}")
 
-    if not args.no_pool:
-        frames = []
-        for cond, by_seed in runs.items():
-            for s, r in by_seed.items():
-                pth = r.get("predictions_csv")
-                if pth and os.path.isfile(pth):
-                    df = pd.read_csv(pth); df["condition"] = cond; df["seed"] = s
-                    frames.append(df)
-                else:
-                    print(f"[warn] {cond}_seed{s}: predictions CSV missing ({pth})", file=sys.stderr)
-        if frames:
-            allp = pd.concat(frames, ignore_index=True)
-            num = [c for c in ("pred_age", "gap", "gap_corrected", "pred_age_bnadapt", "gap_bnadapt",
-                               "gap_bnadapt_corrected") if c in allp.columns]
-            keys = ["condition", "dataset", "file"]
-            meta = [c for c in allp.columns if c not in num + keys + ["seed"]]
-            pooled = allp.groupby(keys, as_index=False).agg(
-                **{c: (c, "mean") for c in num}, n_seeds=("seed", "nunique"),
-                **{c: (c, "first") for c in meta})
-            out = os.path.join(args.dir, "predictions_pooled.csv")
-            pooled.to_csv(out, index=False)
-            print(f"[info] wrote {out} ({len(pooled)} rows; per-image mean over seeds)")
+    if pooled is not None:
+        out = os.path.join(args.dir, "predictions_pooled.csv")
+        pooled.to_csv(out, index=False)
+        print(f"[info] wrote {out} ({len(pooled)} rows; per-image mean over seeds)")
     return 0
 
 
