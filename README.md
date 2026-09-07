@@ -181,8 +181,38 @@ b·age` fit on healthy val and subtracted, Beheshti et al. 2019 — the raw gap 
 anti-correlated with age and would confound any disease association). Every
 mBRSET patient is diabetic and the camera differs, so the mBRSET MAE mixes device
 and biology; read the within-mBRSET DR-grade breakdown for the biological part.
-The lab-box launcher has a `retinalage` target (`bash launch_disease_runs.sh
-retinalage`) once the branch is pushed.
+
+The first 3-seed sweep (7 September) gave BRSET healthy-test MAE ≈ 5.1 y with
+tails at 6.0 / 6.5 y, but zero-shot mBRSET MAE ≈ 14 y (worse than predicting
+the mean) and ≈ 9.7 y after AdaBN: the transferred clock reads age on phone
+images at a compressed scale (about 0.5 predicted years per true year) plus an
+offset — the age analogue of the DR operating point not transferring. Two
+answers are built in: every run also reports the external set
+**device-calibrated** (`external_recal`: a linear `age ≈ c + d·pred` fit on the
+external DR-0 patients in two patient-grouped folds, scored out of fold, with
+its own within-set bias correction `gap_recal_corrected` — the gap to use for
+any within-mBRSET association), and `CEILING=1 bash run_retinal_age.sh` adds
+the phone-domain ceiling per seed (the same model trained in-domain on
+mBRSET's DR-0 patients, `--dataset mbrset --healthy dr0`, with BRSET as the
+reverse external set). The lab-box launcher has a `retinalage` target
+(`bash launch_disease_runs.sh retinalage`).
+
+Step 2 — the gap against disease — is `analyze_age_gap.py`, run automatically at
+the end of the sweep and usable on any predictions table:
+
+```bash
+python analyze_age_gap.py --predictions exp_retinal_age/predictions_pooled.csv --brset-csv <BRSET>/labels_brset.csv
+```
+
+Patient-level (both eyes averaged), gradable images only, adjusted for age,
+age², sex and camera: per exposure (diabetes, insulin, any / referable DR,
+edema, BRSET's ophthalmic flags, mBRSET's systemic labels) the adjusted
+difference in corrected gap with 95 % CI, p and BH q, **prevalence by quintile
+of the gap** with the OR per +5 years, the DR-grade trend, the
+diabetes-duration trend, and an image-quality artefact check (ungradable vs
+gradable among disease-free patients). External rows use the device-calibrated,
+within-set-corrected gap; the in-domain correction is never applied across
+devices.
 
 ## Segmentation: GCG vs control
 

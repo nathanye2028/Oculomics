@@ -61,10 +61,29 @@ What is reported
   Following Beheshti et al. (2019), ``gap = a + b*age`` is fit on the healthy
   VAL predictions and subtracted everywhere (``gap_corrected``). Any disease
   association must use the corrected gap; the raw one is age-confounded.
+* **Device calibration of the external set.** The first real sweep showed that
+  a BRSET-trained clock reads age on smartphone images at a compressed scale
+  (about 0.5 predicted years per true year after AdaBN, versus 0.8 in-domain)
+  with an offset — the age equivalent of the DR operating point not
+  transferring. So the external set is also reported *device-calibrated*: a
+  linear map ``age ≈ c + d·pred`` is fit on the external DR-grade-0 patients
+  (``--recal-group``) in two patient-grouped folds, every calibration row is
+  scored by the fold it was not in, and the non-DR-0 rows by the fit on all
+  DR-0 rows. Age labels are free, so this is an honest "calibrated on the
+  target device" number (``external_recal``), and it gets its own bias
+  correction fit within the external set (``gap_recal_corrected``), which is
+  the gap to use for any *within-mBRSET* association. ``--no-recalibrate``
+  turns it off.
 * ``<ckpt-dir>/<run>_predictions.csv`` — one row per scored image (BRSET test,
-  BRSET non-healthy, mBRSET) with age, prediction, raw and corrected gap and
-  the clinical metadata that travels with the row. This is the input to the
-  disease-association step.
+  BRSET non-healthy, mBRSET) with age, prediction, raw / corrected /
+  device-calibrated gap and the clinical metadata that travels with the row.
+  This is the input to the disease-association step.
+
+The in-domain ceiling for the phone domain is the same script trained on
+mBRSET's DR-grade-0 patients (``--dataset mbrset --root <mBRSET> --healthy dr0
+--external-test-root <BRSET> --external-test-dataset brset``;
+``CEILING=1 bash run_retinal_age.sh``): it says whether the phone images carry
+the age signal at all, or whether the transferred model just fails to read it.
 
 Run::
 
@@ -455,6 +474,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--gpu-aug", dest="gpu_aug", action="store_true", default=None)
     p.add_argument("--no-gpu-aug", dest="gpu_aug", action="store_false")
+    p.add_argument("--no-recalibrate", action="store_true",
+                   help="Skip the device-side linear recalibration of the external set.")
+    p.add_argument("--recal-group", default="dr0", choices=["dr0", "all"],
+                   help="External rows the recalibration is fit on (2-fold, patient-grouped).")
     p.add_argument("--bn-adapt", action="store_true",
                    help="AdaBN on the external IMAGES (no labels) -> 'external_bnadapt'.")
     p.add_argument("--bn-adapt-batches", type=int, default=0)
@@ -519,8 +542,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     train_ds, val_ds, sc_ds = mk(tr_df, "train"), mk(va_df, "val"), mk(sc_df, "val")
     ext_ds = mk(ext_df, "val", ext["images_dir"]) if ext_df is not None else None
     if len(train_ds) == 0 or len(val_ds) == 0:
-        raise SystemExit(f"[fatal] empty train ({len(train_ds)}) or val ({len(val_ds)}) after "
-                         f"dropping missing files; check --root / --image-ext.")
+        raise SystemExit(f"[fatal] empty healthy train ({len(train_ds)}) or val ({len(val_ds)}) set: "
+                         f"either the images are missing (check --root / --image-ext; cohort rows "
+                         f"train={len(tr_df)} val={len(va_df)}) or the --healthy {args.healthy} cohort "
+                         f"is too small for a 70/10/20 patient split (see the report above).")
 
     # Standardise the target on the TRAIN ages: the head then starts near the
     # mean instead of having to climb from 0 to ~55 years.
@@ -684,6 +709,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- external (mBRSET), zero-shot ---
     em, em_by_dr, ef = None, None, None
+    er, er_by_dr, rinfo = None, None, None
     if ext_loader is not None:
         ef = score_frame(model, ext_ds, ext_df, ext_loader, device, mean, std)
         ef["gap_corrected"] = bias_apply(ef["age"], ef["gap"], fit)
@@ -691,6 +717,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              ef["age"], ef["pred_age"], fit)
         em_by_dr = _by_dr(ef, fit)
         _print_external(f"EXTERNAL {args.external_test_dataset} (zero-shot)", em, em_by_dr, th)
+        if not args.no_recalibrate:
+            ef, rinfo = recalibrate_external(ef, args.seed, group=args.recal_group)
+            if rinfo is None:
+                print("\n[warn] external recalibration skipped: fewer than 4 calibration "
+                      "patients or constant predictions")
+            else:
+                er, er_by_dr = _recal_metrics(ef, rinfo)
+                _print_recal(args.external_test_dataset, "zero-shot", er, er_by_dr, rinfo, th)
 
     result = {"task": TASK, "seed": args.seed, "backbone": args.backbone,
               "train_dataset": args.dataset, "healthy": args.healthy,
@@ -708,7 +742,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "external": em, "external_by_dr": em_by_dr,
               "n_external": len(ext_ds) if ext_ds is not None else 0,
               "external_bnadapt": None, "external_bnadapt_by_dr": None,
+              "recal_group": args.recal_group if not args.no_recalibrate else None,
+              "external_recal": er, "external_recal_by_dr": er_by_dr, "external_recal_fit": rinfo,
+              "external_bnadapt_recal": None, "external_bnadapt_recal_by_dr": None,
+              "external_bnadapt_recal_fit": None,
               "domain_gap_mae": (em["mae"] - th["mae"]) if em else None,
+              "domain_gap_mae_recal": (er["mae"] - th["mae"]) if er else None,
               "amp": bool(use_amp), "params_m": round(n_params / 1e6, 4),
               "predictions_csv": os.path.abspath(os.path.join(args.ckpt_dir, f"{run_name}_predictions.csv")),
               "args": vars(args)}
@@ -756,10 +795,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             f"({n_bn} BN layers, label-free, transductive)", ema_m, ema_by_dr, th)
             print(f"  BN-adapt effect on MAE: {em['mae']:.2f} -> {ema_m['mae']:.2f}y  "
                   f"delta={ema_m['mae'] - em['mae']:+.2f}  (paired within this run)")
-            ef = ef.merge(ea[["file", "pred_age", "gap", "gap_corrected"]]
-                          .rename(columns={"pred_age": "pred_age_bnadapt", "gap": "gap_bnadapt",
-                                           "gap_corrected": "gap_bnadapt_corrected"}),
-                          on="file", how="left")
+            ea_r, ea_r_by_dr, rinfo_a = None, None, None
+            if not args.no_recalibrate:
+                ea, rinfo_a = recalibrate_external(ea, args.seed, group=args.recal_group)
+                if rinfo_a is not None:
+                    ea_r, ea_r_by_dr = _recal_metrics(ea, rinfo_a)
+                    _print_recal(args.external_test_dataset, "after AdaBN", ea_r, ea_r_by_dr, rinfo_a, th)
+            ren = {"pred_age": "pred_age_bnadapt", "gap": "gap_bnadapt",
+                   "gap_corrected": "gap_bnadapt_corrected",
+                   "pred_age_recal": "pred_age_bnadapt_recal", "gap_recal": "gap_bnadapt_recal",
+                   "gap_recal_corrected": "gap_bnadapt_recal_corrected"}
+            keep = ["file"] + [c for c in ren if c in ea.columns]
+            ef = ef.merge(ea[keep].rename(columns=ren), on="file", how="left")
             ck = torch.load(ckpt, map_location="cpu")
             ck["model_bnadapt"] = {k: v.detach().cpu() for k, v in adapted.state_dict().items()}
             ck["bn_adapt"] = {"dataset": args.external_test_dataset, "root": args.external_test_root,
@@ -767,7 +814,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               "transductive": True, "external_bnadapt": ema_m}
             torch.save(ck, ckpt)
             result.update({"external_bnadapt": ema_m, "external_bnadapt_by_dr": ema_by_dr,
-                           "bn_adapt_transductive": True})
+                           "external_bnadapt_recal": ea_r, "external_bnadapt_recal_by_dr": ea_r_by_dr,
+                           "external_bnadapt_recal_fit": rinfo_a, "bn_adapt_transductive": True})
             write_results()
             write_predictions(ef)
 
@@ -779,7 +827,80 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-def _by_dr(frame: pd.DataFrame, fit) -> Optional[Dict[str, Dict[str, object]]]:
+def recalibrate_external(frame: pd.DataFrame, seed: int, group: str = "dr0",
+                         pred_col: str = "pred_age", suffix: str = "_recal"
+                         ) -> Tuple[pd.DataFrame, Optional[Dict[str, object]]]:
+    """Device-side linear recalibration ``age ≈ c + d·pred`` of an external set.
+
+    Fit on the rows of ``group`` (``dr0``: DR grade 0; ``all``), split into two
+    patient-grouped halves by ``seed``. Every calibration row is mapped by the
+    fit from the *other* half; rows outside the group by the fit on the whole
+    group (they were never fit on). Then a bias correction ``gap = a + b·age``
+    is fit on the out-of-fold calibration rows and applied to every row.
+
+    Adds ``pred_age<suffix>``, ``gap<suffix>``, ``gap<suffix>_corrected`` and
+    ``recal_fold`` (0/1 for calibration rows, -1 otherwise). Returns
+    ``(frame, None)`` untouched when there are fewer than 4 calibration patients
+    or the predictions are constant.
+    """
+    out = frame.copy()
+    use_dr0 = (group == "dr0" and "dr_grade" in out.columns and bool((out["dr_grade"] == 0).any()))
+    pool_mask = (out["dr_grade"] == 0) if use_dr0 else pd.Series(True, index=out.index)
+    pool = out[pool_mask]
+    pats = np.array(sorted(pool["patient"].astype(str).unique()))
+    # A predictor with under 0.1 y of spread carries no age information; fitting
+    # a line through it produces astronomically large, meaningless coefficients.
+    if len(pats) < 4 or not np.isfinite(pool[pred_col].std()) or float(pool[pred_col].std()) < 0.1:
+        return frame, None
+    rng = np.random.default_rng(seed)
+    rng.shuffle(pats)
+    half = set(pats[: len(pats) // 2])
+    in_a = pool["patient"].astype(str).isin(half).to_numpy()
+    a_idx, b_idx = pool.index[in_a], pool.index[~in_a]
+
+    def fit(f: pd.DataFrame) -> Dict[str, float]:
+        d, c = np.polyfit(f[pred_col].to_numpy(np.float64), f["age"].to_numpy(np.float64), 1)
+        return {"c": float(c), "d": float(d), "n": int(len(f))}
+
+    fits = [fit(pool.loc[a_idx]), fit(pool.loc[b_idx])]
+    full = fit(pool)
+    p = out[pred_col].to_numpy(np.float64)
+    rec = full["c"] + full["d"] * p                     # non-calibration rows
+    fold = np.full(len(out), -1)
+    rec[a_idx] = fits[1]["c"] + fits[1]["d"] * p[a_idx]  # A scored by the fit on B
+    rec[b_idx] = fits[0]["c"] + fits[0]["d"] * p[b_idx]
+    fold[a_idx], fold[b_idx] = 0, 1
+    out["pred_age" + suffix] = rec
+    out["gap" + suffix] = rec - out["age"].to_numpy(np.float64)
+    out["recal_fold"] = fold
+    bc = bias_fit(out.loc[pool.index, "age"], out.loc[pool.index, "gap" + suffix])
+    bc["fit_on"] = f"external_{'dr0' if use_dr0 else 'all'}_out_of_fold"
+    out["gap" + suffix + "_corrected"] = bias_apply(out["age"], out["gap" + suffix], bc)
+    info = {"group": "dr0" if use_dr0 else "all", "n_pool": int(len(pool)),
+            "n_pool_patients": int(len(pats)), "folds": fits, "full": full,
+            "bias_correction": bc}
+    return out, info
+
+
+def _recal_metrics(frame: pd.DataFrame, rinfo: Dict[str, object]):
+    bc = rinfo["bias_correction"]
+    m = _with_corrected(regression_metrics(frame["age"], frame["pred_age_recal"], frame["patient"]),
+                        frame["age"], frame["pred_age_recal"], bc)
+    return m, _by_dr(frame, bc, pred_col="pred_age_recal")
+
+
+def _print_recal(ext_name: str, stage: str, er, er_by_dr, rinfo, th) -> None:
+    _print_external(f"EXTERNAL {ext_name} {stage}, DEVICE-CALIBRATED (2-fold linear fit on "
+                    f"{rinfo['group']} patients: n={rinfo['n_pool']}, {rinfo['n_pool_patients']} pts; "
+                    f"every row scored out of fold)", er, er_by_dr, th,
+                    corrected_note="fit within the external set; use THIS gap for within-set associations")
+    print(f"  scale: age ≈ {rinfo['full']['c']:+.1f} + {rinfo['full']['d']:.3f}·pred   "
+          f"(d < 1: the model reads age at a compressed scale on this device; "
+          f"folds d={rinfo['folds'][0]['d']:.3f}/{rinfo['folds'][1]['d']:.3f})")
+
+
+def _by_dr(frame: pd.DataFrame, fit, pred_col: str = "pred_age"
+           ) -> Optional[Dict[str, Dict[str, object]]]:
     """Metrics per DR stratum of an external frame (grade 0 / 1 / referable >=2)."""
     if "dr_grade" not in frame.columns or frame["dr_grade"].isna().all():
         return None
@@ -788,31 +909,39 @@ def _by_dr(frame: pd.DataFrame, fit) -> Optional[Dict[str, Dict[str, object]]]:
     out = {}
     for k, m in groups.items():
         f = frame[m]
-        out[k] = _with_corrected(regression_metrics(f["age"], f["pred_age"], f["patient"]),
-                                 f["age"], f["pred_age"], fit)
+        out[k] = _with_corrected(regression_metrics(f["age"], f[pred_col], f["patient"]),
+                                 f["age"], f[pred_col], fit)
     return out
 
 
-def _print_external(title: str, em: Dict[str, object], by_dr, th: Dict[str, object]) -> None:
+def _print_external(title: str, em: Dict[str, object], by_dr, th: Dict[str, object],
+                    corrected_note: str = "in-domain healthy-val fit; NOT valid within "
+                                          "the external set") -> None:
     print(f"\n=== {title}, n={em['n']}, {em['n_patients']} patients ===")
     print(f"  MAE={em['mae']:.2f}y  RMSE={em['rmse']:.2f}  r={em['r']:.3f}  "
-          f"patient-level MAE={em['patient_mae']:.2f}y  mean gap={em['mean_gap']:+.2f} "
-          f"(corrected {em['mean_gap_corrected']:+.2f})")
+          f"patient-level MAE={em['patient_mae']:.2f}y  mean gap={em['mean_gap']:+.2f}  "
+          f"corrected {em['mean_gap_corrected']:+.2f} ({corrected_note})")
     print(f"  MAE by age bin: {fmt_bins(em['by_bin'])}")
     if th["n"]:
         print(f"  domain gap (external minus in-domain healthy MAE): {em['mae'] - th['mae']:+.2f}y")
     if by_dr:
-        print("  by DR grade (all diabetic; corrected gap is the within-device signal):")
+        print("  by DR grade:")
         for k, m in by_dr.items():
             if m["n"]:
                 print(f"    {k:<10} n={m['n']:<5} MAE={m['mae']:.2f}y  gap={m['mean_gap']:+.2f}  "
                       f"corrected={m['mean_gap_corrected']:+.2f}")
+        d0, dr = by_dr.get("dr0", {}), by_dr.get("referable", {})
+        if d0.get("n") and dr.get("n"):
+            print(f"    referable minus dr0 corrected gap: "
+                  f"{dr['mean_gap_corrected'] - d0['mean_gap_corrected']:+.2f}y  (one seed, descriptive)")
 
 
 def _pred_rows(frame: pd.DataFrame, dataset: str) -> pd.DataFrame:
     cols = ["file", "patient", "split", "cohort", "age", "pred_age", "gap", "gap_corrected"]
     opt = [c for c in META_COLS if c in frame.columns]
-    opt += [c for c in ("pred_age_bnadapt", "gap_bnadapt", "gap_bnadapt_corrected")
+    opt += [c for c in ("pred_age_recal", "gap_recal", "gap_recal_corrected", "recal_fold",
+                        "pred_age_bnadapt", "gap_bnadapt", "gap_bnadapt_corrected",
+                        "pred_age_bnadapt_recal", "gap_bnadapt_recal", "gap_bnadapt_recal_corrected")
             if c in frame.columns]
     out = frame[cols + opt].copy()
     out.insert(0, "dataset", dataset)

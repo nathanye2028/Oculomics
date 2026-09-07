@@ -32,9 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_experiment import paired_stats               # noqa: E402
 from train_retinal_age import AGE_BIN_LABELS          # noqa: E402
 
-SETS = [("test_healthy", "BRSET test, healthy"), ("test_all", "BRSET test, all"),
-        ("test_nonhealthy", "BRSET test, non-healthy"), ("unseen_nonhealthy", "BRSET non-healthy, never trained"),
-        ("external", "mBRSET zero-shot"), ("external_bnadapt", "mBRSET + AdaBN")]
+# (JSON key, label) — {tr} / {ex} are the run's train / external dataset names.
+SETS = [("test_healthy", "{tr} test, healthy"), ("test_all", "{tr} test, all"),
+        ("test_nonhealthy", "{tr} test, non-healthy"), ("unseen_nonhealthy", "{tr} non-healthy, never trained"),
+        ("external", "{ex} zero-shot"), ("external_recal", "{ex} device-calibrated"),
+        ("external_bnadapt", "{ex} + AdaBN"), ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
+BIN_SETS = [("test_healthy", "{tr} test healthy"), ("external", "{ex} zero-shot"),
+            ("external_recal", "{ex} device-calibrated"), ("external_bnadapt", "{ex} + AdaBN"),
+            ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
 
 
 def load(d):
@@ -86,7 +91,8 @@ def main() -> int:
         L.append(f"   cohort: {c.get('n_healthy_images')}/{c.get('n_images')} healthy images, "
                  f"{c.get('n_healthy_patients')}/{c.get('n_patients')} patients; "
                  f"excluded {c.get('exclusions')}")
-        L.append(f"\n   {'set':<36}{'MAE (y)':<16}{'r':<16}{'mean gap':<16}{'corrected gap':<16}{'n':>6}")
+        names = {"tr": r0.get("train_dataset", "train"), "ex": r0.get("external_dataset") or "external"}
+        L.append(f"\n   {'set':<40}{'MAE (y)':<16}{'r':<16}{'mean gap':<16}{'corrected gap':<16}{'n':>6}")
         for key, label in SETS:
             recs = [by_seed[s].get(key) for s in seeds]
             recs = [x for x in recs if x and x.get("n")]
@@ -94,8 +100,10 @@ def main() -> int:
                 continue
             mae = agg([x["mae"] for x in recs]); r = agg([x["r"] for x in recs])
             g = agg([x["mean_gap"] for x in recs]); gc = agg([x.get("mean_gap_corrected") for x in recs])
-            L.append(f"   {label:<36}{fmt(*mae):<16}{fmt(*r, prec=3):<16}{fmt(*g):<16}{fmt(*gc):<16}"
-                     f"{recs[0]['n']:>6}")
+            L.append(f"   {label.format(**names):<40}{fmt(*mae):<16}{fmt(*r, prec=3):<16}{fmt(*g):<16}"
+                     f"{fmt(*gc):<16}{recs[0]['n']:>6}")
+        L.append("   (corrected gap: zero-shot / AdaBN rows use the in-domain fit, which is NOT valid on the "
+                 "external set; device-calibrated rows use a fit within the external set)")
         # non-healthy minus healthy corrected gap, per seed then averaged
         deltas = []
         for s in seeds:
@@ -104,16 +112,34 @@ def main() -> int:
                 deltas.append(a["mean_gap_corrected"] - b["mean_gap_corrected"])
         if deltas:
             m, sd, n = agg(deltas)
-            L.append(f"\n   non-healthy minus healthy corrected gap (BRSET test): {fmt(m, sd, n)} y "
+            L.append(f"\n   non-healthy minus healthy corrected gap ({names['tr']} test): {fmt(m, sd, n)} y "
                      f"over {n} seed(s)  [descriptive; the association step tests this properly]")
+        # within-external DR contrast on the device-calibrated, within-set-corrected gap
+        for key, label in (("external_recal_by_dr", "device-calibrated"),
+                           ("external_bnadapt_recal_by_dr", "AdaBN + device-calibrated")):
+            d = []
+            for s in seeds:
+                bd = by_seed[s].get(key) or {}
+                if bd.get("dr0", {}).get("n") and bd.get("referable", {}).get("n"):
+                    d.append(bd["referable"]["mean_gap_corrected"] - bd["dr0"]["mean_gap_corrected"])
+            if d:
+                m, sd, n = agg(d)
+                L.append(f"   {names['ex']} referable minus DR-0 corrected gap ({label}): {fmt(m, sd, n)} y "
+                         f"over {n} seed(s)")
+        fits = [by_seed[s].get("external_recal_fit") for s in seeds]
+        fits = [x for x in fits if x]
+        if fits:
+            dd = agg([x["full"]["d"] for x in fits]); cc = agg([x["full"]["c"] for x in fits])
+            L.append(f"   device scale on {names['ex']}: age ≈ {fmt(*cc)} + {fmt(*dd, prec=3)}·pred "
+                     f"(fit on {fits[0]['group']}; d < 1 = compressed age reading)")
         # by-age-bin tables
-        for key, label in (("test_healthy", "BRSET test healthy"), ("external", "mBRSET zero-shot"),
-                           ("external_bnadapt", "mBRSET + AdaBN")):
+        for key, label in BIN_SETS:
             recs = [by_seed[s].get(key) for s in seeds]
             recs = [x for x in recs if x and x.get("by_bin")]
             if not recs:
                 continue
-            L.append(f"\n   MAE by age bin — {label} (mean over {len(recs)} seed(s); n from seed {seeds[0]})")
+            L.append(f"\n   MAE by age bin — {label.format(**names)} (mean over {len(recs)} seed(s); "
+                     f"n from seed {seeds[0]})")
             L.append(f"   {'bin':<8}" + "".join(f"{lab:>12}" for lab in AGE_BIN_LABELS))
             L.append(f"   {'n':<8}" + "".join(f"{recs[0]['by_bin'].get(lab, {}).get('n', 0):>12}"
                                               for lab in AGE_BIN_LABELS))
@@ -130,14 +156,20 @@ def main() -> int:
             L.append(f"\n   bias correction gap = a + b*age (fit on healthy val): "
                      f"a={fmt(*a)}  b={fmt(*b, prec=4)}  (a negative b = regression to the mean)")
 
-    # paired condition contrast on MAE (teacher - student etc.)
+    # paired condition contrast on MAE (teacher - student etc.), only between conditions that
+    # train on the same dataset — a ceiling run's "in-domain" is the other dataset.
     conds = sorted(runs)
     if len(conds) >= 2:
         for i in range(len(conds)):
             for j in range(i + 1, len(conds)):
                 a, b = conds[i], conds[j]
-                for key, label in (("test_healthy", "BRSET healthy MAE"), ("external", "mBRSET MAE"),
-                                   ("external_bnadapt", "mBRSET+AdaBN MAE")):
+                ta = {r.get("train_dataset") for r in runs[a].values()}
+                tb = {r.get("train_dataset") for r in runs[b].values()}
+                if ta != tb:
+                    continue
+                for key, label in (("test_healthy", "in-domain healthy MAE"), ("external", "external MAE"),
+                                   ("external_recal", "external device-calibrated MAE"),
+                                   ("external_bnadapt", "external+AdaBN MAE")):
                     da = {s: runs[a][s][key]["mae"] for s in runs[a] if runs[a][s].get(key)}
                     db = {s: runs[b][s][key]["mae"] for s in runs[b] if runs[b][s].get(key)}
                     ps = paired_stats(db, da)

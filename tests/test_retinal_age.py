@@ -12,7 +12,8 @@ import pytest
 from PIL import Image
 
 from train_retinal_age import (AGE_BIN_LABELS, _flag, age_bin, bias_apply, bias_fit,
-                               build_cohort, main, regression_metrics, split_by_patient)
+                               build_cohort, main, recalibrate_external, regression_metrics,
+                               split_by_patient)
 
 
 # ---- flags ------------------------------------------------------------------ #
@@ -127,6 +128,37 @@ def test_bias_correction_removes_age_dependence():
     assert bias_fit([50.0], [3.0]) == {"a": 3.0, "b": 0.0, "n": 1}
 
 
+def test_recalibrate_external_is_out_of_fold_and_restores_scale():
+    rng = np.random.default_rng(5)
+    n = 600
+    age = rng.uniform(30, 85, n)
+    df = pd.DataFrame({"file": [f"{i}.jpg" for i in range(n)], "patient": [f"p{i // 2}" for i in range(n)],
+                       "age": age, "dr_grade": rng.choice([0, 0, 0, 1, 2, 3], n),
+                       "pred_age": 20 + 0.5 * age + rng.normal(0, 2, n)})     # compressed + offset
+    out, info = recalibrate_external(df, seed=0, group="dr0")
+    assert info["group"] == "dr0" and info["n_pool"] == int((df["dr_grade"] == 0).sum())
+    # true inverse map is age = 2*pred - 40; the sd-2 noise on pred attenuates d a little
+    assert 1.75 < info["full"]["d"] < 2.1 and -45 < info["full"]["c"] < -28
+    pool = out[out["dr_grade"] == 0]
+    assert set(pool["recal_fold"]) == {0, 1} and (out.loc[out["dr_grade"] != 0, "recal_fold"] == -1).all()
+    # each calibration fold is mapped by the OTHER fold's fit
+    f = info["folds"]
+    a = pool[pool["recal_fold"] == 0]
+    np.testing.assert_allclose(a["pred_age_recal"], f[1]["c"] + f[1]["d"] * a["pred_age"], atol=1e-9)
+    # patients never straddle folds
+    assert not (set(a["patient"]) & set(pool.loc[pool["recal_fold"] == 1, "patient"]))
+    # recalibrated MAE is near the noise floor (2 y / 0.5 -> 4 y), raw MAE is far worse
+    assert np.abs(out["gap_recal"]).mean() < 5.5 < np.abs(out["pred_age"] - out["age"]).mean()
+    assert abs(np.corrcoef(pool["age"], pool["gap_recal_corrected"])[0, 1]) < 0.1
+    assert {"pred_age_recal", "gap_recal", "gap_recal_corrected"} <= set(out.columns)
+    # too few calibration patients -> untouched
+    same, none = recalibrate_external(df.head(4), seed=0)
+    assert none is None and "pred_age_recal" not in same.columns
+    # no DR column -> falls back to all rows
+    _, info2 = recalibrate_external(df.drop(columns=["dr_grade"]), seed=0)
+    assert info2["group"] == "all" and info2["n_pool"] == n
+
+
 # ---- end to end -------------------------------------------------------------- #
 def _fundus(rng, path, age):
     a = np.zeros((72, 80, 3), np.uint8)
@@ -135,7 +167,7 @@ def _fundus(rng, path, age):
     Image.fromarray(a).save(path)
 
 
-def _make_trees(tmp_path, n_pat=40, n_ext=24):
+def _make_trees(tmp_path, n_pat=40, n_ext=320):
     rng = np.random.default_rng(0)
     B = tmp_path / "BRSET"; (B / "fundus_photos").mkdir(parents=True)
     rows = []
@@ -157,13 +189,25 @@ def _make_trees(tmp_path, n_pat=40, n_ext=24):
         age = int(rng.integers(30, 80))
         _fundus(rng, M / "images" / f"{i//2}.{i%2+1}.jpg", age)
         rows.append(dict(file=f"{i//2}.{i%2+1}.jpg", patient=i // 2, age=age, sex=int(rng.integers(0, 2)),
-                         final_icdr=int(rng.integers(0, 4)), final_quality="yes" if i % 9 else "no",
+                         final_icdr=int(rng.choice([0, 0, 0, 0, 0, 1, 2, 3])), final_quality="yes" if i % 9 else "no",
                          final_edema="no", systemic_hypertension="yes" if i % 3 == 0 else "no"))
     pd.DataFrame(rows).to_csv(M / "labels_mbrset.csv", index=False)
     return str(B), str(M)
 
 
-def test_end_to_end_smoke(tmp_path):
+def _fake_predict(model, loader, device, mean, std):
+    """Stand-in for train_retinal_age.predict: a compressed, offset, noisy reading of the
+    TRUE ages (20 + 0.5*age), so the plumbing — selection, scoring, bias correction,
+    device calibration, tables — is exercised deterministically instead of depending on
+    what a from-scratch model learns in one epoch on 64 px noise."""
+    ages = loader.dataset.labels.numpy().astype(np.float64)
+    rng = np.random.default_rng(int(ages.sum()) % 100003)
+    return 20.0 + 0.5 * ages + rng.normal(0, 1.0, len(ages))
+
+
+def test_end_to_end_smoke(tmp_path, monkeypatch):
+    import train_retinal_age
+    monkeypatch.setattr(train_retinal_age, "predict", _fake_predict)
     B, M = _make_trees(tmp_path)
     ck = tmp_path / "ck"; out = tmp_path / "exp"
     common = ["--root", B, "--external-test-root", M, "--image-size", "64", "--backbone", "mobilenetv3_small",
@@ -177,8 +221,15 @@ def test_end_to_end_smoke(tmp_path):
     r = json.load(open(out / "student_seed0.json"))
     assert r["task"] == "retinal_age" and r["healthy"] == "nodm"
     assert r["cohort"]["n_healthy_images"] < r["cohort"]["n_images"]
-    for k in ("val", "test_healthy", "test_all", "external", "external_bnadapt", "bias_correction"):
+    for k in ("val", "test_healthy", "test_all", "external", "external_bnadapt", "bias_correction",
+              "external_recal", "external_recal_by_dr", "external_recal_fit",
+              "external_bnadapt_recal", "external_bnadapt_recal_fit"):
         assert r[k] is not None, k
+    assert r["external_recal_fit"]["group"] == "dr0" and r["external_recal"]["n"] == r["external"]["n"]
+    assert r["external_recal_fit"]["bias_correction"]["fit_on"] == "external_dr0_out_of_fold"
+    # the stub reads age at half scale; calibration must undo that and cut the external MAE
+    assert 1.6 < r["external_recal_fit"]["full"]["d"] < 2.4
+    assert r["external_recal"]["mae"] < r["external"]["mae"] and r["external_recal"]["mae"] < 5.0
     assert r["test_healthy"]["n"] > 0 and r["external"]["n"] > 0
     assert set(r["test_healthy"]["by_bin"]) == set(AGE_BIN_LABELS)
     assert r["external_by_dr"] and set(r["external_by_dr"]) == {"dr0", "dr1", "referable"}
@@ -195,6 +246,12 @@ def test_end_to_end_smoke(tmp_path):
     ext = pr[pr["dataset"] == "mbrset"]
     assert ext["pred_age_bnadapt"].notna().all() and ext["gap_corrected"].notna().all()
     assert len(ext) == r["external"]["n"]
+    for c in ("pred_age_recal", "gap_recal", "gap_recal_corrected", "recal_fold",
+              "pred_age_bnadapt_recal", "gap_bnadapt_recal_corrected"):
+        assert ext[c].notna().all(), c
+    assert set(ext.loc[ext["dr_grade"] == 0, "recal_fold"]) <= {0, 1}
+    assert (ext.loc[ext["dr_grade"] != 0, "recal_fold"] == -1).all()
+    assert br["pred_age_recal"].isna().all()                  # calibration is external-only
     # gap_corrected = gap - (a + b*age) row by row
     fit = r["bias_correction"]
     np.testing.assert_allclose(pr["gap_corrected"], pr["gap"] - (fit["a"] + fit["b"] * pr["age"]), atol=1e-6)
@@ -210,3 +267,19 @@ def test_end_to_end_smoke(tmp_path):
     assert "MAE by age bin" in res.stdout and (out / "summary.md").exists()
     pooled = pd.read_csv(out / "predictions_pooled.csv")
     assert pooled["n_seeds"].max() == 2 and {"condition", "dataset", "file", "pred_age"} <= set(pooled.columns)
+    assert "gap_recal_corrected" in pooled.columns
+
+    # the ceiling direction: train on mBRSET DR-0 patients, external = BRSET (as CEILING=1 does)
+    rc = main(common + ["--dataset", "mbrset", "--root", M, "--external-test-root", B,
+                        "--external-test-dataset", "brset", "--healthy", "dr0", "--seed", "0",
+                        "--run-name", "ceiling_seed0", "--results-json", str(out / "ceiling_seed0.json")])
+    assert rc == 0
+    c = json.load(open(out / "ceiling_seed0.json"))
+    assert c["train_dataset"] == "mbrset" and c["external_dataset"] == "brset" and c["healthy"] == "dr0"
+    assert c["test_healthy"]["n"] > 0 and c["external"]["n"] > 0 and c["external_recal"] is not None
+    res = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                                       "summarize_retinal_age.py"), "--dir", str(out)],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert "## ceiling" in res.stdout and "device-calibrated" in res.stdout
+    assert "paired ceiling" not in res.stdout                  # different train set: never paired
