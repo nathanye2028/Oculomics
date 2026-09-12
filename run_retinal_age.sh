@@ -61,6 +61,9 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
     STUDENT        backbone (default timm:mobilenetv4_conv_small.e2400_r224_in1k)
     TEACHER        optional large backbone trained on the same split ("" = skip)
     TEACHER_LR     teacher learning rate                          (default 1e-4)
+    TEACHER_EXTRA  extra flags for the teacher only, e.g. "--batch-size 8" at 512 px
+                   (ConvNeXt-S at 512 px and batch 32 needs ~2x the 384 px DR runs; the
+                   lab box's GPUs have 11.6 GiB)
     SIZE           image size                                     (default 384)
     EPOCHS         epochs per run                                 (default 30)
     LOSS           l1 | huber | mse                               (default l1)
@@ -76,6 +79,11 @@ for a in "$@"; do case "$a" in -h|--help) usage; exit 0;; esac; done
 
 cd "$(dirname "$0")"
 export PYTHONUNBUFFERED=1
+# The lab box's cards are ~12 GB: the trainer probes one training step at start-up and
+# halves the batch (doubling gradient accumulation, same effective batch) until it fits,
+# and skips a batch if a neighbour grabs memory mid-run (--auto-batch, on by default on
+# CUDA). Still: one job per GPU. TEACHER_EXTRA="--batch-size 8" pre-empts the probe.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 : "${B:?set B=<BRSET root> (dir holding fundus_photos/ + labels_brset.csv); see --help}"
 : "${M:?set M=<mBRSET root> (dir holding images/ + labels_mbrset.csv); see --help}"
@@ -99,6 +107,7 @@ CK=${CK:-ck_retinal_age}
 STUDENT=${STUDENT:-timm:mobilenetv4_conv_small.e2400_r224_in1k}
 TEACHER=${TEACHER:-}
 TEACHER_LR=${TEACHER_LR:-1e-4}
+TEACHER_EXTRA=${TEACHER_EXTRA:-}
 SIZE=${SIZE:-384}
 EPOCHS=${EPOCHS:-30}
 LOSS=${LOSS:-l1}
@@ -153,7 +162,8 @@ run() {  # run <name> <flags...>
 for s in "${SEEDS[@]}"; do
   run "student${TAG}_seed$s" --seed "$s" --backbone "$STUDENT"
   if [ -n "$TEACHER" ]; then
-    run "teacher${TAG}_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR"
+    # shellcheck disable=SC2086
+    run "teacher${TAG}_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR" $TEACHER_EXTRA
     if [ "$KD" = 1 ]; then
       tpt="$CK/teacher${TAG}_seed$s.pt"
       if [ -f "$tpt" ] && [ -f "$CK/teacher${TAG}_seed$s.done" ]; then

@@ -110,7 +110,7 @@ def ensemble_lines(pooled, cond, r0):
         if len(f) < 2:
             return
         err = np.abs(f[col] - f["age"]); r = np.corrcoef(f["age"], f[col])[0, 1]
-        out.append(f"   {label:<46}{err.mean():<16.2f}{r:<16.3f}{'':<32}{len(f):>6}")
+        out.append(f"   {label:<42}{err.mean():<15.2f}{r:<15.3f}{'':<30}{len(f):>6}")
 
     line(f"{tr} test, healthy", d[(d["dataset"] == tr) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
     if xt:
@@ -157,7 +157,7 @@ def main() -> int:
             L.append(f"   distilled from {r0.get('teacher_backbone')} (alpha={r0.get('kd', {}).get('alpha')})")
         L.append(f"   head={r0.get('head', {}).get('type', 'linear')}  tta={r0.get('tta', False)}  "
                  f"phone_aug={r0.get('phone_aug', False)}")
-        L.append(f"\n   {'set':<46}{'MAE (y)':<16}{'r':<16}{'mean gap':<16}{'corrected gap':<16}{'n':>6}")
+        L.append(f"\n   {'set':<42}{'MAE (y)':<15}{'r':<15}{'mean gap':<15}{'corrected gap':<15}{'n':>6}")
         for key, label in SETS:
             recs = [by_seed[s].get(key) for s in seeds]
             recs = [x for x in recs if x and x.get("n")]
@@ -165,8 +165,8 @@ def main() -> int:
                 continue
             mae = agg([x["mae"] for x in recs]); r = agg([x["r"] for x in recs])
             g = agg([x["mean_gap"] for x in recs]); gc = agg([x.get("mean_gap_corrected") for x in recs])
-            L.append(f"   {label.format(**names):<46}{fmt(*mae):<16}{fmt(*r, prec=3):<16}{fmt(*g):<16}"
-                     f"{fmt(*gc):<16}{recs[0]['n']:>6}")
+            L.append(f"   {label.format(**names):<42}{fmt(*mae):<15}{fmt(*r, prec=3):<15}{fmt(*g):<15}"
+                     f"{fmt(*gc):<15}{recs[0]['n']:>6}")
         L.append("   (corrected gap: zero-shot / AdaBN rows use the in-domain fit, which is NOT valid on the "
                  "external set; device-calibrated rows use a fit within the external set)")
         if pooled is not None:
@@ -230,8 +230,10 @@ def main() -> int:
         for i in range(len(conds)):
             for j in range(i + 1, len(conds)):
                 a, b = conds[i], conds[j]
-                ta = {r.get("train_dataset") for r in runs[a].values()}
-                tb = {r.get("train_dataset") for r in runs[b].values()}
+                # same training data means same primary set AND same mixed-in set: a *_mix run's
+                # external rows are a different population from a plain run's
+                ta = {(r.get("train_dataset"), r.get("extra_dataset")) for r in runs[a].values()}
+                tb = {(r.get("train_dataset"), r.get("extra_dataset")) for r in runs[b].values()}
                 if ta != tb:
                     continue
                 for key, label in (("test_healthy", "in-domain healthy MAE"), ("external", "external MAE"),

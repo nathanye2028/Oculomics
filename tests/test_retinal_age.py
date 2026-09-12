@@ -335,8 +335,24 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert l["head"]["type"] == "ldl" and len(l["head"]["centers"]) > 10 and l["tta"] and l["phone_aug"]
     ck_l = torch.load(ck / "ldl_seed0.pt", map_location="cpu")
     assert ck_l["head"]["type"] == "ldl" and "target_norm" in ck_l
-    assert main(common + ["--seed", "0", "--run-name", "teacher_seed0",
+    # teacher run with gradient accumulation and one injected CUDA-style OOM on the first
+    # training batch: the run must skip that batch, finish, and record the skip
+    import train_retinal_age as tra
+    real_step = tra.train_step
+    calls = {"n": 0}
+
+    def flaky_step(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise tra._OOM("CUDA out of memory (injected)")
+        return real_step(*a, **k)
+    monkeypatch.setattr(tra, "train_step", flaky_step)
+    assert main(common + ["--seed", "0", "--run-name", "teacher_seed0", "--grad-accum", "2",
                           "--results-json", str(out / "teacher_seed0.json")]) == 0
+    monkeypatch.setattr(tra, "train_step", real_step)
+    t = json.load(open(out / "teacher_seed0.json"))
+    assert t["oom_skips"] == 1 and t["grad_accum_used"] == 2 and t["batch_size_used"] == 8
+    assert calls["n"] > 2
     rc = main(common + ["--seed", "0", "--run-name", "kd_seed0", "--teacher", str(ck / "teacher_seed0.pt"),
                         "--kd-alpha", "0.5", "--distill-feat-weight", "0.1",
                         "--results-json", str(out / "kd_seed0.json")])

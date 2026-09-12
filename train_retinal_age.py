@@ -610,6 +610,64 @@ def cohort_report(df: pd.DataFrame, split: Optional[pd.Series], healthy: str, ti
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+_OOM = getattr(torch, "OutOfMemoryError", getattr(torch.cuda, "OutOfMemoryError", RuntimeError))
+
+
+def train_step(model, teacher, proj, x, y, age_loss, mean, std, args, use_amp, amp_dtype, device):
+    """One forward/backward-ready loss for a micro-batch (returned un-scaled). Kept as a
+    function so a CUDA OOM raised inside releases every intermediate when it unwinds."""
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        years, out, feat = model.forward_with_feat(x)
+        t_years = t_feat = None
+        if teacher is not None:
+            with torch.no_grad():
+                t_years, _, t_feat = teacher.forward_with_feat(x)
+    loss = age_loss(years, out, y)                                   # fp32, outside autocast
+    if teacher is not None:
+        kd = F.l1_loss((years.float() - mean) / std, (t_years.float() - mean) / std)
+        loss = (1.0 - args.kd_alpha) * loss + args.kd_alpha * kd
+        if proj is not None:
+            cosd = F.cosine_similarity(proj(feat.float()), t_feat.float(), dim=1)
+            loss = loss + args.distill_feat_weight * (1.0 - cosd).mean()
+    return loss
+
+
+def fits_in_memory(model, teacher, proj, opt, bs, image_size, device, age_loss, mean, std, args,
+                   use_amp, amp_dtype, use_cl) -> Tuple[bool, float]:
+    """Run one full training step (forward, backward, optimizer state allocation) on a
+    random batch of ``bs`` and report (fits, peak GiB). lr is set to 0 for the probe step
+    and the optimizer state cleared afterwards, so weights and Adam moments are untouched;
+    the RNG is forked so the training stream is unchanged."""
+    if device.type != "cuda":
+        return True, 0.0
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    lrs = [g["lr"] for g in opt.param_groups]
+    ok = True
+    try:
+        with torch.random.fork_rng(devices=[device]):
+            x = torch.rand(bs, 3, image_size, image_size, device=device)
+            if use_cl:
+                x = x.to(memory_format=torch.channels_last)
+            y = torch.full((bs,), float(mean), device=device)
+            for g in opt.param_groups:
+                g["lr"] = 0.0
+            model.train()
+            loss = train_step(model, teacher, proj, x, y, age_loss, mean, std, args, use_amp, amp_dtype, device)
+            loss.backward()
+            opt.step()
+    except _OOM:
+        ok = False
+    finally:
+        for g, lr in zip(opt.param_groups, lrs):
+            g["lr"] = lr
+        opt.zero_grad(set_to_none=True)
+        opt.state.clear()
+        torch.cuda.empty_cache()
+    peak = torch.cuda.max_memory_allocated(device) / 2 ** 30
+    return ok, peak
+
+
 class Domain:
     """One training dataset: cohort, patient split, the frames that are trained on
     (healthy train / val) and the frame that is only ever scored (test partition
@@ -744,6 +802,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup-epochs", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--ema-decay", type=float, default=0.0)
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Micro-batches per optimizer step (effective batch = batch-size x this).")
+    p.add_argument("--auto-batch", dest="auto_batch", action="store_true", default=None,
+                   help="CUDA default: probe one training step at --batch-size and halve the batch "
+                        "(doubling --grad-accum) until it fits the card. Same effective batch.")
+    p.add_argument("--no-auto-batch", dest="auto_batch", action="store_false")
+    p.add_argument("--max-oom-skips", type=int, default=20,
+                   help="Training batches that may be skipped after a mid-run CUDA OOM (a neighbour "
+                        "grabbing memory) before the run is abandoned.")
     p.add_argument("--amp", dest="amp", action="store_true", default=None)
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--nondeterministic", action="store_true")
@@ -869,7 +936,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.age_balance or (extra is not None and args.extra_weight != 1.0):
         sampler = WeightedRandomSampler(torch.as_tensor(w / w.sum(), dtype=torch.double),
                                         num_samples=len(train_ds), replacement=True, generator=g)
-    train_loader = dl(train_ds, sampler=sampler, shuffle=(sampler is None), drop_last=True)
 
     centers = None
     if args.head == "ldl":
@@ -932,6 +998,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         milestones=[warm]) if warm > 0 else cos)
     csv_log = CSVLogger(os.path.join(args.ckpt_dir, f"{run_name}_metrics.csv"))
 
+    # --- fit the batch to the card: probe, halve + accumulate until one step succeeds ---
+    bs, accum = int(args.batch_size), max(1, int(args.grad_accum))
+    auto_batch = args.auto_batch if args.auto_batch is not None else (device.type == "cuda")
+    peak_probe = 0.0
+    if auto_batch:
+        while True:
+            ok, peak_probe = fits_in_memory(model, teacher, proj, opt, bs, args.image_size, device, age_loss,
+                                            mean, std, args, use_amp, amp_dtype, use_cl)
+            if ok:
+                break
+            if bs < 8:
+                raise SystemExit(f"[fatal] a training step does not fit this GPU even at batch {bs} "
+                                 f"({args.backbone} @ {args.image_size}px); lower --image-size or free the card.")
+            print(f"[warn] batch {bs} @ {args.image_size}px does not fit the GPU; trying {bs // 2} "
+                  f"with grad-accum x2 (same effective batch)")
+            bs //= 2; accum *= 2
+        total_gb = torch.cuda.get_device_properties(device).total_memory / 2 ** 30
+        print(f"[info] batch  : {bs} x accum {accum} (effective {bs * accum}); probe peak "
+              f"{peak_probe:.1f} of {total_gb:.1f} GiB")
+    train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler, shuffle=(sampler is None),
+                              drop_last=True, num_workers=args.num_workers, worker_init_fn=seed_worker,
+                              generator=g, pin_memory=(device.type == "cuda"),
+                              persistent_workers=(args.num_workers > 0))
+    oom_skips = 0
+
     def eval_split(m, dom: Domain):
         sf = score_frame(m, dom.val_ds, dom.va, dom.val_loader, device)
         return regression_metrics(sf["age"], sf["pred_age"], sf["patient"]), sf
@@ -943,9 +1034,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     best_mae, best_epoch, since = float("inf"), -1, 0
     print(f"\n=== training up to {args.epochs} epochs (healthy val MAE selects best"
           f"{', pooled over both domains' if extra is not None else ''}) ===")
+    def optimizer_step():
+        scaler.step(opt); scaler.update()
+        opt.zero_grad(set_to_none=True)
+        if ema is not None:
+            ema.update(model)
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        run, nb, t_ep = 0.0, 0, time.time()
+        run, nb, micro, t_ep = 0.0, 0, 0, time.time()
+        opt.zero_grad(set_to_none=True)
         for batch in train_loader:
             x = batch["image"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
@@ -953,28 +1051,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 x = dev_aug(x)
             if use_cl:
                 x = x.to(memory_format=torch.channels_last)
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                years, out, feat = model.forward_with_feat(x)
-                if teacher is not None:
-                    with torch.no_grad():
-                        t_years, _, t_feat = teacher.forward_with_feat(x)
-            loss = age_loss(years, out, y)                          # fp32, outside autocast
-            if teacher is not None:
-                kd = F.l1_loss((years.float() - mean) / std, (t_years.float() - mean) / std)
-                loss = (1.0 - args.kd_alpha) * loss + args.kd_alpha * kd
-                if proj is not None:
-                    cosd = F.cosine_similarity(proj(feat.float()), t_feat.float(), dim=1)
-                    loss = loss + args.distill_feat_weight * (1.0 - cosd).mean()
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
-            if ema is not None:
-                ema.update(model)
-            run = run + loss.detach(); nb += 1
+            try:
+                loss = train_step(model, teacher, proj, x, y, age_loss, mean, std, args, use_amp, amp_dtype, device)
+                scaler.scale(loss / accum).backward()
+            except _OOM:
+                # A neighbour on the card took memory mid-run: drop this micro-batch (and the
+                # partial accumulation), free what we hold, carry on. Bounded, then fatal.
+                oom_skips += 1
+                opt.zero_grad(set_to_none=True); micro = 0
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(f"  [warn] CUDA OOM on a training batch (skip {oom_skips}/{args.max_oom_skips}); "
+                      f"another process may be using this GPU", flush=True)
+                if oom_skips > args.max_oom_skips:
+                    raise SystemExit(f"[fatal] {oom_skips} training batches lost to CUDA OOM; free the "
+                                     f"GPU or lower --batch-size / --image-size and rerun (the sweep resumes).")
+                continue
+            micro += 1; nb += 1
+            run = run + loss.detach()
+            if micro == accum:
+                optimizer_step(); micro = 0
             if args.log_every and nb % args.log_every == 0:
                 el = time.time() - t_ep
                 print(f"    step {nb}/{len(train_loader)}  loss={float(run)/nb:.4f}  "
-                      f"{nb*args.batch_size/el:.0f} img/s  ({el:.0f}s)", flush=True)
+                      f"{nb*bs/el:.0f} img/s  ({el:.0f}s)", flush=True)
+        if micro:                                   # leftover micro-batches at the epoch end
+            optimizer_step()
         run = float(run) / max(nb, 1)
         eval_model = ema.ema if ema is not None else model
         vm_p, _ = eval_split(eval_model, prim)
@@ -991,9 +1093,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tag = "  <- best"
         else:
             since += 1
+        mem = (f"  peak {torch.cuda.max_memory_allocated(device) / 2 ** 30:.1f}GiB"
+               if (epoch == 1 and device.type == "cuda") else "")
         print(f"  epoch {epoch:3d}/{args.epochs}  loss={run:.4f}  val_MAE={vm_p['mae']:.2f}y"
               + (f"/{vm_e['mae']:.2f}y" if vm_e else "") + f"  r={vm_p['r']:.3f}  "
-              f"gap={vm_p['mean_gap']:+.2f}  [{time.time()-t_ep:.0f}s]{tag}", flush=True)
+              f"gap={vm_p['mean_gap']:+.2f}  [{time.time()-t_ep:.0f}s]{mem}{tag}", flush=True)
         csv_log.log({"epoch": epoch, "train_loss": round(run, 5), "val_mae_pooled": round(sel, 5),
                      **{f"val_{k}": round(v, 5) for k, v in vm_p.items()
                         if isinstance(v, float) and k != "n"}})
@@ -1093,6 +1197,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "teacher_backbone": t_args.get("backbone") if args.teacher else None,
               "kd": ({"alpha": args.kd_alpha, "feat_weight": args.distill_feat_weight} if args.teacher else None),
               "amp": bool(use_amp), "params_m": round(n_params / 1e6, 4),
+              "batch_size_used": bs, "grad_accum_used": accum, "oom_skips": oom_skips,
+              "peak_gpu_gib": (round(torch.cuda.max_memory_allocated(device) / 2 ** 30, 2)
+                               if device.type == "cuda" else None),
               "predictions_csv": os.path.abspath(os.path.join(args.ckpt_dir, f"{run_name}_predictions.csv")),
               "args": vars(args)}
 
