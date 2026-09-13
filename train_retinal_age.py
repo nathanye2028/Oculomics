@@ -416,13 +416,20 @@ class RetinalAgeModel(nn.Module):
     """
 
     def __init__(self, backbone: str, image_size: int, head: str = "linear", centers=None,
-                 mean: float = 0.0, std: float = 1.0, dropout: float = 0.2, pretrained: bool = True):
+                 mean: float = 0.0, std: float = 1.0, dropout: float = 0.2, pretrained: bool = True,
+                 gcg: str = "off"):
         super().__init__()
         self.head_type = head
         self.backbone_name = backbone
         self.image_size = int(image_size)
-        kw = dict(pretrained=pretrained, use_gcg=False, dropout=dropout, backbone=backbone,
-                  backbone_kwargs=backbone_kwargs_for(backbone, image_size))
+        self.gcg = gcg or "off"
+        if self.gcg != "off" and backbone != "mobilenetv3_small":
+            raise ValueError(f"GCG ({self.gcg}) is a MobileNetV3-specific mid/deep gate; backbone "
+                             f"{backbone!r} cannot carry it. Use --backbone mobilenetv3_small for the "
+                             f"gcg arm (and its ctrl arm), or --gcg off.")
+        kw = dict(pretrained=pretrained, use_gcg=(self.gcg != "off"),
+                  gcg_variant=(self.gcg if self.gcg != "off" else "baseline"), dropout=dropout,
+                  backbone=backbone, backbone_kwargs=backbone_kwargs_for(backbone, image_size))
         if head == "ldl":
             if centers is None or len(centers) < 2:
                 raise ValueError("head='ldl' needs at least two bin centres")
@@ -460,7 +467,8 @@ class RetinalAgeModel(nn.Module):
         return torch.stack([self.years_from(self.net(v)) for v in views], 0).mean(0)
 
     def head_spec(self) -> Dict[str, object]:
-        return {"type": self.head_type, "centers": self.centers.tolist() if self.n_bins else None}
+        return {"type": self.head_type, "centers": self.centers.tolist() if self.n_bins else None,
+                "gcg": self.gcg}
 
 
 def ldl_centers(lo: float, hi: float, step: float = 1.0) -> np.ndarray:
@@ -527,6 +535,30 @@ def make_train_transform(image_size: int, phone_aug: bool, cpu_full: bool):
     return T.Compose(ops)
 
 
+def load_age_model(path: str, device, bn_stats: str = "source"):
+    """Rebuild a train_retinal_age.py checkpoint. ``bn_stats="adapted"`` loads the
+    AdaBN weights saved as ``model_bnadapt`` when the run used --bn-adapt.
+    Returns (model in eval mode, checkpoint dict)."""
+    ck = torch.load(path, map_location="cpu")
+    if ck.get("task") != TASK:
+        raise SystemExit(f"[fatal] {path} is a {ck.get('task')!r} checkpoint, not {TASK!r}")
+    a = ck.get("args", {})
+    head = ck.get("head") or {"type": "linear", "centers": None}
+    tn = ck["target_norm"]
+    m = RetinalAgeModel(a["backbone"], int(a.get("image_size", 384)), head["type"], head.get("centers"),
+                        tn["mean"], tn["std"], dropout=float(a.get("dropout", 0.2)), pretrained=False,
+                        gcg=head.get("gcg", a.get("gcg", "off")))
+    key = "model"
+    if bn_stats == "adapted":
+        if "model_bnadapt" not in ck:
+            raise SystemExit(f"[fatal] {path} has no 'model_bnadapt' weights (run used no --bn-adapt)")
+        key = "model_bnadapt"
+    m.net.load_state_dict(ck[key])
+    m.tta = bool(a.get("tta", False))
+    m.eval().to(device)
+    return m, ck
+
+
 def load_age_teacher(path: str, device, dataset: str, root: str, extra_root: Optional[str] = None):
     """Rebuild a train_retinal_age.py checkpoint as a frozen teacher.
 
@@ -544,12 +576,8 @@ def load_age_teacher(path: str, device, dataset: str, root: str, extra_root: Opt
         print(f"[warn] teacher root {a['root']} != student root {root}")
     if bool(a.get("extra_train_root")) != bool(extra_root):
         print("[warn] teacher and student differ in mixed-domain training (--extra-train-root)")
-    head = ck.get("head") or {"type": "linear", "centers": None}
-    tn = ck["target_norm"]
-    t = RetinalAgeModel(a["backbone"], int(a.get("image_size", 384)), head["type"], head.get("centers"),
-                        tn["mean"], tn["std"], dropout=float(a.get("dropout", 0.2)), pretrained=False)
-    t.net.load_state_dict(ck["model"])
-    t.eval().to(device)
+    t, _ = load_age_model(path, device)
+    t.tta = False                                   # the teacher scores the same augmented batch, 1x
     for q in t.parameters():
         q.requires_grad_(False)
     return t, a, ck.get("val", {})
@@ -772,7 +800,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sampling weight multiplier for the extra dataset's training images.")
     # model / recipe
     p.add_argument("--backbone", default="timm:mobilenetv4_conv_small.e2400_r224_in1k",
-                   help="mobilenetv3_small or timm:<name>. GCG is not used for this task.")
+                   help="mobilenetv3_small or timm:<name> (e.g. timm:mobilenetv4_conv_medium.e500_r256_in1k).")
+    p.add_argument("--gcg", default="off", choices=["off", "baseline", "attention", "cbam", "se"],
+                   help="Guided Context Gating on the stride-16 feature; mobilenetv3_small only. "
+                        "'baseline' is the project's GCG block, the others its ablation variants.")
     p.add_argument("--image-size", type=int, default=384)
     p.add_argument("--head", default="linear", choices=["linear", "ldl"],
                    help="linear: one standardised output. ldl: label distribution over age bins.")
@@ -942,8 +973,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         lo = args.ldl_min if args.ldl_min is not None else np.floor(ages.min()) - 2
         hi = args.ldl_max if args.ldl_max is not None else np.ceil(ages.max()) + 2
         centers = ldl_centers(lo, hi, args.ldl_step)
-    model = RetinalAgeModel(args.backbone, args.image_size, args.head, centers, mean, std,
-                            dropout=args.dropout, pretrained=not args.no_pretrained).to(device)
+    try:
+        model = RetinalAgeModel(args.backbone, args.image_size, args.head, centers, mean, std,
+                                dropout=args.dropout, pretrained=not args.no_pretrained, gcg=args.gcg).to(device)
+    except ValueError as e:
+        raise SystemExit(f"[fatal] {e}")
     model.tta = bool(args.tta)
     use_cl = device.type == "cuda" and args.nondeterministic
     if use_cl:
@@ -951,7 +985,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_params = sum(q.numel() for q in model.parameters())
     print(f"[info] model  : {args.backbone}, {n_params/1e6:.3f}M params, head={args.head}"
           + (f" ({model.n_bins} bins of {args.ldl_step}y, sigma={args.ldl_sigma})" if args.head == "ldl" else "")
-          + (f"  tta={'on' if args.tta else 'off'}"))
+          + (f"  tta={'on' if args.tta else 'off'}") + (f"  gcg={args.gcg}" if args.gcg != "off" else ""))
 
     teacher, proj, t_args = None, None, {}
     if args.teacher:
@@ -1163,6 +1197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _print_recal(ext_name, "zero-shot" if not held_out else "held-out", er, er_by_dr, rinfo, th)
 
     result = {"task": TASK, "seed": args.seed, "backbone": args.backbone, "head": model.head_spec(),
+              "gcg": args.gcg,
               "tta": bool(args.tta), "phone_aug": bool(args.phone_aug),
               "train_dataset": args.dataset, "healthy": args.healthy,
               "exclude_pathology": args.exclude_pathology,

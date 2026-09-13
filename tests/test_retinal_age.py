@@ -178,7 +178,7 @@ def test_retinal_age_model_heads_and_tta():
     lin = RetinalAgeModel("mobilenetv3_small", 64, "linear", None, mean=50.0, std=15.0, pretrained=False).eval()
     y, out, feat = lin.forward_with_feat(x)
     assert y.shape == (2,) and out.shape == (2,) and feat.shape[0] == 2
-    assert torch.allclose(y, out * 15.0 + 50.0) and lin.head_spec() == {"type": "linear", "centers": None}
+    assert torch.allclose(y, out * 15.0 + 50.0) and lin.head_spec() == {"type": "linear", "centers": None, "gcg": "off"}
     ldl = RetinalAgeModel("mobilenetv3_small", 64, "ldl", ldl_centers(20, 90), pretrained=False).eval()
     y, out, _ = ldl.forward_with_feat(x)
     assert out.shape == (2, 71) and (y >= 20).all() and (y <= 90).all() and ldl.n_bins == 71
@@ -193,6 +193,11 @@ def test_retinal_age_model_heads_and_tta():
         assert torch.allclose(ldl(x), manual, atol=1e-5) and plain.shape == (2,)
     with pytest.raises(ValueError):
         RetinalAgeModel("mobilenetv3_small", 64, "ldl", None, pretrained=False)
+    # GCG: carried on the V3 trunk, refused elsewhere, recorded in the head spec
+    g = RetinalAgeModel("mobilenetv3_small", 64, "linear", None, 50.0, 15.0, pretrained=False, gcg="baseline").eval()
+    assert g.net.gcg is not None and g(x).shape == (2,) and g.head_spec()["gcg"] == "baseline"
+    with pytest.raises(ValueError, match="MobileNetV3"):
+        RetinalAgeModel("timm:mobilenetv4_conv_small.e2400_r224_in1k", 64, "linear", None, pretrained=False, gcg="se")
 
 
 def test_phone_aug_keeps_shape_and_range():
@@ -375,6 +380,27 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert (mb.loc[mb["cohort"] == "healthy", "split"] == "test").all()
     assert len(mb) == mx["n_extra_scored"] and mb["pred_age_recal"].notna().all()
     assert mb["pred_age_bnadapt_recal"].notna().all() and pm[pm["dataset"] == "brset"]["pred_age_recal"].isna().all()
+
+    # a GCG arm on the V3 trunk, then the explainer on it (gate maps) and on the plain student (Grad-CAM)
+    rc = main(common + ["--gcg", "baseline", "--seed", "0", "--run-name", "gcg_seed0",
+                        "--results-json", str(out / "gcg_seed0.json")])
+    assert rc == 0 and json.load(open(out / "gcg_seed0.json"))["gcg"] == "baseline"
+    assert torch.load(ck / "gcg_seed0.pt", map_location="cpu")["head"]["gcg"] == "baseline"
+    with pytest.raises(SystemExit):
+        main(common + ["--gcg", "se", "--backbone", "timm:mobilenetv4_conv_small.e2400_r224_in1k",
+                       "--seed", "0", "--run-name", "bad_gcg"])
+    explain = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "explain_retinal_age.py")
+    for ckname, expect_gate in (("gcg_seed0", True), ("student_seed0", False)):
+        res = subprocess.run([sys.executable, explain, "--checkpoint", str(ck / f"{ckname}.pt"), "--root", B,
+                              "--predictions", str(out / "predictions_pooled.csv"), "--condition", "student",
+                              "--out", str(tmp_path / f"explain_{ckname}"), "--per-bin", "1"],
+                             capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+        assert (tmp_path / f"explain_{ckname}" / "explain_grid.png").exists()
+        st = pd.read_csv(tmp_path / f"explain_{ckname}" / "explain_stats.csv")
+        assert len(st) >= 3 and st["cam_central_half"].between(0, 1).all() and set(st["cam_sign"]) <= {"pos", "abs"}
+        assert (st["gate_central_half"].notna().all() if expect_gate else st["gate_central_half"].isna().all())
+        assert f"gcg={'on' if expect_gate else 'off'}" in res.stdout
 
     # the ceiling direction: train on mBRSET DR-0 patients, external = BRSET (as CEILING=1 does)
     rc = main(common + ["--dataset", "mbrset", "--root", M, "--external-test-root", B,

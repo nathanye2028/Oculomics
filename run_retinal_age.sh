@@ -12,6 +12,11 @@
 #   teacher_seed<s>   $TEACHER (off by default; e.g. timm:convnext_small.fb_in22k_ft_in1k)
 #   kd_seed<s>        with TEACHER (and KD=1, the default): $STUDENT distilled from teacher_seed<s>
 #                     (regression KD: matches the teacher's predicted age; same split, same seed)
+#   medium_seed<s>    MEDIUM=1: a MobileNetV4-Medium student (9 M params) on the same split — the
+#                     capacity lever that still fits the phone budget (measure its Core ML latency)
+#   ctrl_seed<s> /    GCG=<variant>: the paired Guided-Context-Gating ablation on the MobileNetV3-Small
+#   gcg_seed<s>       trunk (GCG is V3-specific): same split, same recipe, gate on vs off; the summary
+#                     pairs them. Variants: baseline | attention | cbam | se.
 #   ceiling_seed<s>   CEILING=1: $STUDENT trained IN-DOMAIN on mBRSET's DR-grade-0 patients
 #                     (--dataset mbrset --healthy dr0), scored on held-out mBRSET patients and
 #                     on all of BRSET as the reverse transfer. This is the phone-domain ceiling:
@@ -54,6 +59,11 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
     KD_ALPHA       weight of the teacher-matching term                             (default 0.5)
     FEAT_W         cosine feature-matching weight                                  (default 0.0)
     TAG            suffix on condition names, e.g. _512 (MIX=1 defaults to _mix)   (default "")
+  extra arms
+    MEDIUM         1 = also train medium_seed<s> with MEDIUM_STUDENT                (default 0)
+    MEDIUM_STUDENT backbone for that arm       (default timm:mobilenetv4_conv_medium.e500_r256_in1k)
+    GCG            baseline | attention | cbam | se = also train ctrl/gcg pairs on GCG_STUDENT (default "")
+    GCG_STUDENT    trunk for the GCG pair, must carry the gate (default mobilenetv3_small)
   outputs
     OUT            results JSONs + summary + pooled predictions   (default exp_retinal_age)
     CK             checkpoints + per-run predictions CSVs         (default ck_retinal_age)
@@ -102,6 +112,10 @@ KD_ALPHA=${KD_ALPHA:-0.5}
 FEAT_W=${FEAT_W:-0.0}
 TAG=${TAG:-}
 [ "$MIX" = 1 ] && [ -z "$TAG" ] && TAG=_mix
+MEDIUM=${MEDIUM:-0}
+MEDIUM_STUDENT=${MEDIUM_STUDENT:-timm:mobilenetv4_conv_medium.e500_r256_in1k}
+GCG=${GCG:-}
+GCG_STUDENT=${GCG_STUDENT:-mobilenetv3_small}
 OUT=${OUT:-exp_retinal_age}
 CK=${CK:-ck_retinal_age}
 STUDENT=${STUDENT:-timm:mobilenetv4_conv_small.e2400_r224_in1k}
@@ -173,6 +187,13 @@ for s in "${SEEDS[@]}"; do
         echo "[warn] teacher${TAG}_seed$s has no finished checkpoint ($tpt); kd${TAG}_seed$s skipped"
       fi
     fi
+  fi
+  if [ "$MEDIUM" = 1 ]; then
+    run "medium${TAG}_seed$s" --seed "$s" --backbone "$MEDIUM_STUDENT"
+  fi
+  if [ -n "$GCG" ]; then
+    run "ctrl${TAG}_seed$s" --seed "$s" --backbone "$GCG_STUDENT"
+    run "gcg${TAG}_seed$s"  --seed "$s" --backbone "$GCG_STUDENT" --gcg "$GCG"
   fi
   if [ "$CEILING" = 1 ]; then
     run "ceiling${TAG}_seed$s" --seed "$s" --backbone "$STUDENT" "${CEIL[@]}"

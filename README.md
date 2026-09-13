@@ -207,7 +207,13 @@ distilled from it — regression KD on the predicted age), and `MIX=1`
 cohort rule, split and bias correction; the external numbers are then computed
 on mBRSET's held-out rows only, and conditions are named `*_mix`). The
 summariser adds a seed-ensemble line (per-image mean over seeds) to every
-table. On CUDA the trainer probes a training step at start-up and halves the
+table. Two more arms: `MEDIUM=1` trains a MobileNetV4-Medium student (the capacity
+lever that still fits the phone budget) and `GCG=baseline|attention|cbam|se`
+trains a paired `ctrl` / `gcg` ablation on the MobileNetV3-Small trunk (GCG is
+V3-specific; the summary pairs them). `explain_retinal_age.py` writes Grad-CAM
+overlays (evidence for *older*) for a strip of retinas across the age range
+and, for a GCG checkpoint, the gate's spatial map via `record_gcg_gates`, plus
+a CSV of where the attention mass sits. On CUDA the trainer probes a training step at start-up and halves the
 batch with gradient accumulation until it fits the card (the lab box's GPUs
 have 11.6 GiB), tolerates a bounded number of mid-run OOMs from a neighbouring
 process, and records `batch_size_used`, `grad_accum_used`, `oom_skips` and
