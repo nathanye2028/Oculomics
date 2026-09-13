@@ -56,13 +56,28 @@ The age-range asymmetry matters twice below: it makes r non-comparable across
 the two sets, and it means an mBRSET-trained clock cannot extrapolate to BRSET's
 young and old tails.
 
+**ODIR-5K as an auxiliary training set (built 12 September).** The Kaggle
+mirror of ODIR-5K (`andrewmvd/ocular-disease-recognition-odir5k`: 6,392 eyes of
+3,358 patients, several tabletop cameras, ages 1–91 with mean 57.9) carries an
+age and per-eye diagnostic keywords. Under the same patient-level rule as BRSET
+— every eye of the patient reads "normal fundus" and nothing else, adequate
+quality — it contributes **2,152 training-eligible images from 1,150 patients**
+(excluded: 4,130 abnormal, 110 ungradable; verified on the real files with
+`--inspect`). Its 70/10/20 patient split gives 1,504 training and 214
+validation images, roughly 30 % more healthy training retinas on top of
+BRSET's 5,200, and a 434-image / 237-patient test partition that is scored as a
+third-camera sanity check. It joins training only (`AUX=1`): own split, own bias
+correction, never the external set. Its healthy ages are 40–70 heavy like
+BRSET's (26 under-30 training images), so it does not fix the tails.
+
 ## 3. Method
 
 * **Healthy cohort** (`--healthy nodm`): no diabetes, DR grade 0 on *every*
   image of the patient (one eye with retinopathy disqualifies the fellow eye),
   adequate quality. `dr0` keeps diabetics without retinopathy (used for mBRSET,
-  which has no non-diabetics); `--exclude-pathology` also drops BRSET's other
-  ophthalmic flags.
+  which has no non-diabetics); `normal` keeps only patients whose every eye is
+  read as "normal fundus" (ODIR-5K's keywords); `--exclude-pathology` also
+  drops BRSET's other ophthalmic flags.
 * **Split**: patient-grouped, age-stratified 70/10/20 drawn over *all* patients
   first, the healthy rule applied to train and val afterwards. Every diseased
   image is therefore scorable without leakage, and none was trained on.
@@ -94,8 +109,10 @@ young and old tails.
   applied across devices.
 
 Code: `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py`,
-`analyze_age_gap.py`; tests `tests/test_retinal_age.py`, `tests/test_age_gap.py`
-(suite: 99 tests, all synthetic and network-free).
+`analyze_age_gap.py`, `public_fundus.py` (the ODIR-5K adapter),
+`export_coreml.py --model age`; tests `tests/test_retinal_age.py`,
+`tests/test_age_gap.py`, `tests/test_odir_age.py`, `tests/test_export_age.py`
+(suite: 106 tests, all synthetic and network-free).
 
 ## 4. The clock
 
@@ -124,6 +141,15 @@ networks and a 40 – 69 age range; predicting the mean age on BRSET gives about
 14 years. Excluded patients read **+1.7 ± 0.1 years** older than healthy ones
 after correction, consistent between the small test slice and the 2,727
 never-trained images.
+
+The MAEs above are per image. A phone exam captures both eyes, so the number
+the deployment delivers is the **patient-level MAE**, both eyes averaged before
+the error is taken. The trainer has always computed it (`patient_mae` in every
+results JSON) and the summariser now tables it beside the image-level MAE for
+every set and in the seed-ensemble lines. It is not quoted here yet because the
+result files live on the lab box; re-running
+`python summarize_retinal_age.py --dir exp_retinal_age` there fills the column
+without retraining, and that is the number to headline.
 
 ### 4.2 Smartphone camera (mBRSET, n = 4,860 images, 1,282 patients)
 
@@ -264,6 +290,42 @@ age balance + EMA at 512 px, then teacher + KD) is the pending experiment: its
 `student_mix` rows on mBRSET's held-out patients are the phone clock of record,
 and its association report is a third model on the same patients.
 
+Three more levers were built on 12 September, each verified on real files or
+real hardware:
+
+* **More labelled-age data — `AUX=1`.** ODIR-5K's normal-fundus patients
+  (section 2) join training as an auxiliary set (`--aux-train-root`,
+  repeatable: own split, own bias correction, its val in the checkpoint-
+  selection pool, its test partition reported under `aux`, never external).
+  `O=kaggle:andrewmvd/ocular-disease-recognition-odir5k` fetches the mirror with
+  kagglehub on the lab box; conditions get `_odir` appended; the ceiling arm
+  stays ODIR-free.
+* **Capacity inside the phone budget — `MEDIUM=1`, judged on Core ML latency.**
+  `export_coreml.py` now exports a `train_retinal_age.py` checkpoint (kind
+  `age`: the head is folded into the graph so the output is years, and
+  `--verify-images` compares Core ML with PyTorch in years) and, without a
+  checkpoint, the bare architecture for a latency probe. Measured on this Mac's
+  M2 (fp16, 10 warm-up + 60 timed runs; an optimistic floor for an iPhone,
+  valid for the relative cost):
+
+| clock trunk | params | 384 px ANE | 512 px ANE | 384 px CPU |
+|---|---|---|---|---|
+| MobileNetV3-Small (GCG trunk) | 1.09 M | 0.57 ms | – | 2.4 ms |
+| MobileNetV4-Small (student) | 2.82 M | 0.67 ms | 0.95 ms | 2.6 ms |
+| MobileNetV4-Medium (`MEDIUM=1`) | 8.76 M | 1.43 ms | 1.96 ms | 8.3 ms |
+
+  The LDL head (100 bins) adds nothing measurable (Small at 384 px: 0.69 ms;
+  its expectation is exported as multiply-and-sum because Core ML cannot type a
+  matmul against a 1-D bin vector). Every graph stays on the ANE (`ALL` matches
+  `CPU_AND_NE`). The Medium student
+  costs about twice the Small one and 512 px about 1.4×; all of it is far inside
+  the budget, so the arm is affordable and only its MAE decides.
+* **The v4 sweep** combines them with the v3 levers (section 9): mixed-domain +
+  ODIR-5K + LDL + TTA + age balance + EMA at 512 px, the Medium student, then
+  the ConvNeXt-S teacher with distillation. The v3 levers should buy tenths of
+  a year each; the data lever and the Medium arm are the ones that can move the
+  in-domain 5-year floor.
+
 ## 8. Open items
 
 1. **v3 results:** mixed-domain MAE / r on held-out mBRSET (expected ≈ 5 y,
@@ -271,11 +333,17 @@ and its association report is a third model on the same patients.
    third clock.
 2. **Pre-lesion signal:** add the "diabetes without DR vs non-diabetic" row to
    the BRSET table (grade-0 diabetics already sit at +0.67 y).
-3. **Deployment:** `export_coreml.py` has no regression path; the clock shares
-   the classifier's trunk, so its on-device latency should match the 0.7 ms
-   ANE figure, but it has not been measured.
+3. **Deployment:** the regression export exists (`export_coreml.py --model
+   age`) and the untrained architectures are timed (section 7: 0.67 ms Small,
+   1.43 ms Medium at 384 px on the M2); the trained clock's Core ML fidelity
+   check (`--verify-images`) still needs a checkpoint from the lab box.
 4. **Distillation and resolution:** the teacher / KD arms of v3 quantify what
    capacity and 512 px buy on BRSET.
+5. **v4 sweep** (mixed-domain + ODIR-5K auxiliary + levers + Medium student,
+   then teacher + KD): commands ready in section 9, not launched — the lab box
+   needs an interactive login.
+6. **Patient-level MAE:** re-run the summariser on the lab box's result
+   directories to fill the new column, then headline it (section 4.1).
 
 ## 9. Reproduction
 
@@ -293,6 +361,22 @@ python analyze_age_gap.py --predictions exp_retinal_age/predictions_pooled.csv -
 # the pending v3 sweep: mixed-domain + levers, then teacher + distillation (one job per 12 GB GPU)
 MIX=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_v3 CK=ck_retinal_age_v3 bash run_retinal_age.sh 0 1 2
 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 EXTRA="--ema-decay 0.999" TEACHER=timm:convnext_small.fb_in22k_ft_in1k OUT=exp_retinal_age_v3 CK=ck_retinal_age_v3 bash run_retinal_age.sh 0 1 2
+
+# v4: + ODIR-5K auxiliary set (fetched with kagglehub) + the Medium student; then the teacher + KD
+# on the same mixed/auxiliary data (already-finished conditions are skipped, so the two lines resume each other)
+O=kaggle:andrewmvd/ocular-disease-recognition-odir5k MIX=1 AUX=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 MEDIUM=1 \
+  EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_v4 CK=ck_retinal_age_v4 bash run_retinal_age.sh 0 1 2
+O=kaggle:andrewmvd/ocular-disease-recognition-odir5k MIX=1 AUX=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 \
+  EXTRA="--ema-decay 0.999" TEACHER=timm:convnext_small.fb_in22k_ft_in1k TEACHER_EXTRA="--batch-size 8" \
+  OUT=exp_retinal_age_v4 CK=ck_retinal_age_v4 bash run_retinal_age.sh 0 1 2
+# (or through the launcher: RA_ENV="MIX=1 AUX=1 O=kaggle:... SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 MEDIUM=1 OUT=... CK=..." bash launch_disease_runs.sh retinalage)
+
+# ODIR-5K cohort report alone (no images touched)
+python train_retinal_age.py --dataset odir --root <ODIR-5K> --healthy normal --inspect
+
+# Core ML: export a trained clock with the real-image fidelity check; time an untrained architecture
+python export_coreml.py --checkpoint ck_retinal_age_v4/student_mix_odir_seed0.pt --verify-images <mBRSET>/images
+python export_coreml.py --model age --backbone timm:mobilenetv4_conv_medium.e500_r256_in1k --image-size 512
 ```
 
 Data: BRSET and mBRSET (PhysioNet, credentialed), passed as `B=` / `M=`; on the

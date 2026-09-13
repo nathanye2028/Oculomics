@@ -31,6 +31,9 @@ back to be *scored*, never trained on.
   eye with retinopathy disqualifies the fellow eye too.
 * ``dr0`` — every image of the patient is DR grade 0; diabetics without
   retinopathy are kept. Use it when a release has no ``diabetes`` column.
+* ``normal`` — every image of the patient is read as "normal fundus" and
+  nothing else (ODIR-5K's per-eye diagnostic keywords, ``normal_fundus``
+  column from ``public_fundus.py``); a release without that column refuses.
 * ``gradable`` — adequate quality only.
 * ``all`` — no filter at all (ablation).
 
@@ -97,6 +100,14 @@ exposes each as a knob):
   the ``--external-test-root``, the external numbers are computed on exactly
   those held-out rows, so nothing scored was trained on. This gives up the
   zero-shot framing, which is the right trade for a clock meant to run on phones.
+* ``--aux-train-root <ODIR-5K> --aux-train-dataset odir --aux-healthy normal``
+  (repeatable) — auxiliary training sets: more labelled-age retinas from other
+  cameras. Same treatment as the mixed-in set (own cohort rule, own patient
+  split on the seed, healthy train/val rows join training, val joins the
+  checkpoint selection pool, test partition + non-healthy rows scored and
+  reported under ``aux``) except that an auxiliary set can never be the
+  external set: it is a data lever for the clock, not a domain being measured.
+  ``--aux-weight`` is its sampling multiplier.
 
 The in-domain ceiling for the phone domain is the same script trained on
 mBRSET's DR-grade-0 patients (``--dataset mbrset --root <mBRSET> --healthy dr0
@@ -121,7 +132,7 @@ import os
 import sys
 import time
 import warnings
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -140,7 +151,10 @@ from metrics import CSVLogger                                       # noqa: E402
 from train_mbrset import ModelEMA, adapt_bn, pick_device, backbone_kwargs_for   # noqa: E402
 
 TASK = "retinal_age"
-HEALTHY_DEFS = ("nodm", "dr0", "gradable", "all")
+HEALTHY_DEFS = ("nodm", "dr0", "normal", "gradable", "all")
+# Datasets the trainer can name for --dataset / --extra-train-dataset / --aux-train-dataset
+# (brset_dataset.load_any resolves each; odir goes through public_fundus.py).
+DATASET_CHOICES = ("mbrset", "brset", "odir")
 # Age bins for the per-bin MAE table. BRSET is 40-70 heavy; <30 and 80+ are thin.
 AGE_BIN_EDGES = (30, 40, 50, 60, 70, 80)
 AGE_BIN_LABELS = ("<30", "30-39", "40-49", "50-59", "60-69", "70-79", "80+")
@@ -261,6 +275,12 @@ def build_cohort(df: pd.DataFrame, healthy: str = "nodm", exclude_pathology: boo
         img_ok = (out["dr_grade"] == 0) & (out["diabetes"] == 0)   # NaN -> False
     elif healthy == "dr0":
         img_ok = out["dr_grade"] == 0
+    elif healthy == "normal":
+        if "normal_fundus" not in out.columns or out["normal_fundus"].isna().all():
+            raise ValueError("--healthy normal needs a 'normal_fundus' column (ODIR-5K's per-eye "
+                             "diagnostic keywords via public_fundus.py). This release has none; "
+                             "use --healthy dr0 / nodm for BRSET-schema sets.")
+        img_ok = pd.to_numeric(out["normal_fundus"], errors="coerce") == 1.0   # NaN -> False
     else:
         img_ok = pd.Series(True, index=out.index)
     if exclude_pathology:
@@ -284,6 +304,10 @@ def build_cohort(df: pd.DataFrame, healthy: str = "nodm", exclude_pathology: boo
     if healthy in ("nodm", "dr0"):
         has_dr = out.groupby("patient")["dr_grade"].transform(lambda s: (s != 0).any())
         reason = np.where((reason == "other") & has_dr, "dr", reason)
+    if healthy == "normal":
+        abn = out.groupby("patient")["normal_fundus"].transform(
+            lambda s: (pd.to_numeric(s, errors="coerce") != 1.0).any())
+        reason = np.where((reason == "other") & abn, "abnormal", reason)
     if exclude_pathology:
         has_p = out.groupby("patient")["pathology"].transform(lambda s: (s != 0).any())
         reason = np.where((reason == "other") & has_p, "pathology", reason)
@@ -452,7 +476,9 @@ class RetinalAgeModel(nn.Module):
     def years_from(self, out: torch.Tensor) -> torch.Tensor:
         out = out.float()
         if self.head_type == "ldl":
-            return torch.softmax(out, dim=1) @ self.centers
+            # expectation over the bin centres as mul + sum rather than `probs @ centers`:
+            # identical value, and Core ML's matmul cannot type a 1-D right operand.
+            return (torch.softmax(out, dim=1) * self.centers).sum(dim=1)
         return out * self.t_std + self.t_mean
 
     def forward_with_feat(self, x: torch.Tensor):
@@ -559,7 +585,8 @@ def load_age_model(path: str, device, bn_stats: str = "source"):
     return m, ck
 
 
-def load_age_teacher(path: str, device, dataset: str, root: str, extra_root: Optional[str] = None):
+def load_age_teacher(path: str, device, dataset: str, root: str, extra_root: Optional[str] = None,
+                     aux_roots: Optional[Sequence[str]] = None):
     """Rebuild a train_retinal_age.py checkpoint as a frozen teacher.
 
     Refuses a checkpoint of another task; refuses a teacher trained on another
@@ -576,6 +603,8 @@ def load_age_teacher(path: str, device, dataset: str, root: str, extra_root: Opt
         print(f"[warn] teacher root {a['root']} != student root {root}")
     if bool(a.get("extra_train_root")) != bool(extra_root):
         print("[warn] teacher and student differ in mixed-domain training (--extra-train-root)")
+    if sorted(map(str, a.get("aux_train_root") or [])) != sorted(map(str, aux_roots or [])):
+        print("[warn] teacher and student differ in auxiliary training sets (--aux-train-root)")
     t, _ = load_age_model(path, device)
     t.tta = False                                   # the teacher scores the same augmented batch, 1x
     for q in t.parameters():
@@ -773,9 +802,9 @@ def _print_in_domain(name: str, res: Dict[str, Dict[str, object]]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Retinal age regression: BRSET healthy cohort -> mBRSET.")
     p.add_argument("--root", required=True, help="Training dataset root (BRSET).")
-    p.add_argument("--dataset", default="brset", choices=["mbrset", "brset"])
+    p.add_argument("--dataset", default="brset", choices=list(DATASET_CHOICES))
     p.add_argument("--external-test-root", default=None, help="mBRSET root, scored zero-shot.")
-    p.add_argument("--external-test-dataset", default="mbrset", choices=["mbrset", "brset"])
+    p.add_argument("--external-test-dataset", default="mbrset", choices=list(DATASET_CHOICES))
     p.add_argument("--external-all", action="store_true",
                    help="Score every external image with an age; default keeps gradable only.")
     p.add_argument("--image-ext", default=".jpg")
@@ -793,11 +822,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Second training dataset (e.g. mBRSET): its healthy train/val rows join training; "
                         "its test partition and non-healthy rows are only scored. If it is also the "
                         "--external-test-root, the external numbers are computed on those held-out rows.")
-    p.add_argument("--extra-train-dataset", default="mbrset", choices=["mbrset", "brset"])
+    p.add_argument("--extra-train-dataset", default="mbrset", choices=list(DATASET_CHOICES))
     p.add_argument("--extra-healthy", default="dr0", choices=list(HEALTHY_DEFS),
                    help="Healthy rule for the extra dataset (mBRSET has no non-diabetics: dr0).")
     p.add_argument("--extra-weight", type=float, default=1.0,
                    help="Sampling weight multiplier for the extra dataset's training images.")
+    # auxiliary training sets (repeatable): more labelled-age retinas, never the external set
+    p.add_argument("--aux-train-root", action="append", default=None, metavar="ROOT",
+                   help="Auxiliary training dataset (repeatable), e.g. ODIR-5K: its healthy train/val rows "
+                        "join training and its val joins checkpoint selection; its test partition and "
+                        "non-healthy rows are scored and reported under 'aux'. Never the external set.")
+    p.add_argument("--aux-train-dataset", action="append", default=None, choices=list(DATASET_CHOICES),
+                   help="Per --aux-train-root (or once for all; default odir).")
+    p.add_argument("--aux-healthy", action="append", default=None, choices=list(HEALTHY_DEFS),
+                   help="Per --aux-train-root (or once for all; default normal = ODIR 'normal fundus' eyes only).")
+    p.add_argument("--aux-weight", action="append", type=float, default=None,
+                   help="Per --aux-train-root sampling multiplier (or once for all; default 1.0).")
     # model / recipe
     p.add_argument("--backbone", default="timm:mobilenetv4_conv_small.e2400_r224_in1k",
                    help="mobilenetv3_small or timm:<name> (e.g. timm:mobilenetv4_conv_medium.e500_r256_in1k).")
@@ -864,6 +904,50 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+
+def build_aux_domains(args, prim: "Domain", extra: Optional["Domain"]) -> List["Domain"]:
+    """The ``--aux-train-root`` sets as Domains, in CLI order, each carrying ``.weight``.
+
+    ``--aux-train-dataset`` / ``--aux-healthy`` / ``--aux-weight`` are given once per
+    root, once for all roots, or not at all (odir / normal / 1.0). An auxiliary root
+    that is also the primary, mixed-in or external root is refused: the rows would
+    be trained on and scored as external at once.
+    """
+    roots = list(args.aux_train_root or [])
+    if not roots:
+        return []
+
+    def expand(vals, flag, default):
+        vals = list(vals or [])
+        if not vals:
+            return [default] * len(roots)
+        if len(vals) == 1:
+            return vals * len(roots)
+        if len(vals) != len(roots):
+            raise SystemExit(f"[fatal] {flag} given {len(vals)} times for {len(roots)} --aux-train-root")
+        return vals
+    datasets = expand(args.aux_train_dataset, "--aux-train-dataset", "odir")
+    healthy = expand(args.aux_healthy, "--aux-healthy", "normal")
+    weights = expand(args.aux_weight, "--aux-weight", 1.0)
+    real = lambda q: os.path.realpath(os.path.expanduser(str(q)))
+    taken = {real(prim.root)} | ({real(extra.root)} if extra is not None else set()) \
+        | ({real(args.external_test_root)} if args.external_test_root else set())
+    out = []
+    for r, ds, h, w in zip(roots, datasets, healthy, weights):
+        if real(r) in taken:
+            raise SystemExit(f"[fatal] --aux-train-root {r} is also the primary / mixed-in / external root: "
+                             f"an auxiliary set only joins training, it is never scored as external "
+                             f"(use --extra-train-root for the held-out mixed-in domain)")
+        taken.add(real(r))
+        d = Domain(f"aux:{ds}", r, ds, h, args.seed, args.image_ext, min_age=args.min_age, max_age=args.max_age)
+        d.weight = float(w)
+        print(d.report())
+        print(f"[info] auxiliary training set: {ds} healthy={h} train/val rows join training (x{w}); "
+              f"its test partition + non-healthy rows are scored only, never used as external")
+        out.append(d)
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     rp = os.path.realpath
@@ -884,6 +968,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(extra.report())
         print(f"[info] mixed-domain training: {extra.dataset} healthy train/val rows join training; "
               f"its test partition + non-healthy rows are scored only")
+    aux = build_aux_domains(args, prim, extra)
     ext_df, ext_images = None, None
     if args.external_test_root and not held_out:
         from brset_dataset import load_any                      # noqa: E402
@@ -926,6 +1011,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prim.build(mk, dl)
     if extra is not None:
         extra.build(mk, dl)
+    for d in aux:
+        d.build(mk, dl)
     if held_out:
         ext_ds, ext_loader, ext_base, ext_name = extra.sc_ds, extra.sc_loader, extra.sc, extra.dataset
     elif ext_df is not None:
@@ -935,36 +1022,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ext_ds = ext_loader = ext_base = ext_name = None
 
     from torch.utils.data import ConcatDataset
-    train_sets = [prim.train_ds] + ([extra.train_ds] if extra is not None else [])
+    train_sets = [prim.train_ds] + ([extra.train_ds] if extra is not None else []) + [d.train_ds for d in aux]
     train_ds = ConcatDataset(train_sets) if len(train_sets) > 1 else prim.train_ds
     ages = torch.cat([ds.labels for ds in train_sets]).numpy().astype(np.float64)
     # Standardise the target on the TRAIN ages: the head starts near the mean
     # instead of climbing from 0 to ~55 years.
     mean, std = float(ages.mean()), float(max(ages.std(), 1e-6))
 
-    n_scored = len(prim.sc_ds) + (len(extra.sc_ds) if extra is not None else 0)
+    n_scored = len(prim.sc_ds) + (len(extra.sc_ds) if extra is not None else 0) + sum(len(d.sc_ds) for d in aux)
     print(f"[info] device : {device}")
     print(f"[info] train  : {args.dataset} @ {args.root}   healthy={args.healthy}"
           + ("  +exclude-pathology" if args.exclude_pathology else "")
           + (f"   + {extra.dataset} @ {extra.root} healthy={extra.healthy} (x{args.extra_weight})"
-             if extra is not None else ""))
+             if extra is not None else "")
+          + "".join(f"   + aux {d.dataset} @ {d.root} healthy={d.healthy} (x{d.weight:g})" for d in aux))
     print(f"[info] splits : train={len(train_ds)} val={len(prim.val_ds)}"
-          + (f"+{len(extra.val_ds)}" if extra is not None else "") + f" (healthy)  scored={n_scored} "
+          + (f"+{len(extra.val_ds)}" if extra is not None else "")
+          + "".join(f"+{len(d.val_ds)}" for d in aux) + f" (healthy)  scored={n_scored} "
           f"(test all + non-healthy)" + (f"  external={len(ext_ds)}" if ext_ds is not None else "")
           + ("  [external = held-out rows of the mixed-in set]" if held_out else ""))
     print(f"[info] target : age mean={mean:.1f} sd={std:.1f}")
 
-    # Sampler: age balance and/or the extra-domain weight; plain shuffle otherwise.
-    n_p = len(prim.train_ds)
+    # Sampler: age balance and/or per-domain weights (ConcatDataset order: primary,
+    # mixed-in, then each auxiliary set); plain shuffle otherwise.
     w = np.ones(len(train_ds), dtype=np.float64)
     if args.age_balance:
         b = age_bin(ages)
         freq = np.bincount(b, minlength=len(AGE_BIN_LABELS)).astype(np.float64)
         w *= 1.0 / np.sqrt(np.maximum(freq[b], 1.0))
-    if extra is not None and args.extra_weight != 1.0:
-        w[n_p:] *= float(args.extra_weight)
+    dom_w = ([float(args.extra_weight)] if extra is not None else []) + [d.weight for d in aux]
+    off = len(prim.train_ds)
+    for ds_i, wt in zip(train_sets[1:], dom_w):
+        w[off:off + len(ds_i)] *= wt
+        off += len(ds_i)
     sampler = None
-    if args.age_balance or (extra is not None and args.extra_weight != 1.0):
+    if args.age_balance or any(wt != 1.0 for wt in dom_w):
         sampler = WeightedRandomSampler(torch.as_tensor(w / w.sum(), dtype=torch.double),
                                         num_samples=len(train_ds), replacement=True, generator=g)
 
@@ -991,7 +1083,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.teacher:
         with torch.random.fork_rng(devices=[]):
             teacher, t_args, t_val = load_age_teacher(args.teacher, device, args.dataset, args.root,
-                                                      args.extra_train_root)
+                                                      args.extra_train_root, args.aux_train_root)
         if int(t_args.get("seed", args.seed)) != args.seed:
             print(f"[warn] teacher seed {t_args.get('seed')} != student seed {args.seed}: different "
                   f"patient split, the teacher may have trained on this run's test images.")
@@ -1067,7 +1159,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     best_mae, best_epoch, since = float("inf"), -1, 0
     print(f"\n=== training up to {args.epochs} epochs (healthy val MAE selects best"
-          f"{', pooled over both domains' if extra is not None else ''}) ===")
+          f"{', pooled over all training domains' if (extra is not None or aux) else ''}) ===")
     def optimizer_step():
         scaler.step(opt); scaler.update()
         opt.zero_grad(set_to_none=True)
@@ -1115,13 +1207,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eval_model = ema.ema if ema is not None else model
         vm_p, _ = eval_split(eval_model, prim)
         vm_e = eval_split(eval_model, extra)[0] if extra is not None else None
-        sel = pooled_mae([vm_p] + ([vm_e] if vm_e else []))
+        vm_a = [eval_split(eval_model, d)[0] for d in aux]
+        sel = pooled_mae([vm_p] + ([vm_e] if vm_e else []) + vm_a)
         tag = ""
         if sel < best_mae:
             best_mae, best_epoch, since = sel, epoch, 0
             torch.save({"model": eval_model.net.state_dict(), "head": model.head_spec(),
                         "target_norm": {"mean": mean, "std": std}, "epoch": epoch,
-                        "val": {"primary": vm_p, "extra": vm_e, "mae": sel},
+                        "val": {"primary": vm_p, "extra": vm_e, "aux": vm_a, "mae": sel},
                         "use_gcg": False, "task": TASK, "regression": True, "num_classes": None,
                         "selection_metric": "mae", "args": vars(args)}, ckpt)
             tag = "  <- best"
@@ -1160,6 +1253,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"=== VAL {extra.dataset} (healthy, best checkpoint) ===  MAE={vm_extra['mae']:.2f}y  "
               f"r={vm_extra['r']:.3f}; its own bias correction: gap = {extra.fit['a']:+.2f} "
               f"{extra.fit['b']:+.4f}*age  (n={extra.fit['n']})")
+    aux_val = []
+    for d in aux:
+        vm_a, vfa = eval_split(model, d)
+        d.fit = bias_fit(vfa["age"], vfa["gap"]); d.fit["fit_on"] = f"val_healthy_{d.dataset}"
+        _with_corrected(vm_a, vfa["age"], vfa["pred_age"], d.fit)
+        aux_val.append(vm_a)
+        print(f"=== VAL {d.dataset} (auxiliary, healthy, best checkpoint) ===  MAE={vm_a['mae']:.2f}y  "
+              f"r={vm_a['r']:.3f}; its own bias correction: gap = {d.fit['a']:+.2f} {d.fit['b']:+.4f}*age")
 
     # --- in-domain scoring: test partition (healthy + non-healthy), never-trained non-healthy ---
     sc_p, res_sets = prim.score_sets(model, device)
@@ -1168,6 +1269,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sc_e, res_extra = (extra.score_sets(model, device) if extra is not None else (None, {}))
     if extra is not None:
         _print_in_domain(f"{extra.dataset} (mixed-in domain)", res_extra)
+    aux_scored = [d.score_sets(model, device) for d in aux]
+    for d, (_, res_a) in zip(aux, aux_scored):
+        _print_in_domain(f"{d.dataset} (auxiliary training set)", res_a)
 
     # --- external ---
     em, em_by_dr, ef = None, None, None
@@ -1218,6 +1322,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "n_extra_scored": len(extra.sc_ds) if extra is not None else 0,
               "extra_val": vm_extra, "extra_bias_correction": extra.fit if extra is not None else None,
               **{f"extra_{k}": v for k, v in res_extra.items()},
+              "aux_train_root": list(args.aux_train_root or []),
+              "aux": [{"dataset": d.dataset, "root": d.root, "healthy": d.healthy, "weight": d.weight,
+                       "n_train": len(d.train_ds), "n_val": len(d.val_ds), "n_scored": len(d.sc_ds),
+                       "val": vm_a, "bias_correction": d.fit, **res_a}
+                      for d, vm_a, (_, res_a) in zip(aux, aux_val, aux_scored)],
               "external_dataset": ext_name if em else None, "external_held_out": held_out,
               "external": em, "external_by_dr": em_by_dr,
               "n_external": len(ext_ds) if ext_ds is not None else 0,
@@ -1249,6 +1358,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         frames = [_pred_rows(sc_p, prim.dataset)]
         if extra is not None:
             frames.append(_pred_rows(ext_frame if held_out and ext_frame is not None else sc_e, extra.dataset))
+        frames += [_pred_rows(sc_a, d.dataset) for d, (sc_a, _) in zip(aux, aux_scored)]
         if ext_frame is not None and not held_out:
             e = ext_frame.copy(); e["split"] = "external"; e["cohort"] = "external"
             frames.append(_pred_rows(e, ext_name))
@@ -1261,6 +1371,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ck = torch.load(ckpt, map_location="cpu")
     ck["bias_correction"] = prim.fit
     ck["extra_bias_correction"] = extra.fit if extra is not None else None
+    ck["aux_bias_corrections"] = {d.dataset: d.fit for d in aux}
     torch.save(ck, ckpt)
     write_results()
     write_predictions(ef)

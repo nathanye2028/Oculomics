@@ -64,6 +64,8 @@ OPH_LABELS=${OPH_LABELS:-amd drusens increased_cup_disc hypertensive_retinopathy
 RA_SEEDS=${RA_SEEDS:-0 1 2}
 RA_HEALTHY=${RA_HEALTHY:-nodm}
 RA_TEACHER=${RA_TEACHER:-}                          # e.g. timm:convnext_small.fb_in22k_ft_in1k
+RA_ENV=${RA_ENV:-}                                  # further run_retinal_age.sh knobs, e.g.
+#   RA_ENV="MIX=1 AUX=1 O=kaggle:andrewmvd/ocular-disease-recognition-odir5k SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 MEDIUM=1 OUT=exp_retinal_age_v4 CK=ck_retinal_age_v4"
 DRY_RUN=${DRY_RUN:-0}                              # 1 = print what would be launched, launch nothing
 STAMP=$(date +%Y%m%d-%H%M)
 
@@ -140,7 +142,7 @@ run_glaucoma() {
 run_retinalage() {
   worktree disease/retinal-age "$WT_RETINALAGE"
   launch oculomics-retinalage-brset "$WT_RETINALAGE" "$GPU_RETINALAGE" "$WT_RETINALAGE/exp_retinal_age/sweep-$STAMP.log" \
-    "B='$B' M='$M' HEALTHY=$RA_HEALTHY TEACHER='$RA_TEACHER' WORKERS=$WORKERS bash run_retinal_age.sh $RA_SEEDS"
+    "B='$B' M='$M' HEALTHY=$RA_HEALTHY TEACHER='$RA_TEACHER' WORKERS=$WORKERS $RA_ENV bash run_retinal_age.sh $RA_SEEDS"
 }
 
 resolve() {  # resolve <VAR> <dataset> -- replace $VAR with the directory that holds the label CSV, or fail loudly

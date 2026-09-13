@@ -26,7 +26,9 @@
 # external DR-0 patients, out-of-fold), next to zero-shot and AdaBN.
 # Recipe knobs (each off by default): HEAD=ldl, TTA=1, PHONE_AUG=1, AGE_BALANCE=1, and
 # MIX=1 for mixed-domain training (mBRSET DR-0 patients join training; the external numbers
-# are then computed on mBRSET's held-out rows and conditions are named *_mix).
+# are then computed on mBRSET's held-out rows and conditions are named *_mix). AUX=1 adds
+# ODIR-5K's "normal fundus" patients as an auxiliary training set (O=<root> or a kaggle: id;
+# more labelled-age retinas, never external; conditions get _odir appended).
 # Pre-flight: train_retinal_age.py --inspect prints the cohort (how many healthy
 # images/patients survive the --healthy rule, age histogram per split) and fails
 # loudly if the rule needs a column the CSV lacks (nodm needs BRSET's `diabetes`).
@@ -51,6 +53,12 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
     MIX            1 = mixed-domain training: mBRSET DR-0 train/val rows join training;
                    external = mBRSET held-out rows; run names get TAG=_mix          (default 0)
     EXTRA_WEIGHT   sampling weight multiplier for the mixed-in images              (default 1.0)
+    O              ODIR-5K root, or kaggle:andrewmvd/ocular-disease-recognition-odir5k (fetched or
+                   reused with kagglehub under $KAGGLEHUB_CACHE); required by AUX=1      (default "")
+    AUX            1 = ODIR-5K "normal fundus" patients join training as an auxiliary set
+                   (--aux-train-root; scored on its own test split, never external);
+                   run names get TAG+=_odir                                            (default 0)
+    AUX_WEIGHT     sampling multiplier for the auxiliary images                        (default 1.0)
   recipe
     HEAD           linear | ldl (label-distribution head)                          (default linear)
     TTA            1 = average four flip views at evaluation                       (default 0)
@@ -83,6 +91,9 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
 
 example
     B=/data/BRSET/1.0.1 M=/data/mBRSET/1.0 TEACHER=timm:convnext_small.fb_in22k_ft_in1k bash run_retinal_age.sh 0 1 2
+    # v4: mixed-domain + ODIR-5K auxiliary + the v3 levers + the Medium student, one job per 12 GB GPU
+    B=... M=... O=kaggle:andrewmvd/ocular-disease-recognition-odir5k MIX=1 AUX=1 SIZE=512 HEAD=ldl TTA=1 \
+      AGE_BALANCE=1 MEDIUM=1 EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_v4 CK=ck_retinal_age_v4 bash run_retinal_age.sh 0 1 2
 USAGE
 }
 for a in "$@"; do case "$a" in -h|--help) usage; exit 0;; esac; done
@@ -104,6 +115,10 @@ CEILING=${CEILING:-0}
 RECAL_GROUP=${RECAL_GROUP:-dr0}
 MIX=${MIX:-0}
 EXTRA_WEIGHT=${EXTRA_WEIGHT:-1.0}
+O=${O:-}
+AUX=${AUX:-0}
+AUX_WEIGHT=${AUX_WEIGHT:-1.0}
+export KAGGLEHUB_CACHE=${KAGGLEHUB_CACHE:-$HOME/.cache/kagglehub}
 HEAD=${HEAD:-linear}
 TTA=${TTA:-0}
 PHONE_AUG=${PHONE_AUG:-0}
@@ -112,6 +127,7 @@ KD_ALPHA=${KD_ALPHA:-0.5}
 FEAT_W=${FEAT_W:-0.0}
 TAG=${TAG:-}
 [ "$MIX" = 1 ] && [ -z "$TAG" ] && TAG=_mix
+[ "$AUX" = 1 ] && TAG="${TAG}_odir"
 MEDIUM=${MEDIUM:-0}
 MEDIUM_STUDENT=${MEDIUM_STUDENT:-timm:mobilenetv4_conv_medium.e500_r256_in1k}
 GCG=${GCG:-}
@@ -134,6 +150,18 @@ SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
 mkdir -p "$OUT" "$CK"
 [ -d "$B" ] || { echo "[fatal] BRSET root not found: $B"; exit 1; }
 [ -d "$M" ] || { echo "[fatal] mBRSET root not found: $M"; exit 1; }
+# Auxiliary ODIR-5K set: flags kept apart from COMMON so the ceiling arm (in-domain mBRSET
+# clock) never receives them.
+AUXF=()
+if [ "$AUX" = 1 ]; then
+  [ -n "$O" ] || { echo "[fatal] AUX=1 needs O=<ODIR-5K root> or O=kaggle:andrewmvd/ocular-disease-recognition-odir5k"; exit 1; }
+  case "$O" in
+    kaggle:*) O=$($PY -c "import sys, kagglehub; print(kagglehub.dataset_download(sys.argv[1]))" "${O#kaggle:}") \
+                || { echo "[fatal] kagglehub could not fetch $O"; exit 1; };;
+  esac
+  [ -d "$O" ] || { echo "[fatal] ODIR-5K root not found: $O"; exit 1; }
+  AUXF=(--aux-train-root "$O" --aux-train-dataset odir --aux-healthy normal --aux-weight "$AUX_WEIGHT")
+fi
 $PY -c "import timm" 2>/dev/null || { echo "[fatal] timm missing: $PY -m pip install -r requirements.txt"; exit 1; }
 
 COMMON=(--dataset brset --root "$B" --external-test-root "$M" --external-test-dataset mbrset
@@ -155,7 +183,7 @@ fi
 
 echo "=== pre-flight: cohort under --healthy $HEALTHY   $(date) ==="
 # shellcheck disable=SC2086
-$PY train_retinal_age.py "${COMMON[@]}" --inspect $EXTRA \
+$PY train_retinal_age.py "${COMMON[@]}" ${AUXF[@]+"${AUXF[@]}"} --inspect $EXTRA \
   || { echo "[fatal] cohort pre-flight failed (see above); nothing trained"; exit 1; }
 if [ "$CEILING" = 1 ]; then
   echo "=== pre-flight: mBRSET DR-0 ceiling cohort   $(date) ==="
@@ -168,8 +196,10 @@ run() {  # run <name> <flags...>
   local name=$1; shift
   if [ -f "$OUT/$name.json" ]; then echo "[skip] $name (exists)"; return 0; fi
   echo; echo "=== $name   $(date) ==="
+  local auxf=()
+  case "$name" in ceiling*) ;; *) auxf=(${AUXF[@]+"${AUXF[@]}"});; esac   # the ceiling is in-domain only
   # shellcheck disable=SC2086
-  $PY -u train_retinal_age.py "${COMMON[@]}" --run-name "$name" \
+  $PY -u train_retinal_age.py "${COMMON[@]}" ${auxf[@]+"${auxf[@]}"} --run-name "$name" \
       --results-json "$OUT/$name.json" "$@" $EXTRA
 }
 
@@ -205,7 +235,7 @@ $PY summarize_retinal_age.py --dir "$OUT"
 echo; echo "=== age gap vs disease (patient-level, gradable images)   $(date) ==="
 BCSV=$($PY -c "from brset_dataset import load_any; print(load_any('$B', 'brset')['csv'])" 2>/dev/null || true)
 $PY analyze_age_gap.py --predictions "$OUT/predictions_pooled.csv" ${BCSV:+--brset-csv "$BCSV"} \
-    --out "$OUT/associations" > /dev/null \
+    --datasets brset mbrset --out "$OUT/associations" > /dev/null \
   && echo "-> $OUT/associations/age_gap_associations.md" \
   || echo "[warn] analyze_age_gap.py failed; run it by hand on $OUT/predictions_pooled.csv"
 echo "done=$(date)  ->  $OUT/summary.md  +  $OUT/predictions_pooled.csv  +  $OUT/associations/"

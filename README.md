@@ -77,7 +77,8 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
-| `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py` | Retinal age regression on BRSET's healthy cohort → mBRSET; MAE by age bin, bias-corrected age gap, per-image predictions table (branch `disease/retinal-age`) |
+| `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py` | Retinal age regression on BRSET's healthy cohort → mBRSET; MAE by age bin and patient level (both eyes), bias-corrected age gap, per-image predictions table; `MIX=1` mixes mBRSET in, `AUX=1` adds ODIR-5K's normal-fundus patients as an auxiliary training set (branch `disease/retinal-age`) |
+| `public_fundus.py` | Adapters for the public sets in the mBRSET schema; here ODIR-5K (Kaggle mirror, `kaggle:andrewmvd/ocular-disease-recognition-odir5k`) with per-eye `normal_fundus` / quality / DR grade read from the diagnostic keywords |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -95,7 +96,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `fundus_utils.py` | Seeding (`make_rng` is safe with persistent workers), FOV crop, losses, tiled inference, `pick_device` |
 | `metrics.py` | Kappa, Dice/IoU (NaN for absent lesions), AUPRC, CSV/TensorBoard logging |
 | **Deployment** | |
-| `export_coreml.py` | Core ML export (seg or cls, read from the checkpoint); `--bn-stats {source,adapted}`; per-compute-unit ANE/GPU/CPU benchmark; `--verify-images DIR` real-image pass/fail; preprocessing spec written into the model metadata |
+| `export_coreml.py` | Core ML export (seg, cls or the retinal-age clock, read from the checkpoint; the clock's head is folded in so the output is years); `--bn-stats {source,adapted}`; per-compute-unit ANE/GPU/CPU benchmark; `--verify-images DIR` real-image pass/fail; preprocessing spec written into the model metadata |
 | `evaluate_deploy.py` | FP32 vs INT8 accuracy, val-calibrated operating point (also on `--external-root`), ONNX-CPU proxy latency (key `latency_ms_cpu_onnx` — not a device number) |
 | `edge_optimize.py` | ONNX export + static INT8 quantisation helpers |
 | `artifacts.py`, `validate_artifacts.py` | Artifact-reduction preprocessing and its validation |
@@ -205,9 +206,15 @@ model on the same split; with `KD=1`, the default, the student is then
 distilled from it — regression KD on the predicted age), and `MIX=1`
 (mixed-domain training: mBRSET's DR-0 patients join training with their own
 cohort rule, split and bias correction; the external numbers are then computed
-on mBRSET's held-out rows only, and conditions are named `*_mix`). The
-summariser adds a seed-ensemble line (per-image mean over seeds) to every
-table. Two more arms: `MEDIUM=1` trains a MobileNetV4-Medium student (the capacity
+on mBRSET's held-out rows only, and conditions are named `*_mix`), and
+`AUX=1` with `O=<ODIR-5K root>` or `O=kaggle:andrewmvd/ocular-disease-recognition-odir5k`
+(ODIR-5K's normal-fundus patients — 2,152 gradable images from 1,150 patients
+under the patient-level rule — join training as an auxiliary set with their
+own split and bias correction; scored on their own test partition, never used
+as the external set; conditions get `_odir` appended). The summariser adds a
+seed-ensemble line (per-image mean over seeds) and a patient-level MAE column
+(both eyes of a patient averaged before the error — the two-eye exam number)
+to every table. Two more arms: `MEDIUM=1` trains a MobileNetV4-Medium student (the capacity
 lever that still fits the phone budget) and `GCG=baseline|attention|cbam|se`
 trains a paired `ctrl` / `gcg` ablation on the MobileNetV3-Small trunk (GCG is
 V3-specific; the summary pairs them). `explain_retinal_age.py` writes Grad-CAM

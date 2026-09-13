@@ -258,6 +258,33 @@ def _make_trees(tmp_path, n_pat=40, n_ext=320):
     return str(B), str(M)
 
 
+def _make_odir_tree(tmp_path, n_pat=60):
+    """ODIR-5K in the Kaggle full_df.csv layout: one row per eye, preprocessed_images/."""
+    rng = np.random.default_rng(1)
+    O = tmp_path / "ODIR"; (O / "preprocessed_images").mkdir(parents=True)
+    rows = []
+    for p in range(n_pat):
+        age = int(rng.integers(20, 85))
+        lk = rk = "normal fundus"
+        if p % 6 == 1:
+            rk = "cataract"                                     # one bad eye -> patient excluded
+        elif p % 6 == 2:
+            lk = "normal fundus，lens dust"                      # ungradable eye, fellow eye healthy
+        elif p % 6 == 3:
+            lk, rk = "moderate non proliferative retinopathy", "mild nonproliferative retinopathy"
+        for side, k in (("left", lk), ("right", rk)):
+            fn = f"{p}_{side}.jpg"
+            _fundus(rng, O / "preprocessed_images" / fn, age)
+            rows.append({"ID": p, "Patient Age": age, "Patient Sex": "Male" if p % 2 else "Female",
+                         "Left-Fundus": f"{p}_left.jpg", "Right-Fundus": f"{p}_right.jpg",
+                         "Left-Diagnostic Keywords": lk, "Right-Diagnostic Keywords": rk,
+                         "N": int(lk == rk == "normal fundus"), "D": 0, "G": 0, "C": 0, "A": 0, "H": 0, "M": 0, "O": 0,
+                         "filepath": f"../input/x/{fn}", "labels": "['N']", "target": "[1,0,0,0,0,0,0,0]",
+                         "filename": fn})
+    pd.DataFrame(rows).to_csv(O / "full_df.csv", index=False)
+    return str(O)
+
+
 def _fake_predict(model, loader, device):
     """Stand-in for train_retinal_age.predict: a compressed, offset, noisy reading of the
     TRUE ages (20 + 0.5*age), so the plumbing — selection, scoring, bias correction,
@@ -381,6 +408,39 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert len(mb) == mx["n_extra_scored"] and mb["pred_age_recal"].notna().all()
     assert mb["pred_age_bnadapt_recal"].notna().all() and pm[pm["dataset"] == "brset"]["pred_age_recal"].isna().all()
 
+    # + ODIR-5K as an auxiliary training set: its normal-fundus patients join training (own patient
+    # split, own bias correction), its test partition and abnormal rows are scored, never external
+    O = _make_odir_tree(tmp_path)
+    rc = main(common + ["--extra-train-root", M, "--extra-train-dataset", "mbrset", "--extra-healthy", "dr0",
+                        "--aux-train-root", O, "--aux-train-dataset", "odir", "--aux-healthy", "normal",
+                        "--aux-weight", "1.5", "--seed", "0", "--run-name", "student_mix_odir_seed0",
+                        "--results-json", str(out / "student_mix_odir_seed0.json")])
+    assert rc == 0
+    ax = json.load(open(out / "student_mix_odir_seed0.json"))
+    a0 = ax["aux"][0]
+    assert ax["aux_train_root"] == [O] and a0["dataset"] == "odir" and a0["healthy"] == "normal" and a0["weight"] == 1.5
+    assert a0["n_train"] > 0 and a0["n_val"] > 0 and a0["test_healthy"]["n"] > 0 and a0["test_nonhealthy"]["n"] > 0
+    assert a0["test_healthy"]["patient_mae"] > 0 and a0["test_healthy"]["n_patients"] > 0
+    assert a0["bias_correction"]["fit_on"] == "val_healthy_odir" and a0["val"]["n"] == a0["n_val"]
+    assert ax["external_dataset"] == "mbrset" and ax["external_held_out"]      # ODIR did not touch the external
+    assert ax["n_train"] == (ax["cohort"]["n_images"] - ax["n_val"] - ax["n_scored"]
+                             + ax["n_extra_train"] + a0["n_train"])
+    pa = pd.read_csv(ax["predictions_csv"])
+    od = pa[pa["dataset"] == "odir"]
+    assert len(od) == a0["n_scored"] and set(od["cohort"]) == {"healthy", "nonhealthy"}
+    assert (od.loc[od["cohort"] == "healthy", "split"] == "test").all()      # nothing trained on is scored
+    assert od["pred_age_recal"].isna().all() and (od["camera"] == "odir").all()
+    ck_a = torch.load(ck / "student_mix_odir_seed0.pt", map_location="cpu")
+    assert ck_a["aux_bias_corrections"]["odir"]["fit_on"] == "val_healthy_odir"
+    # the same set as auxiliary AND external would be trained on and scored as external: refused
+    with pytest.raises(SystemExit, match="aux-train-root"):
+        main(common + ["--aux-train-root", M, "--aux-train-dataset", "mbrset", "--aux-healthy", "dr0",
+                       "--seed", "0", "--run-name", "bad_aux"])
+    # a teacher trained without the auxiliary set only warns (prints) — the run still works
+    rc = main(common + ["--aux-train-root", O, "--seed", "0", "--run-name", "kd_odir_seed0",
+                        "--teacher", str(ck / "teacher_seed0.pt"), "--results-json", str(out / "kd_odir_seed0.json")])
+    assert rc == 0 and json.load(open(out / "kd_odir_seed0.json"))["aux"][0]["healthy"] == "normal"
+
     # a GCG arm on the V3 trunk, then the explainer on it (gate maps) and on the plain student (Grad-CAM)
     rc = main(common + ["--gcg", "baseline", "--seed", "0", "--run-name", "gcg_seed0",
                         "--results-json", str(out / "gcg_seed0.json")])
@@ -418,4 +478,7 @@ def test_end_to_end_smoke(tmp_path, monkeypatch):
     assert "paired ceiling" not in res.stdout                  # different train set: never paired
     assert "## student_mix" in res.stdout and "mixed-domain: + mbrset" in res.stdout
     assert "mbrset test, healthy (mixed-in domain)" in res.stdout
+    assert "## student_mix_odir" in res.stdout and "auxiliary: + odir healthy=normal x1.5" in res.stdout
+    assert "odir test, healthy (auxiliary)" in res.stdout and "patient MAE" in res.stdout
+    assert "paired student_mix_odir" not in res.stdout           # different training data: never paired
     assert "seed-ensemble" in res.stdout and "distilled from mobilenetv3_small" in res.stdout

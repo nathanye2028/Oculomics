@@ -61,6 +61,10 @@ Run:
         --verify-images /path/to/mbrset/images --verify-n 16
     # architecture-only latency probe (random weights)
     python export_coreml.py --model cls --backbone timm:mobilenetv4_conv_small --image-size 384
+    # retinal-age clock (train_retinal_age.py checkpoint): head folded in, output = years
+    python export_coreml.py --checkpoint ck_retinal_age/student_seed0.pt --verify-images <BRSET>/fundus_photos
+    # latency of the Medium student before it is trained (random weights)
+    python export_coreml.py --model age --backbone timm:mobilenetv4_conv_medium.e500_r256_in1k --image-size 384
 """
 from __future__ import annotations
 
@@ -105,6 +109,26 @@ class ClsDeployWrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self.mean255) / self.std255
         return torch.softmax(self.net(x), dim=1)
+
+
+class AgeDeployWrapper(nn.Module):
+    """Raw 0-255 RGB in, predicted age in YEARS out ([N,1]).
+
+    Wraps :class:`train_retinal_age.RetinalAgeModel`, whose forward already folds
+    the head in (de-standardisation for the linear head, softmax expectation over
+    the bin centres for the LDL head), so the app reads years and never sees the
+    head or the target normalisation. TTA is off: the app runs the single view.
+    """
+
+    def __init__(self, net: nn.Module) -> None:
+        super().__init__()
+        self.net = net
+        self.register_buffer("mean255", IMAGENET_MEAN.clone() * 255.0)
+        self.register_buffer("std255", IMAGENET_STD.clone() * 255.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.mean255) / self.std255
+        return self.net(x).reshape(-1, 1)
 
 
 class DeployWrapper(nn.Module):
@@ -212,14 +236,17 @@ def load_checkpoint(net: nn.Module, ck: Optional[dict], bn_stats: str = "source"
 
 
 def detect_model_kind(args, ck: Optional[dict]) -> str:
-    """'cls' vs 'seg', read from the checkpoint when --model auto.
+    """'cls' / 'seg' / 'age', read from the checkpoint when --model auto.
 
     Classifier checkpoints (train_mbrset.py) record ``task``/``backbone`` in
-    their args; segmentation checkpoints (train_idrid.py) record ``lesions``.
+    their args; segmentation checkpoints (train_idrid.py) record ``lesions``;
+    retinal-age checkpoints (train_retinal_age.py) carry ``task == "retinal_age"``.
     """
     if args.model != "auto":
         return args.model
     if ck is not None:
+        if ck.get("task") == "retinal_age":
+            return "age"
         if "lesions" in ck or "lesions" in ckpt_args(ck):
             return "seg"
         a = ckpt_args(ck)
@@ -247,6 +274,33 @@ def build_wrapped_cls(args: argparse.Namespace, ck: Optional[dict]) -> Tuple[nn.
           f"gcg={'on' if use_gcg else 'off'}")
     trained = load_checkpoint(net, ck, args.bn_stats)
     wrapper = ClsDeployWrapper(net).eval()
+    for p_ in wrapper.parameters():
+        p_.requires_grad_(False)
+    return wrapper, trained, size
+
+
+def build_wrapped_age(args: argparse.Namespace, ck: Optional[dict]) -> Tuple[nn.Module, bool, int]:
+    """Retinal-age path: the checkpoint's own RetinalAgeModel (train_retinal_age.load_age_model),
+    or with no checkpoint the bare architecture for a latency probe (--backbone, --head)."""
+    from train_retinal_age import RetinalAgeModel, load_age_model
+    if ck is not None:
+        net, _ = load_age_model(args.checkpoint, torch.device("cpu"), bn_stats=args.bn_stats)
+        a = ckpt_args(ck)
+        size = int(a.get("image_size", net.image_size))
+        if args.image_size and args.image_size != size:
+            print(f"[warn] --image-size {args.image_size} ignored: the checkpoint was trained at {size}px")
+        backbone, trained = net.backbone_name, True
+    else:
+        backbone = args.backbone or "timm:mobilenetv4_conv_small.e2400_r224_in1k"
+        size = args.image_size or 384
+        centers = np.arange(0, args.ldl_bins, dtype=np.float32) if args.head == "ldl" else None
+        net = RetinalAgeModel(backbone, size, args.head, centers, 55.0, 15.0, pretrained=False, gcg="off")
+        trained = False
+    net.tta = False                                  # 4-view TTA is an eval-time option, not the app's
+    net.eval()
+    print(f"[info] arch: {backbone}  task=retinal_age  head={net.head_type}"
+          + (f" ({net.n_bins} bins)" if net.head_type == "ldl" else "") + f"  size={size}  tta=off")
+    wrapper = AgeDeployWrapper(net).eval()
     for p_ in wrapper.parameters():
         p_.requires_grad_(False)
     return wrapper, trained, size
@@ -316,7 +370,7 @@ def preprocess_spec(kind: str, size: int, bn_stats: str, checkpoint: Optional[st
         "export.quantize": quantize,
         "export.torch": torch.__version__,
     }
-    if kind == "cls":
+    if kind in ("cls", "age"):
         spec["preprocess.2_resize"] = (
             f"resize the FOV crop to exactly {size}x{size} (aspect ratio NOT preserved; no "
             "centre crop) with bilinear interpolation and antialiasing — torchvision "
@@ -326,7 +380,9 @@ def preprocess_spec(kind: str, size: int, bn_stats: str, checkpoint: Optional[st
             "training decoded JPEGs with PIL draft mode (DCT-domain downscale to the "
             "smallest scale >= target size); a full-resolution decode differs by JPEG "
             "rounding only")
-        spec["postprocess"] = "softmax BAKED IN; output[1] = P(positive class)"
+        spec["postprocess"] = ("softmax BAKED IN; output[1] = P(positive class)" if kind == "cls" else
+                               "head BAKED IN (linear de-standardisation or LDL expectation); "
+                               "output = predicted age in YEARS, no app-side scaling")
     else:
         spec["preprocess.2_resize"] = (
             f"resize the FOV crop to exactly {size}x{size} (aspect ratio NOT preserved) with "
@@ -353,7 +409,7 @@ def export(wrapper: nn.Module, args: argparse.Namespace, size: int, kind: str,
            spec: Dict[str, str]) -> str:
     import coremltools as ct
 
-    out_name = "class_prob" if kind == "cls" else "lesion_prob"
+    out_name = OUT_NAMES[kind]
     example = torch.randint(0, 256, (1, 3, size, size), dtype=torch.float32)
 
     # jit.trace is the best-supported coremltools front end. The dynamic
@@ -391,6 +447,11 @@ def export(wrapper: nn.Module, args: argparse.Namespace, size: int, kind: str,
             "Referable-DR fundus classifier (MBRSETClassifier). "
             "Input: 0-255 RGB. Output: class probabilities (softmax).")
         mlmodel.output_description[out_name] = "Class probabilities [1,C]; index 1 = positive."
+    elif kind == "age":
+        mlmodel.short_description = (
+            "Retinal age clock (RetinalAgeModel, train_retinal_age.py). "
+            "Input: 0-255 RGB. Output: predicted age in years.")
+        mlmodel.output_description[out_name] = "Predicted age in years [1,1]."
     else:
         mlmodel.short_description = (
             f"GCG-U-Net retinal lesion segmentation ({args.classes} channels). "
@@ -409,6 +470,11 @@ def export(wrapper: nn.Module, args: argparse.Namespace, size: int, kind: str,
     mlmodel.save(out)
     print(f"[ok]   saved {out}")
     return out
+
+
+OUT_NAMES = {"cls": "class_prob", "seg": "lesion_prob", "age": "age_years"}
+# fp16 tolerance per kind: probabilities in [0,1] vs. years on a 0-100 scale.
+DEFAULT_TOL = {"cls": 1e-2, "seg": 1e-2, "age": 0.5}
 
 
 # --------------------------------------------------------------------------- #
@@ -432,13 +498,13 @@ def preprocess_for_verify(path: str, size: int, kind: str) -> Tuple[torch.Tensor
     from fundus_utils import crop_to_fov
 
     with Image.open(path) as im:
-        if kind == "cls":
+        if kind in ("cls", "age"):
             im.draft("RGB", (size, size))        # MBRSETDataset(draft_decode=True)
         im = im.convert("RGB")
     arr, _ = crop_to_fov(np.asarray(im), tol=FOV_TOL)
     im = Image.fromarray(arr)
 
-    if kind == "cls":
+    if kind in ("cls", "age"):
         from dataset import build_transforms
         # The dataset's own eval pipeline, twice: once as trained (Normalize),
         # once with an identity Normalize so the pre-normalisation [0,1] pixels
@@ -466,6 +532,8 @@ def reference_output(wrapper: nn.Module, x_norm: torch.Tensor, kind: str) -> np.
     activation the wrapper bakes in. This is the number the training and
     evaluation scripts would have produced for this image."""
     logits = wrapper.net(x_norm)
+    if kind == "age":                                # RetinalAgeModel.forward already returns years
+        return logits.reshape(-1, 1).numpy()
     out = torch.softmax(logits, dim=1) if kind == "cls" else torch.sigmoid(logits)
     return out.numpy()
 
@@ -483,7 +551,8 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
     is used instead of the max: at fp16 a handful of boundary pixels on a
     512x512x4 map routinely diverge by more than any sane tolerance without
     the mask changing, and a hard max would fail every export for nothing.
-    Mask agreement at thr=0.5 must also be >= 99%.
+    Mask agreement at thr=0.5 must also be >= 99%. For the age clock the
+    statistic is the max |years_torch - years_coreml| against ``tol`` in years.
     """
     import coremltools as ct
     from PIL import Image
@@ -492,7 +561,7 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
         print("[skip] verification requires macOS")
         return True
 
-    out_name = "class_prob" if kind == "cls" else "lesion_prob"
+    out_name = OUT_NAMES[kind]
     mlmodel = ct.models.MLModel(path, compute_units=ct.ComputeUnit.ALL)
 
     def run_coreml(u8: np.ndarray, shape) -> np.ndarray:
@@ -512,6 +581,9 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
         if kind == "cls":
             print(f"  torch probs   : {np.round(torch_out.ravel(), 4)}")
             print(f"  coreml probs  : {np.round(cm_out.ravel(), 4)}")
+        elif kind == "age":
+            print(f"  torch years   : {float(torch_out.ravel()[0]):.3f}")
+            print(f"  coreml years  : {float(cm_out.ravel()[0]):.3f}")
         else:
             agree = float(((torch_out > 0.5) == (cm_out > 0.5)).mean())
             print(f"  mask agreement: {agree*100:.3f}% of pixels @ thr=0.5")
@@ -543,6 +615,10 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
             print(f"  {os.path.basename(f):<28} p_torch={ref.ravel()[1]:.4f} "
                   f"p_coreml={cm.ravel()[1]:.4f} maxdiff={stat:.5f} "
                   f"{'' if ok_arg else '  <-- ARGMAX DISAGREES'}")
+        elif kind == "age":
+            stat, stat_u8 = float(d.max()), float(d_u8.max())
+            print(f"  {os.path.basename(f):<28} years_torch={ref.ravel()[0]:.2f} "
+                  f"years_coreml={cm.ravel()[0]:.2f} diff={stat:.3f}")
         else:
             stat, stat_u8 = float(np.percentile(d, 99)), float(np.percentile(d_u8, 99))
             a = float(((ref > 0.5) == (cm > 0.5)).mean())
@@ -550,13 +626,15 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
             print(f"  {os.path.basename(f):<28} p99diff={stat:.5f} mask-agree={a*100:.3f}%")
         worst_diff, worst_u8 = max(worst_diff, stat), max(worst_u8, stat_u8)
 
-    label = "max abs diff" if kind == "cls" else "p99 abs diff"
+    label = "p99 abs diff" if kind == "seg" else "max abs diff"
     print(f"  worst {label:<13}: {worst_diff:.6f}   (vs training-pipeline float input)")
     print(f"  worst {label:<13}: {worst_u8:.6f}   (vs the same uint8 bytes in fp32 torch — "
           "isolates fp16/ANE error from uint8 rounding)")
     if kind == "cls":
         print(f"  argmax agreement : {len(files) - disagree}/{len(files)}")
         ok = worst_diff <= tol and disagree == 0
+    elif kind == "age":
+        ok = worst_diff <= tol
     else:
         min_agree = min(agree_px)
         print(f"  min mask agreement: {min_agree*100:.3f}% @ thr=0.5")
@@ -642,11 +720,15 @@ def main() -> int:
                    help="Which BatchNorm statistics to export: 'source' = the checkpoint's "
                         "'model' weights; 'adapted' = the AdaBN weights train_mbrset.py "
                         "--bn-adapt stores under 'model_bnadapt' (fails if absent).")
-    p.add_argument("--model", default="auto", choices=["auto", "seg", "cls"],
-                   help="'auto' reads it from the checkpoint (seg=train_idrid, cls=train_mbrset).")
+    p.add_argument("--model", default="auto", choices=["auto", "seg", "cls", "age"],
+                   help="'auto' reads it from the checkpoint (seg=train_idrid, cls=train_mbrset, "
+                        "age=train_retinal_age).")
     p.add_argument("--backbone", default=None,
-                   help="cls only: override/for random-weight probes, e.g. "
+                   help="cls/age: override/for random-weight probes, e.g. "
                         "timm:mobilenetv4_conv_small (default: from checkpoint).")
+    p.add_argument("--head", default="linear", choices=["linear", "ldl"],
+                   help="age probes without a checkpoint: the head to build (a checkpoint carries its own).")
+    p.add_argument("--ldl-bins", type=int, default=100, help="age probes with --head ldl: number of bins.")
     p.add_argument("--classes", type=int, default=None,
                    help="Output channels/classes (default: 4 for seg, 2 for cls).")
     p.add_argument("--image-size", type=int, default=None,
@@ -670,8 +752,9 @@ def main() -> int:
                         "and compare Core ML vs PyTorch with pass/fail (exit 1 on failure). "
                         "Without it only a noise smoke test runs.")
     p.add_argument("--verify-n", type=int, default=16, help="Max images from --verify-images.")
-    p.add_argument("--tol", type=float, default=1e-2,
-                   help="Max |p_torch - p_coreml| allowed (1e-2 is appropriate for fp16).")
+    p.add_argument("--tol", type=float, default=None,
+                   help="Max |torch - coreml| allowed: default 1e-2 on probabilities (cls/seg), "
+                        "0.5 years for the age clock (fp16).")
     p.add_argument("--skip-verify", action="store_true")
     # Benchmark — 10 warm-up + 60 timed matches the README's stated protocol.
     p.add_argument("--warmup", type=int, default=10, help="Untimed runs per compute unit.")
@@ -681,8 +764,12 @@ def main() -> int:
 
     ck = read_checkpoint(args.checkpoint)          # once; every consumer gets the dict
     kind = detect_model_kind(args, ck)
+    if args.tol is None:
+        args.tol = DEFAULT_TOL[kind]
     if kind == "cls":
         wrapper, trained, size = build_wrapped_cls(args, ck)
+    elif kind == "age":
+        wrapper, trained, size = build_wrapped_age(args, ck)
     else:
         if args.classes is None:
             args.classes = 4
@@ -691,7 +778,7 @@ def main() -> int:
         size = args.image_size
         wrapper, trained = build_wrapped(args, ck)
     n_params = sum(q.numel() for q in wrapper.parameters())
-    print(f"[info] model    : {'classifier' if kind == 'cls' else 'GCG-U-Net'}, "
+    print(f"[info] model    : {dict(cls='classifier', age='retinal age clock').get(kind, 'GCG-U-Net')}, "
           f"{n_params/1e6:.2f}M params @ {size}px")
     print(f"[info] weights  : {args.checkpoint if trained else 'RANDOM (untrained)'}")
     print(f"[info] bn stats : {args.bn_stats}"

@@ -7,7 +7,10 @@ Aggregate ``train_retinal_age.py`` runs named ``<condition>_seed<n>.json``
 ``teacher_seed<n>``): mean ± SD per condition of the in-domain healthy MAE, the
 whole-test MAE, the mBRSET MAE zero-shot and after AdaBN, Pearson r, the
 non-healthy-minus-healthy corrected gap, and the **MAE-by-age-bin** table
-averaged over seeds. If two conditions share seeds, their MAE difference is
+averaged over seeds. Every set also gets its **patient-level MAE** (both eyes of
+a patient averaged before the error is taken — the number a two-eye phone exam
+delivers, and the one to headline) and the patient count. Auxiliary training
+sets (``--aux-train-root``, e.g. ODIR-5K) are listed with their own test rows. If two conditions share seeds, their MAE difference is
 paired by seed (``run_experiment.paired_stats``).
 
 It also pools the per-run predictions tables into ``<dir>/predictions_pooled.csv``
@@ -40,6 +43,23 @@ SETS = [("test_healthy", "{tr} test, healthy"), ("test_all", "{tr} test, all"),
         ("extra_unseen_nonhealthy", "{xt} non-healthy, never trained (mixed-in)"),
         ("external", "{ex} {zs}"), ("external_recal", "{ex} device-calibrated"),
         ("external_bnadapt", "{ex} + AdaBN"), ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
+AUX_KEYS = ("test_healthy", "test_all", "test_nonhealthy", "unseen_nonhealthy")
+
+
+def sets_for(r0):
+    """SETS plus one block per auxiliary training set found in the run."""
+    out = list(SETS)
+    for a in r0.get("aux") or []:
+        ds = a["dataset"]
+        out += [(f"aux_{ds}_test_healthy", f"{ds} test, healthy (auxiliary)"),
+                (f"aux_{ds}_test_all", f"{ds} test, all (auxiliary)"),
+                (f"aux_{ds}_test_nonhealthy", f"{ds} test, non-healthy (auxiliary)"),
+                (f"aux_{ds}_unseen_nonhealthy", f"{ds} non-healthy, never trained (auxiliary)")]
+    return out
+
+
+HEADER = (f"   {'set':<42}{'MAE (y)':<15}{'patient MAE':<15}{'r':<15}{'mean gap':<15}"
+          f"{'corrected gap':<15}{'n':>6}{'pts':>6}")
 BIN_SETS = [("test_healthy", "{tr} test healthy"), ("external", "{ex} {zs}"),
             ("external_recal", "{ex} device-calibrated"), ("external_bnadapt", "{ex} + AdaBN"),
             ("external_bnadapt_recal", "{ex} + AdaBN, device-calibrated")]
@@ -58,6 +78,10 @@ def load(d):
             r = json.load(f)
         if r.get("task") != "retinal_age":
             continue
+        for a in r.get("aux") or []:                    # flatten per-auxiliary-set results
+            for k in AUX_KEYS:
+                if a.get(k) is not None:
+                    r[f"aux_{a['dataset']}_{k}"] = a[k]
         out.setdefault(cond, {})[seed] = r
     return out
 
@@ -110,11 +134,16 @@ def ensemble_lines(pooled, cond, r0):
         if len(f) < 2:
             return
         err = np.abs(f[col] - f["age"]); r = np.corrcoef(f["age"], f[col])[0, 1]
-        out.append(f"   {label:<42}{err.mean():<15.2f}{r:<15.3f}{'':<30}{len(f):>6}")
+        pt = f.groupby("patient")[[col, "age"]].mean()          # both eyes averaged, then the error
+        pmae = float(np.abs(pt[col] - pt["age"]).mean())
+        out.append(f"   {label:<42}{err.mean():<15.2f}{pmae:<15.2f}{r:<15.3f}{'':<30}{len(f):>6}{len(pt):>6}")
 
     line(f"{tr} test, healthy", d[(d["dataset"] == tr) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
     if xt:
         line(f"{xt} test, healthy (mixed-in)", d[(d["dataset"] == xt) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
+    for a in r0.get("aux") or []:
+        ds = a["dataset"]
+        line(f"{ds} test, healthy (auxiliary)", d[(d["dataset"] == ds) & (d["split"] == "test") & (d["cohort"] == "healthy")], "pred_age")
     if ex:
         e = d[d["dataset"] == ex]
         for col, label in (("pred_age", "zero-shot" if not r0.get("external_held_out") else "held-out"),
@@ -153,21 +182,26 @@ def main() -> int:
         if r0.get("extra_dataset"):
             L.append(f"   mixed-domain: + {r0['extra_dataset']} healthy={r0.get('extra_healthy')} "
                      f"(train {r0.get('n_extra_train')}, val {r0.get('n_extra_val')}); external = held-out rows")
+        for a in r0.get("aux") or []:
+            L.append(f"   auxiliary: + {a['dataset']} healthy={a.get('healthy')} x{a.get('weight')} "
+                     f"(train {a.get('n_train')}, val {a.get('n_val')}); its test partition is scored only")
         if r0.get("teacher"):
             L.append(f"   distilled from {r0.get('teacher_backbone')} (alpha={r0.get('kd', {}).get('alpha')})")
         L.append(f"   head={r0.get('head', {}).get('type', 'linear')}  tta={r0.get('tta', False)}  "
                  f"phone_aug={r0.get('phone_aug', False)}")
-        L.append(f"\n   {'set':<42}{'MAE (y)':<15}{'r':<15}{'mean gap':<15}{'corrected gap':<15}{'n':>6}")
-        for key, label in SETS:
+        L.append("\n" + HEADER)
+        for key, label in sets_for(r0):
             recs = [by_seed[s].get(key) for s in seeds]
             recs = [x for x in recs if x and x.get("n")]
             if not recs:
                 continue
             mae = agg([x["mae"] for x in recs]); r = agg([x["r"] for x in recs])
+            pm = agg([x.get("patient_mae") for x in recs])
             g = agg([x["mean_gap"] for x in recs]); gc = agg([x.get("mean_gap_corrected") for x in recs])
-            L.append(f"   {label.format(**names):<42}{fmt(*mae):<15}{fmt(*r, prec=3):<15}{fmt(*g):<15}"
-                     f"{fmt(*gc):<15}{recs[0]['n']:>6}")
-        L.append("   (corrected gap: zero-shot / AdaBN rows use the in-domain fit, which is NOT valid on the "
+            L.append(f"   {label.format(**names):<42}{fmt(*mae):<15}{fmt(*pm):<15}{fmt(*r, prec=3):<15}"
+                     f"{fmt(*g):<15}{fmt(*gc):<15}{recs[0]['n']:>6}{recs[0].get('n_patients', 0):>6}")
+        L.append("   (patient MAE: both eyes of a patient averaged before the error — the two-eye exam number; "
+                 "corrected gap: zero-shot / AdaBN rows use the in-domain fit, which is NOT valid on the "
                  "external set; device-calibrated rows use a fit within the external set)")
         if pooled is not None:
             L += ensemble_lines(pooled, cond, r0)
@@ -232,8 +266,10 @@ def main() -> int:
                 a, b = conds[i], conds[j]
                 # same training data means same primary set AND same mixed-in set: a *_mix run's
                 # external rows are a different population from a plain run's
-                ta = {(r.get("train_dataset"), r.get("extra_dataset")) for r in runs[a].values()}
-                tb = {(r.get("train_dataset"), r.get("extra_dataset")) for r in runs[b].values()}
+                key = lambda r: (r.get("train_dataset"), r.get("extra_dataset"),
+                                 tuple(sorted(x["dataset"] for x in r.get("aux") or [])))
+                ta = {key(r) for r in runs[a].values()}
+                tb = {key(r) for r in runs[b].values()}
                 if ta != tb:
                     continue
                 for key, label in (("test_healthy", "in-domain healthy MAE"), ("external", "external MAE"),
