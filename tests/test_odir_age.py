@@ -60,7 +60,7 @@ def _odir_tree(tmp_path, n_pat=12):
     rows = []
     for p in range(n_pat):
         lk, rk = kw.get(p, ("normal fundus", "normal fundus"))
-        age = int(rng.integers(20, 85))
+        age = 1 if p == 5 else int(rng.integers(20, 85))    # p=5: ODIR's placeholder age
         for side, k in (("left", lk), ("right", rk)):
             fn = f"{p}_{side}.jpg"
             Image.fromarray(rng.integers(0, 255, (48, 48, 3), dtype=np.uint8)).save(root / "preprocessed_images" / fn)
@@ -88,6 +88,8 @@ def test_load_odir_carries_age_fields_and_load_any_dispatches(tmp_path):
     assert eye.loc["2_left.jpg", "final_quality"] == 0.0 and eye.loc["2_left.jpg", "normal_fundus"] == 1.0
     assert eye.loc["3_left.jpg", "final_icdr"] == 2.0 and eye.loc["3_right.jpg", "final_icdr"] == 1.0
     assert np.isnan(eye.loc["4_left.jpg", "normal_fundus"])
+    assert np.isnan(eye.loc["5_left.jpg", "age"]) and np.isnan(eye.loc["5_right.jpg", "age"])   # placeholder age 1
+    assert eye["age"].notna().sum() == 22
     assert df["glaucoma"].notna().sum() > 0                    # the glaucoma branch's labels still ride along
     # the same adapter through the direct entry point
     assert len(load_odir(root)["df"]) == 24
@@ -110,6 +112,7 @@ def test_cohort_normal_rule_is_patient_level_and_refuses_without_column(tmp_path
     # an eye whose keywords say nothing (lens dust only) is NOT normal -> the patient is excluded
     assert not c.loc["4_right.jpg", "healthy"] and c.loc["4_right.jpg", "exclusion"] == "abnormal"
     assert c["diabetes"].isna().all()                          # ODIR has no systemic diabetes column
+    assert "5_left.jpg" not in c.index and len(c) == 22        # the placeholder-age patient never enters
     # a BRSET-schema frame has no normal_fundus column: refuse rather than train on everyone
     with pytest.raises(ValueError, match="normal_fundus"):
         build_cohort(df.drop(columns=["normal_fundus"]), healthy="normal")

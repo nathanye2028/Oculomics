@@ -58,17 +58,44 @@ young and old tails.
 
 **ODIR-5K as an auxiliary training set (built 12 September).** The Kaggle
 mirror of ODIR-5K (`andrewmvd/ocular-disease-recognition-odir5k`: 6,392 eyes of
-3,358 patients, several tabletop cameras, ages 1–91 with mean 57.9) carries an
-age and per-eye diagnostic keywords. Under the same patient-level rule as BRSET
-— every eye of the patient reads "normal fundus" and nothing else, adequate
-quality — it contributes **2,152 training-eligible images from 1,150 patients**
-(excluded: 4,130 abnormal, 110 ungradable; verified on the real files with
-`--inspect`). Its 70/10/20 patient split gives 1,504 training and 214
-validation images, roughly 30 % more healthy training retinas on top of
-BRSET's 5,200, and a 434-image / 237-patient test partition that is scored as a
-third-camera sanity check. It joins training only (`AUX=1`): own split, own bias
-correction, never the external set. Its healthy ages are 40–70 heavy like
-BRSET's (26 under-30 training images), so it does not fix the tails.
+3,358 patients, several tabletop cameras, mean age 57.9) carries an age and
+per-eye diagnostic keywords. Under the same patient-level rule as BRSET — every
+eye of the patient reads "normal fundus" and nothing else, adequate quality — it
+contributes **2151 training-eligible images from 1149 patients** (of 6364
+with a usable age; excluded: 4103 abnormal, 110 ungradable; verified on the
+real files with `--inspect`). Its 70/10/20 patient split gives 1483 training
+and 234 validation images, roughly 30 % more healthy training retinas on top
+of BRSET's 5,200, and a 434-image / 233-patient test partition that is
+scored as a third-camera sanity check. It joins training only (`AUX=1`): own
+split, own bias correction, never the external set. Its healthy ages are 40–70
+heavy like BRSET's (26 under-30 training images), so it does not fix the tails.
+
+*Provenance and audit (13 September).* The data are the training set of the
+ODIR-2019 challenge (Peking University's health-data and AI institutes with
+Shanggong Medical Technology; fundus photos from several Chinese hospitals on
+Canon, Zeiss and Kowa cameras; "annotations labeled by trained human readers
+with quality control management"). The Kaggle mirror was posted in 2020 by
+Larxel (Andrew Maranhão, senior data scientist at Hospital Israelita Albert
+Einstein, São Paulo; Kaggle Datasets Grandmaster, 104 datasets), has 566
+upvotes, 66 k downloads and 265 public notebooks, and adds no labels of its
+own. The checks run here on the downloaded files: the mirror's `full_df.csv`
+matches the original annotation sheet `data.xlsx` on every field for all 6,392
+rows; the mirror drops 608 of the 7,000 original images (142 patients; mostly
+lens-dust and normal eyes, the originals are still in the package); its 512 px
+`preprocessed_images` are a field-of-view crop squashed to a square, i.e. the
+same operation our loader applies to BRSET (correlation 0.97–0.999 against our
+own crop); 16 records carry the placeholder age 1 (all female, mostly
+pathological myopia) and are now read as unknown, so the usable age range is
+14–91; two patients are filed twice under different IDs (both eyes
+identical, same age and sex; one of the pairs is in the healthy cohort, so it
+can straddle ODIR's own train/test split — the only leakage, and only into
+ODIR's own test number); a third-party audit that reports 42 % "patient
+leakage" refers to naive image-level splitting, which this trainer never does;
+and 139 patients flagged normal at the patient level have lens dust on an eye,
+which our quality-required rule excludes. No licence is stated at the source
+or on Kaggle ("license was not specified on source"), so the set is used for
+research only and never redistributed, and the challenge organisers are the
+citation, not the mirror.
 
 ## 3. Method
 

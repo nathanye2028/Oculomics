@@ -59,6 +59,9 @@ usage: B=<BRSET root> M=<mBRSET root> [KNOB=value ...] bash run_retinal_age.sh [
                    (--aux-train-root; scored on its own test split, never external);
                    run names get TAG+=_odir                                            (default 0)
     AUX_WEIGHT     sampling multiplier for the auxiliary images                        (default 1.0)
+    SKIP_STUDENT   1 = do not train student<TAG>_seed<s>: for a SECOND GPU running the teacher /
+                   KD / medium / gcg arms into the same OUT and CK while the first GPU trains
+                   the students (distinct run names, so the two never write the same file) (default 0)
   recipe
     HEAD           linear | ldl (label-distribution head)                          (default linear)
     TTA            1 = average four flip views at evaluation                       (default 0)
@@ -118,6 +121,7 @@ EXTRA_WEIGHT=${EXTRA_WEIGHT:-1.0}
 O=${O:-}
 AUX=${AUX:-0}
 AUX_WEIGHT=${AUX_WEIGHT:-1.0}
+SKIP_STUDENT=${SKIP_STUDENT:-0}
 export KAGGLEHUB_CACHE=${KAGGLEHUB_CACHE:-$HOME/.cache/kagglehub}
 HEAD=${HEAD:-linear}
 TTA=${TTA:-0}
@@ -156,7 +160,8 @@ AUXF=()
 if [ "$AUX" = 1 ]; then
   [ -n "$O" ] || { echo "[fatal] AUX=1 needs O=<ODIR-5K root> or O=kaggle:andrewmvd/ocular-disease-recognition-odir5k"; exit 1; }
   case "$O" in
-    kaggle:*) O=$($PY -c "import sys, kagglehub; print(kagglehub.dataset_download(sys.argv[1]))" "${O#kaggle:}") \
+    # kagglehub prints its version warning and progress lines on stdout too: keep only the path (last line)
+    kaggle:*) O=$($PY -c "import sys, kagglehub; print(kagglehub.dataset_download(sys.argv[1]))" "${O#kaggle:}" 2>/dev/null | tail -n 1) \
                 || { echo "[fatal] kagglehub could not fetch $O"; exit 1; };;
   esac
   [ -d "$O" ] || { echo "[fatal] ODIR-5K root not found: $O"; exit 1; }
@@ -204,7 +209,7 @@ run() {  # run <name> <flags...>
 }
 
 for s in "${SEEDS[@]}"; do
-  run "student${TAG}_seed$s" --seed "$s" --backbone "$STUDENT"
+  [ "$SKIP_STUDENT" = 1 ] || run "student${TAG}_seed$s" --seed "$s" --backbone "$STUDENT"
   if [ -n "$TEACHER" ]; then
     # shellcheck disable=SC2086
     run "teacher${TAG}_seed$s" --seed "$s" --backbone "$TEACHER" --lr "$TEACHER_LR" $TEACHER_EXTRA

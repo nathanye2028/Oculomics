@@ -208,7 +208,7 @@ distilled from it — regression KD on the predicted age), and `MIX=1`
 cohort rule, split and bias correction; the external numbers are then computed
 on mBRSET's held-out rows only, and conditions are named `*_mix`), and
 `AUX=1` with `O=<ODIR-5K root>` or `O=kaggle:andrewmvd/ocular-disease-recognition-odir5k`
-(ODIR-5K's normal-fundus patients — 2,152 gradable images from 1,150 patients
+(ODIR-5K's normal-fundus patients — 2151 gradable images from 1149 patients
 under the patient-level rule — join training as an auxiliary set with their
 own split and bias correction; scored on their own test partition, never used
 as the external set; conditions get `_odir` appended). The summariser adds a

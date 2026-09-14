@@ -34,7 +34,8 @@ and ``--inspect`` shows what was actually joined before any GPU time is spent.
                        For the retinal-age clock (train_retinal_age.py) every eye
                        also carries ``final_quality``, ``normal_fundus`` and
                        ``final_icdr`` read from the same keywords (see
-                       :func:`odir_age_fields`), plus ``keywords`` and ``camera``.
+                       :func:`odir_age_fields`), plus ``keywords`` and ``camera``;
+                       the placeholder age 1 (16 records) becomes NaN.
 
 Every adapter returns ``{"df", "images_dir", "csv", "source"}`` with columns
 ``file`` (relative to ``images_dir``, may contain sub-directories), ``patient``,
@@ -295,6 +296,10 @@ _ODIR_DR_GRADES = (("proliferative diabetic retinopathy", 4.0),
                    ("moderate nonproliferative retinopathy", 2.0), ("moderate non proliferative retinopathy", 2.0),
                    ("mild nonproliferative retinopathy", 1.0), ("mild non proliferative retinopathy", 1.0))
 _ODIR_DR_UNGRADED = "diabetic retinopathy"       # plain / "suspected" / "suspicious": DR, grade not given
+# 16 training records carry "Patient Age" 1 (all female, mostly pathological myopia / AMD:
+# adults with a placeholder, not infants). Treated as unknown so no age model trains on
+# or is scored against them. Verified on the 2020 Kaggle mirror's data.xlsx.
+_ODIR_AGE_PLACEHOLDER_MAX = 1.0
 
 
 def _odir_tokens(keywords) -> List[str]:
@@ -361,7 +366,9 @@ def load_odir(root: str, image_ext: str = ".jpg") -> Dict[str, object]:
     fnc = _col(t, "filename")
     for _, r in t.iterrows():
         pid = str(r[idc]) if idc else None
-        age = r[agec] if agec else np.nan
+        age = pd.to_numeric(r[agec], errors="coerce") if agec else np.nan
+        if age == age and age <= _ODIR_AGE_PLACEHOLDER_MAX:
+            age = np.nan
         sex = sex_map.get(str(r[sexc]).strip().lower(), np.nan) if sexc else np.nan
         if fnc:                                         # Kaggle full_df: one row per eye
             fn = str(r[fnc])
