@@ -77,6 +77,8 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_kd_xfer.sh` | The paired ctrl / teacher / kd design per seed; `B=`/`M=` required, `--help` lists every knob |
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
+| `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py` | Retinal age regression on BRSET's healthy cohort → mBRSET; MAE by age bin and patient level (both eyes), bias-corrected age gap, per-image predictions table; `MIX=1` mixes mBRSET in, `AUX=1` adds ODIR-5K's normal-fundus patients as an auxiliary training set (branch `disease/retinal-age`) |
+| `public_fundus.py` | Adapters for the public sets in the mBRSET schema; here ODIR-5K (Kaggle mirror, `kaggle:andrewmvd/ocular-disease-recognition-odir5k`) with per-eye `normal_fundus` / quality / DR grade read from the diagnostic keywords |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
 | `gcg_blocks.py` | GCG variants (`attention`, `cbam`, `se`, `none`) + registry — drop a custom block in here |
@@ -85,6 +87,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `run_experiment.py` | `{GCG, control} × seeds` harness with paired CI; `--eval-tiled-val` on by default with tiled eval; `--quick` writes to `*_quick/` scratch dirs; non-default configs get their own `experiments/<slug>/` |
 | `run_arch_sweep.py` | Encoder / decoder sweep on the same harness |
 | `eval_fgadr.py` | Score a checkpoint on FGADR (gating and GCG variant read from the checkpoint) |
+| `save_gcg_maps.py` | Save the GCG attention maps (spatial + channel gates at every gated skip) as `.npz`, overlay panels and an on-lesion vs off-lesion stats CSV; whole-image or tiled; seg or classifier checkpoints |
 | `idrid_dataset.py`, `fgadr_dataset.py`, `multi_seg_dataset.py`, `retlesion_dataset.py`, `vessel_dataset.py`, `ddr_dataset.py`, `rfmid_dataset.py` | Lesion / vessel / classification sources; every seg source implements `load_full(idx) -> (img, masks)` + a per-channel `valid` vector |
 | `pretrain_encoder.py`, `pretrain_vessel.py`, `pretrain_retlesion.py` | In-domain pretraining options (`--init-encoder`, `--init-weights`) |
 | `losses.py` | `lesion_seg` loss (focal Tversky + focal BCE) via `--loss lesion_seg` |
@@ -93,7 +96,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `fundus_utils.py` | Seeding (`make_rng` is safe with persistent workers), FOV crop, losses, tiled inference, `pick_device` |
 | `metrics.py` | Kappa, Dice/IoU (NaN for absent lesions), AUPRC, CSV/TensorBoard logging |
 | **Deployment** | |
-| `export_coreml.py` | Core ML export (seg or cls, read from the checkpoint); `--bn-stats {source,adapted}`; per-compute-unit ANE/GPU/CPU benchmark; `--verify-images DIR` real-image pass/fail; preprocessing spec written into the model metadata |
+| `export_coreml.py` | Core ML export (seg, cls or the retinal-age clock, read from the checkpoint; the clock's head is folded in so the output is years); `--bn-stats {source,adapted}`; per-compute-unit ANE/GPU/CPU benchmark; `--verify-images DIR` real-image pass/fail; preprocessing spec written into the model metadata |
 | `evaluate_deploy.py` | FP32 vs INT8 accuracy, val-calibrated operating point (also on `--external-root`), ONNX-CPU proxy latency (key `latency_ms_cpu_onnx` — not a device number) |
 | `edge_optimize.py` | ONNX export + static INT8 quantisation helpers |
 | `artifacts.py`, `validate_artifacts.py` | Artifact-reduction preprocessing and its validation |
@@ -148,6 +151,98 @@ Design points that the code enforces:
 - **Imbalance** is corrected once (`--imbalance sampler`); `--amp` is bf16 on
   MPS, fp16 + GradScaler on CUDA, identically for every arm.
 
+## Retinal age: BRSET healthy cohort → mBRSET (branch `disease/retinal-age`)
+
+Retinal age is regressed from the fundus photograph on BRSET's **healthy**
+cohort (no diabetes, every image DR grade 0 at the patient level, adequate
+quality — `--healthy nodm`; `dr0` keeps diabetics without retinopathy,
+`--exclude-pathology` also drops BRSET's other ophthalmic flags). The
+patient-grouped, age-stratified 70/10/20 split is drawn over *all* patients
+first, so the diseased ones are never trained on and can all be scored. Same
+loader, model (`regression=True`), recipe and AdaBN as the classifier.
+
+```bash
+# cohort report only (no images touched): how many healthy images/patients survive, age bins per split
+python train_retinal_age.py --root <BRSET> --external-test-root <mBRSET> --inspect
+# one seed: healthy val MAE selects the checkpoint; BRSET test (healthy / all / non-healthy) and
+# mBRSET (zero-shot, then AdaBN) are reported with MAE by age bin and a DR-grade breakdown
+python train_retinal_age.py --root <BRSET> --external-test-root <mBRSET> --seed 0 --bn-adapt \
+    --results-json exp_retinal_age/student_seed0.json
+# seeds (+ optional large-backbone reference on the same split), then mean ± SD, per-bin table,
+# paired contrast and a pooled per-image predictions table for the disease-association step
+B=<BRSET> M=<mBRSET> [TEACHER=timm:convnext_small.fb_in22k_ft_in1k] bash run_retinal_age.sh 0 1 2
+python summarize_retinal_age.py --dir exp_retinal_age
+```
+
+Outputs per run: the results JSON (MAE / RMSE / r / R² / mean gap, **MAE by
+age bin** — BRSET is 40-70 heavy, so expect the tails to be worse — patient-level
+MAE, mBRSET by DR grade) and `<ckpt-dir>/<run>_predictions.csv` with one row per
+scored image: age, prediction, raw gap and **bias-corrected gap** (`gap = a +
+b·age` fit on healthy val and subtracted, Beheshti et al. 2019 — the raw gap is
+anti-correlated with age and would confound any disease association). Every
+mBRSET patient is diabetic and the camera differs, so the mBRSET MAE mixes device
+and biology; read the within-mBRSET DR-grade breakdown for the biological part.
+
+The first 3-seed sweep (7 September) gave BRSET healthy-test MAE ≈ 5.1 y with
+tails at 6.0 / 6.5 y, but zero-shot mBRSET MAE ≈ 14 y (worse than predicting
+the mean) and ≈ 9.7 y after AdaBN: the transferred clock reads age on phone
+images at a compressed scale (about 0.5 predicted years per true year) plus an
+offset — the age analogue of the DR operating point not transferring. Two
+answers are built in: every run also reports the external set
+**device-calibrated** (`external_recal`: a linear `age ≈ c + d·pred` fit on the
+external DR-0 patients in two patient-grouped folds, scored out of fold, with
+its own within-set bias correction `gap_recal_corrected` — the gap to use for
+any within-mBRSET association), and `CEILING=1 bash run_retinal_age.sh` adds
+the phone-domain ceiling per seed (the same model trained in-domain on
+mBRSET's DR-0 patients, `--dataset mbrset --healthy dr0`, with BRSET as the
+reverse external set). The lab-box launcher has a `retinalage` target
+(`bash launch_disease_runs.sh retinalage`).
+
+Levers for a sharper clock, each a knob of `run_retinal_age.sh` (all off by
+default): `HEAD=ldl` (label-distribution head over 1-year bins), `TTA=1` (four
+flip views at evaluation), `PHONE_AUG=1` (smartphone-capture simulation in
+training), `AGE_BALANCE=1`, `SIZE=512`, `TEACHER=<timm backbone>` (a large
+model on the same split; with `KD=1`, the default, the student is then
+distilled from it — regression KD on the predicted age), and `MIX=1`
+(mixed-domain training: mBRSET's DR-0 patients join training with their own
+cohort rule, split and bias correction; the external numbers are then computed
+on mBRSET's held-out rows only, and conditions are named `*_mix`), and
+`AUX=1` with `O=<ODIR-5K root>` or `O=kaggle:andrewmvd/ocular-disease-recognition-odir5k`
+(ODIR-5K's normal-fundus patients — 2151 gradable images from 1149 patients
+under the patient-level rule — join training as an auxiliary set with their
+own split and bias correction; scored on their own test partition, never used
+as the external set; conditions get `_odir` appended). The summariser adds a
+seed-ensemble line (per-image mean over seeds) and a patient-level MAE column
+(both eyes of a patient averaged before the error — the two-eye exam number)
+to every table. Two more arms: `MEDIUM=1` trains a MobileNetV4-Medium student (the capacity
+lever that still fits the phone budget) and `GCG=baseline|attention|cbam|se`
+trains a paired `ctrl` / `gcg` ablation on the MobileNetV3-Small trunk (GCG is
+V3-specific; the summary pairs them). `explain_retinal_age.py` writes Grad-CAM
+overlays (evidence for *older*) for a strip of retinas across the age range
+and, for a GCG checkpoint, the gate's spatial map via `record_gcg_gates`, plus
+a CSV of where the attention mass sits. On CUDA the trainer probes a training step at start-up and halves the
+batch with gradient accumulation until it fits the card (the lab box's GPUs
+have 11.6 GiB), tolerates a bounded number of mid-run OOMs from a neighbouring
+process, and records `batch_size_used`, `grad_accum_used`, `oom_skips` and
+`peak_gpu_gib` in the results JSON.
+
+Step 2 — the gap against disease — is `analyze_age_gap.py`, run automatically at
+the end of the sweep and usable on any predictions table:
+
+```bash
+python analyze_age_gap.py --predictions exp_retinal_age/predictions_pooled.csv --brset-csv <BRSET>/labels_brset.csv
+```
+
+Patient-level (both eyes averaged), gradable images only, adjusted for age,
+age², sex and camera: per exposure (diabetes, insulin, any / referable DR,
+edema, BRSET's ophthalmic flags, mBRSET's systemic labels) the adjusted
+difference in corrected gap with 95 % CI, p and BH q, **prevalence by quintile
+of the gap** with the OR per +5 years, the DR-grade trend, the
+diabetes-duration trend, and an image-quality artefact check (ungradable vs
+gradable among disease-free patients). External rows use the device-calibrated,
+within-set-corrected gap; the in-domain correction is never applied across
+devices.
+
 ## Segmentation: GCG vs control
 
 The control for "does gating help?" is the **same backbone with gating off**
@@ -173,6 +268,32 @@ python eval_fgadr.py --checkpoint checkpoints/gcg_seed0.pt --tiled
 Plug in a custom GCG block: implement `forward(skip, guide) -> skip-shaped` in
 `gcg_blocks.py`, register it in `GCG_VARIANTS`, benchmark with
 `run_experiment.py --gcg-variant <name>`.
+
+### What the gates attend to
+
+```bash
+# every gated level (strides 16, 8, 4, 2, 1) on FGADR test images, with ground truth
+python save_gcg_maps.py --checkpoint checkpoints/fgadr_gcg.pt --dataset fgadr --split test --limit 8
+python save_gcg_maps.py --checkpoint checkpoints/fgadr_gcg.pt --dataset idrid --tiled --limit 6   # native res, stitched
+python save_gcg_maps.py --checkpoint ck/gcg_seed0.pt --images <mBRSET>/images --limit 16          # classifier gate
+```
+
+Per image you get `<stem>.npz` (each gate's spatial map at its own resolution
+plus its channel vector), `<stem>.png` (image, ground truth, prediction and one
+heat-map per gate; `--separate-pngs` for individual files, `--stretch` for
+min-max-stretched overlays), and `gate_stats.csv` with the mean attention on
+lesion pixels vs off them per gate and lesion class. In code:
+
+```python
+from model_seg import record_gcg_gates, collect_gcg_gates
+with record_gcg_gates(net):
+    logits = net(x)
+    gates = collect_gcg_gates(net)   # {"decoders.0.gcg": {"spatial": [B,1,h,w], "channel": [B,C]}, ...}
+```
+
+Recording is off outside the context, so training never holds activations.
+A custom block joins in by storing `self.last_gate` when `self.record_gates`
+is set (see `gcg_blocks.py`).
 
 Recorded in every results JSON and checkpoint: git commit, FGADR
 `split_seed`/fractions, `eval_tiled`, `eval_tiled_val`, `tile_overlap`,
