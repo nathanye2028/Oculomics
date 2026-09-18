@@ -1,27 +1,30 @@
-# Oculomics — Retinal Age Report, 6 – 12 September 2026
+# Oculomics — Retinal Age Report, 6 – 16 September 2026
 
 Branch `disease/retinal-age`. The diabetic-retinopathy classification work that
 preceded this track (BRSET → mBRSET transfer, distillation, AdaBN, the operating
 point, Core ML deployment) is documented in `REPORT.md` on `main`; this document
 covers only the retinal-age track, from the first design on 6 September to the
-state of the experiments on 12 September.
+state of the experiments on 16 September.
 
-**Headline.** A 2.8 M-parameter mobile network trained on 5,200 healthy
-tabletop fundus images predicts age with **MAE 5.07 ± 0.09 years, r = 0.92**
-on held-out BRSET patients — the accuracy of the published UK Biobank clocks,
-on a quarter of the data. Trained in-domain on smartphone images it reaches
-**MAE 4.9 years, r = 0.82** on held-out mBRSET patients, so the phone images
-carry the age signal; the zero-shot transfer between cameras does not (r 0.43),
-and mixed-domain training is the pending fix. The bias-corrected **retinal age
-gap tracks diabetic eye disease on both cameras** in dose–response fashion
-(referable DR +4.0 years and macular edema +5.1 on BRSET; referable-DR
-prevalence 13 % → 56 % across gap quintiles), and three signals replicate under
-two independent clocks on the same phone patients: insulin use, hypertension
-(borderline) and diabetes duration. Most of the DR effect is lesion detection
-rather than ageing (+2.3 → +1.0 years when the clock knows the phone domain),
-systemic effects are bounded to under about a year at this sample size, and an
-ungradable image alone is worth 1.5 – 2 years, so every association uses
-gradable images only.
+**Headline.** A MobileNetV4-Medium clock (8.8 M parameters, 1.4 ms on the
+Apple Neural Engine) trained on BRSET's healthy cohort with mBRSET's
+retinopathy-free patients mixed in predicts age with **MAE 4.72 ± 0.05 years
+(4.46 per patient, both eyes), r = 0.93** on held-out BRSET patients and
+**4.57 ± 0.19 (4.17 per patient), r = 0.85** on held-out smartphone patients —
+below the 4.9-year in-domain ceiling measured a week earlier, and approaching
+the published UK Biobank clocks (3.3 – 3.6 y) with a quarter of their data and a
+phone-sized network. Mixing the phone domain into training solved transfer
+(zero-shot 14 y → 4.6); a bigger model in the same latency class moved the floor
+(Small → Medium −0.28 y on BRSET, −0.1 to −0.3 on the phone); more labelled-age
+data from ODIR-5K moved nothing, and distillation from a 50 M-parameter teacher
+bought 0.07 y. Under this clock the bias-corrected **retinal age gap tracks
+diabetes before any retinopathy** (grade-0 diabetics +2.9 y on BRSET, diabetes
+overall +4.2 y adjusted) and rises with DR grade, diabetes duration and insulin
+use on both cameras; on the phone smoking (+1.9 y) now clears FDR alongside
+insulin, referable DR and edema, and hypertension stays borderline. An
+ungradable image is worth +1.1 y on the tabletop camera and +2.3 y on the phone,
+so every association uses gradable images only and phone effects under about
+two years are not separable from image quality.
 
 ---
 
@@ -56,7 +59,8 @@ The age-range asymmetry matters twice below: it makes r non-comparable across
 the two sets, and it means an mBRSET-trained clock cannot extrapolate to BRSET's
 young and old tails.
 
-**ODIR-5K as an auxiliary training set (built 12 September).** The Kaggle
+**ODIR-5K as an auxiliary training set (built 12 September; tried in v4 and
+found to add nothing — section 4.3).** The Kaggle
 mirror of ODIR-5K (`andrewmvd/ocular-disease-recognition-odir5k`: 6,392 eyes of
 3,358 patients, several tabletop cameras, mean age 57.9) carries an age and
 per-eye diagnostic keywords. Under the same patient-level rule as BRSET — every
@@ -173,10 +177,8 @@ The MAEs above are per image. A phone exam captures both eyes, so the number
 the deployment delivers is the **patient-level MAE**, both eyes averaged before
 the error is taken. The trainer has always computed it (`patient_mae` in every
 results JSON) and the summariser now tables it beside the image-level MAE for
-every set and in the seed-ensemble lines. It is not quoted here yet because the
-result files live on the lab box; re-running
-`python summarize_retinal_age.py --dir exp_retinal_age` there fills the column
-without retraining, and that is the number to headline.
+every set and in the seed-ensemble lines; section 4.3 quotes it for the v3 – v5
+sweeps, and it is the number to headline.
 
 ### 4.2 Smartphone camera (mBRSET, n = 4,860 images, 1,282 patients)
 
@@ -210,6 +212,56 @@ The reverse direction is the mirror failure for a different reason: the
 mBRSET-trained clock scores r 0.57 on BRSET with 36 y MAE in the under-30 bin,
 because it never saw anyone that young. BRSET must stay in the mix for the
 tails.
+
+### 4.3 What moved the floor: the v3 – v5 sweeps (10 – 16 September)
+
+Three sweeps at 512 px with the label-distribution head, flip TTA, age-balanced
+sampling and EMA; 3 seeds each; image-level MAE with the patient-level number
+in brackets. "Phone DR-0" is mBRSET's held-out retinopathy-free patients, the
+in-domain accuracy number; "phone calibrated" is every held-out phone patient
+after device calibration, diseased retinas included.
+
+| sweep | condition | params | BRSET healthy test | phone DR-0 held-out | phone calibrated |
+|---|---|---|---|---|---|
+| v1 | Small, 384 px | 2.8 M | 5.07 ± 0.09 | zero-shot 14.0; ceiling 4.91 | 8.16 |
+| v3 | Small + levers | 2.8 M | 4.86 ± 0.15 | — | 8.21 |
+| v3 | Small + levers, mixed (`student_mix`) | 2.8 M | 4.96 ± 0.08 | 4.88 ± 0.18 | 5.74 |
+| v3 | ConvNeXt-S teacher | 49.7 M | 4.49 ± 0.12 | — | 7.52 |
+| v4 | Small, mixed + ODIR | 2.8 M | 5.00 ± 0.10 (4.79) | 4.85 ± 0.22 (4.33) | 5.77 (5.24) |
+| v4 | Small, mixed + ODIR, distilled | 2.8 M | 4.93 ± 0.09 (4.70) | 4.67 ± 0.20 (4.20) | 5.69 (5.20) |
+| v4 | Medium, mixed + ODIR | 8.8 M | 4.73 ± 0.05 (4.46) | 4.52 ± 0.08 (4.09) | 5.53 (5.08) |
+| v4 | ConvNeXt-S teacher, mixed + ODIR | 49.7 M | 4.56 ± 0.08 (4.32) | 4.30 ± 0.10 (3.94) | 5.26 (4.88) |
+| **v5** | **Medium, mixed (`medium_mix`) — clock of record** | 8.8 M | **4.72 ± 0.05 (4.46)** | **4.57 ± 0.19 (4.17)** | 5.61 (5.15) |
+| v5 | Small, mixed (paired control) | 2.8 M | 5.00 ± 0.00 (4.76) | 4.72 ± 0.12 (4.19) | 5.72 (5.23) |
+
+What each lever bought:
+
+* **The v3 recipe** (512 px, LDL, TTA, age balance, EMA): 5.07 → 4.86 on
+  BRSET — tenths of a year, as expected.
+* **Mixed-domain training** took the phone from 14 y zero-shot to the 4.9-y
+  ceiling in one step, at a cost of 0.1 y on BRSET. Zero-shot transfer is
+  closed as a question.
+* **ODIR-5K as an auxiliary set bought nothing.** With and without it the Small
+  and Medium clocks agree to within seed noise on both cameras, and every model
+  reads ODIR's own healthy test badly (MAE 7.2 – 7.4, r ≈ 0.5), so its age
+  labels or images are a weak source. It is dropped from the recipe, which also
+  removes the one dataset with no stated licence.
+* **Capacity is what moved the floor.** MobileNetV4-Medium beats Small by
+  0.28 y on BRSET in both sweeps that contain the pair (paired over seeds,
+  significant both times) and by 0.11 – 0.28 y on the phone (significant in one
+  of two; the phone healthy test holds 150 patients). At 1.43 ms on the Neural
+  Engine (section 7) it is still a phone model, and it is the clock of record.
+  The seed ensemble of the three Medium runs adds about 0.05 y.
+* **Distillation** into the Small model bought 0.07 y — significant on BRSET,
+  not worth the teacher's cost. The ConvNeXt-S teacher itself is a further
+  0.2 y better (4.56 / 4.30) at 50 M parameters.
+* **Patient-level MAE** (both eyes averaged) runs 0.25 – 0.45 y below the
+  image-level number on every set: **4.46 y on the tabletop camera and 4.17 y
+  on the phone** are the deployment numbers.
+
+The phone "calibrated" column stays near 5.6 y because it includes every
+diseased patient, whose retinas read older by construction (referable minus
+DR-0: +3.0 y, section 5.4); it is not clock error.
 
 ## 5. The retinal age gap against disease
 
@@ -282,23 +334,86 @@ reads +2.13 y older on the phone.
   year and needed tens of thousands of participants; 1,282 patients cannot see
   them.
 
+### 5.4 Under the clock of record (v5 Medium, mixed-domain; both cameras)
+
+The Medium clock is sharper (gap SD 5.9 y on BRSET, 4.8 on the phone) and the
+disease signal grows with it. Adjusted differences in corrected gap, exposed
+minus reference, gradable images only; the grade-0 rows are mean corrected gaps
+against a healthy reference at ≈ 0:
+
+| exposure | BRSET (n = 3,266 patients) | mBRSET phone (n = 904) |
+|---|---|---|
+| diabetes vs non-diabetic | **+4.19 [+3.74, +4.64]**, d 0.65 | every patient diabetic |
+| diabetics with DR grade 0, mean gap | **+2.91 [+2.49, +3.34]** | +0.60 [+0.17, +1.03] |
+| insulin use (within diabetics) | **+3.19 [+2.18, +4.20]** | **+2.24 [+1.49, +2.98]** |
+| any DR | +4.32 [+3.60, +5.05] | +1.68 [+1.03, +2.33] |
+| referable DR | **+4.67 [+3.92, +5.43]** | **+2.55 [+1.87, +3.22]** |
+| macular edema | **+4.90 [+3.93, +5.88]** | **+2.35 [+1.49, +3.20]** |
+| DR-grade trend | +1.48 y per grade | +1.07 y per grade |
+| diabetes duration | +1.35 y per decade | +1.08 y per decade |
+| systemic hypertension | — | +0.77 [+0.03, +1.51], q 0.09 |
+| smoking (n = 53) | — | **+1.88 [+0.49, +3.26], q 0.02** |
+| neuropathy (n = 43) / nephropathy (n = 32) | — | +1.49, q 0.10 / +1.61, q 0.12 |
+| AMD (n = 70) | +1.99 [+0.38, +3.60], q 0.035, unstable logistic | — |
+| drusen, cup–disc, hypertensive retinopathy, occlusion, haemorrhage, myopia, scar, nevus | null | — |
+| infarction, vascular disease, diabetic foot, obesity, alcohol | — | null |
+| ungradable image, disease-free patients | +1.10 [+0.54, +1.66] | +2.31 [+1.39, +3.23] |
+
+Prevalence across gap quintiles (youngest- to oldest-looking retinas): on
+BRSET diabetes 23 % → 64 %, referable DR 13 % → 47 %, edema 4 % → 30 %, insulin
+32 % → 86 %; on the phone referable DR 16 % → 51 %, edema 7 % → 27 %, insulin
+16 % → 38 %. The phone DR-grade curve is +0.6 (grade 0), 0.0 (1), +2.2 (2),
++3.1 (3), +6.1 (4).
+
+What changed against the first clocks (5.1 – 5.3):
+
+* **Diabetes without retinopathy is now the finding.** BRSET diabetics with no
+  lesions read +2.9 y older (was +0.7 with the v1 clock) and the overall
+  diabetes effect more than doubled (+1.9 → +4.2). This is the pre-lesion signal
+  section 8 asked for, and it is if anything understated: the clock was trained
+  on mBRSET diabetics labelled with their true ages, which pushes it to discount
+  diabetic appearance, and BRSET diabetics still read older. On the phone the
+  grade-0 effect is +0.6 y because there the grade-0 group *is* the reference
+  population.
+* **The DR effect is larger than "about a year" again** (+4.7 BRSET, +2.6
+  phone). The lesion-detection reading in 5.3 was based on the transferred
+  clock; with a clock that reads both cameras well the phone number sits
+  between the two earlier estimates. The honest statement is that referable DR
+  adds 2.5 – 4.7 y of apparent age and the split between lesion detection and
+  biology cannot be made with these labels.
+* **Insulin, referable DR, edema and the duration trend replicate** across all
+  three phone clocks; **smoking** (+1.9 y, q 0.02) clears FDR for the first
+  time, neuropathy and nephropathy point the same way at q ≈ 0.1, and
+  hypertension stays borderline (+0.8 y, q 0.09).
+* **Image quality bounds the phone claims.** An ungradable image is worth
+  +2.3 y there, the size of the disease effects. Every table uses gradable
+  images only, but residual quality variation among gradable images cannot be
+  excluded for any phone effect under about two years.
+
 ## 6. What is claimable
 
-* **Robust:** a 2.8 M-parameter mobile clock at MAE 5.1 y / r 0.92 on the
-  tabletop camera and, trained in-domain, MAE 4.9 y / r 0.82 on smartphone
-  images. The phone images carry the signal.
+* **Robust:** an 8.8 M-parameter mobile clock (1.4 ms on the Neural Engine) at
+  MAE 4.7 y image-level / 4.5 y per patient, r 0.93, on the tabletop camera and
+  4.6 / 4.2 y, r 0.85, on held-out smartphone patients, trained once for both
+  cameras. The 2.8 M-parameter version trails it by a quarter of a year.
+* **Robust:** zero-shot transfer of an age clock between cameras fails (r 0.43)
+  and mixed-domain training fixes it completely; more data from a third public
+  set does not help, more capacity does.
 * **Robust:** on both cameras the corrected gap rises with diabetic eye disease
-  in dose–response fashion (grade trend, duration trend, quintile gradients),
-  with effect sizes up to d ≈ 1 on the tabletop camera.
+  in dose–response fashion — grade trend, duration trend, quintile gradients —
+  with d 0.6 – 0.75 on the tabletop camera, and **diabetics with no
+  retinopathy read about three years older** there.
 * **Robust, interpret carefully:** the size of the DR effect depends on the
-  clock; most of it is lesion detection, the biological part is about a year.
-* **Replicated across two clocks on the phone:** insulin use, hypertension
-  (borderline), diabetes duration.
-* **Exploratory:** neuropathy +2.1 y (q 0.04, n = 43); nephropathy and smoking
-  point the same way without clearing FDR.
-* **Do not claim:** zero-shot transfer of the clock (r 0.43 is information
-  loss, not fixable by calibration); any systemic effect from a single clock;
-  any effect under about a year without ruling out image quality.
+  clock (+2.6 to +4.7 y for referable DR); lesion detection and biology cannot
+  be separated with these labels.
+* **Replicated across three phone clocks:** insulin use, referable DR, edema,
+  diabetes duration; hypertension borderline each time.
+* **Exploratory:** smoking +1.9 y (q 0.02, n = 53); neuropathy and nephropathy
+  +1.5 y at q ≈ 0.1; AMD +2.0 y on 70 BRSET patients.
+* **Do not claim:** any phone effect under about two years without ruling out
+  image quality (an ungradable image is worth +2.3 y there); any systemic
+  effect from a single clock; that ODIR-5K or distillation improve the clock
+  (both measured, neither did).
 
 ## 7. Infrastructure and levers
 
@@ -349,28 +464,29 @@ real hardware:
   the budget, so the arm is affordable and only its MAE decides.
 * **The v4 sweep** combines them with the v3 levers (section 9): mixed-domain +
   ODIR-5K + LDL + TTA + age balance + EMA at 512 px, the Medium student, then
-  the ConvNeXt-S teacher with distillation. The v3 levers should buy tenths of
-  a year each; the data lever and the Medium arm are the ones that can move the
-  in-domain 5-year floor.
+  the ConvNeXt-S teacher with distillation. Run 13 – 14 September, followed by
+  v5 (Medium, mixed-domain, no ODIR) on 15 – 16 September; results in section
+  4.3: the levers bought tenths, the Medium arm a quarter of a year, ODIR
+  nothing.
 
 ## 8. Open items
 
-1. **v3 results:** mixed-domain MAE / r on held-out mBRSET (expected ≈ 5 y,
-   r ≈ 0.8), and whether insulin, hypertension and neuropathy hold under a
-   third clock.
-2. **Pre-lesion signal:** add the "diabetes without DR vs non-diabetic" row to
-   the BRSET table (grade-0 diabetics already sit at +0.67 y).
-3. **Deployment:** the regression export exists (`export_coreml.py --model
-   age`) and the untrained architectures are timed (section 7: 0.67 ms Small,
-   1.43 ms Medium at 384 px on the M2); the trained clock's Core ML fidelity
-   check (`--verify-images`) still needs a checkpoint from the lab box.
-4. **Distillation and resolution:** the teacher / KD arms of v3 quantify what
-   capacity and 512 px buy on BRSET.
-5. **v4 sweep** (mixed-domain + ODIR-5K auxiliary + levers + Medium student,
-   then teacher + KD): commands ready in section 9, not launched — the lab box
-   needs an interactive login.
-6. **Patient-level MAE:** re-run the summariser on the lab box's result
-   directories to fill the new column, then headline it (section 4.1).
+1. **Poster numbers:** section 4.3's v5 row and section 5.4 are the results of
+   record; sections 4.1 – 4.2 and 5.1 – 5.3 are the history that motivated them.
+2. **Core ML fidelity of the trained clock:** the export path exists and the
+   untrained architectures are timed (section 7); run `export_coreml.py
+   --checkpoint ck_retinal_age_v5/medium_mix_seed0.pt --verify-images …` on a
+   Mac to confirm the trained Medium clock agrees with PyTorch within half a
+   year and to quote its real Neural Engine latency.
+3. **The pre-lesion diabetes signal** (+2.9 y at DR grade 0) deserves its own
+   check: does it survive adjustment for quality *within* gradable images (the
+   artefacts flag), and does it grow with diabetes duration among grade-0
+   patients only?
+4. **Sample size on the phone:** the healthy test partition is 150 patients; a
+   5-fold patient-grouped cross-fit on mBRSET would tighten the phone MAE and
+   the Medium-vs-Small contrast without new data.
+5. **ODIR-5K** stays in the code as an adapter and a negative result; do not put
+   it back in the recipe.
 
 ## 9. Reproduction
 
@@ -397,6 +513,10 @@ O=kaggle:andrewmvd/ocular-disease-recognition-odir5k MIX=1 AUX=1 SIZE=512 HEAD=l
   EXTRA="--ema-decay 0.999" TEACHER=timm:convnext_small.fb_in22k_ft_in1k TEACHER_EXTRA="--batch-size 8" \
   OUT=exp_retinal_age_v4 CK=ck_retinal_age_v4 bash run_retinal_age.sh 0 1 2
 # (or through the launcher: RA_ENV="MIX=1 AUX=1 O=kaggle:... SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 MEDIUM=1 OUT=... CK=..." bash launch_disease_runs.sh retinalage)
+
+# v5, the clock of record: Medium + mixed-domain, no ODIR; then its association report
+MIX=1 MEDIUM=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_v5 CK=ck_retinal_age_v5 bash run_retinal_age.sh 0 1 2
+python analyze_age_gap.py --predictions exp_retinal_age_v5/predictions_pooled.csv --condition medium_mix --brset-csv <BRSET>/labels_brset.csv --datasets brset mbrset --out exp_retinal_age_v5/associations
 
 # ODIR-5K cohort report alone (no images touched)
 python train_retinal_age.py --dataset odir --root <ODIR-5K> --healthy normal --inspect
