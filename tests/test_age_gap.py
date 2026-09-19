@@ -136,6 +136,9 @@ def test_prelesion_recovers_the_grade0_diabetes_effect_strata_and_duration():
     text = "\n".join(prelesion_lines("brset", pl))
     assert "diabetes before retinopathy" in text and "| camera = A |" in text and "per 10 years" in text
     assert "Diabetes x age" in text and "every one of amd recorded as absent" in text
+    dc = pl["duration_clean"]                                     # the planted +1 y/decade holds in the clean subset
+    assert dc is not None and dc["n"] < pl["duration"]["n"] and dc["lo"] < 1.0 < dc["hi"]
+    assert pl["insulin_clean"] is not None and "with no other ophthalmic flag (n=" in text
     # a set where every patient is diabetic (mBRSET) has no contrast to make
     allmd = pat.copy(); allmd["diabetes"] = 1.0
     assert prelesion(allmd) is None and prelesion(pat.drop(columns=["diabetes"])) is None

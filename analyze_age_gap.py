@@ -425,6 +425,15 @@ def prelesion(pat: pd.DataFrame) -> Optional[Dict[str, object]]:
     out["tertiles"] = tert
     out["insulin"] = (assoc_binary(dm, Xd, "insulin", "insulin use, DR grade 0 diabetics")
                       if "insulin" in dm.columns else None)
+    # the same two dose-response checks among diabetics with no other ophthalmic flag
+    out["duration_clean"] = out["insulin_clean"] = None
+    if path_cols:
+        dmc = dm[(dm[path_cols] == 0.0).all(axis=1)]
+        if len(dmc) >= 2 * MIN_CASES:
+            Xdc, _ = covariates(dmc)
+            out["duration_clean"] = assoc_duration(dmc, Xdc, within=None) if "dm_time" in dmc.columns else None
+            out["insulin_clean"] = (assoc_binary(dmc, Xdc, "insulin", "insulin use, clean grade-0 diabetics")
+                                    if "insulin" in dmc.columns else None)
     return out
 
 
@@ -458,6 +467,14 @@ def prelesion_lines(name: str, pl: Dict[str, object]) -> List[str]:
     if ins and not (ins["note"] and ins["n_exposed"] < MIN_CASES):
         L.append(f"Insulin users among them read {_f(ins['adj_delta'], sign=True)} y [{_f(ins['adj_lo'], sign=True)}, "
                  f"{_f(ins['adj_hi'], sign=True)}] older (n={ins['n_exposed']} vs {ins['n_ref']}, p={_f(ins['p_adj'], 4)}).")
+    dc, ic = pl.get("duration_clean"), pl.get("insulin_clean")
+    if dc:
+        L.append(f"Among grade-0 diabetics with no other ophthalmic flag (n={dc['n']}): "
+                 f"{_f(dc['slope_per10y'], sign=True)} y per 10 years of diabetes [{_f(dc['lo'], sign=True)}, "
+                 f"{_f(dc['hi'], sign=True)}], p={_f(dc['p'], 4)}"
+                 + (f"; insulin users {_f(ic['adj_delta'], sign=True)} y [{_f(ic['adj_lo'], sign=True)}, "
+                    f"{_f(ic['adj_hi'], sign=True)}] (n={ic['n_exposed']} vs {ic['n_ref']}, p={_f(ic['p_adj'], 4)})."
+                    if ic and not (ic["note"] and ic["n_exposed"] < MIN_CASES) else "."))
     L.append("Reading: an effect of similar size in every camera and age band argues against a device, pathway or "
              "residual-age artefact; a duration or insulin gradient inside the lesion-free group is the dose-response "
              "biology predicts. An effect confined to one stratum, or flat in duration, is a warning.")

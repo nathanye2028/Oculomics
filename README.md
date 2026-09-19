@@ -78,6 +78,7 @@ make reproduce B=... M=... SEEDS="0 1 2"                     # same via make
 | `summarize_xfer.py` | Paired treatment-vs-control statistics + the AdaBN table over `<condition>_seed<n>.json` files |
 | `run_mbrset.py` | Small in-domain GCG-vs-control sweep on mBRSET |
 | `train_retinal_age.py`, `run_retinal_age.sh`, `summarize_retinal_age.py` | Retinal age regression on BRSET's healthy cohort → mBRSET; MAE by age bin and patient level (both eyes), bias-corrected age gap, per-image predictions table; `MIX=1` mixes mBRSET in, `AUX=1` adds ODIR-5K's normal-fundus patients as an auxiliary training set (branch `disease/retinal-age`) |
+| `lesion_burden.py` | Runs a segmentation checkpoint over the DR-grade-0 cohort of a retinal-age predictions table and tests whether predicted (sub-threshold) lesion burden explains the diabetes effect on the age gap: burden by group, burden vs gap, and the effect before / after adjusting for burden; resumable |
 | `public_fundus.py` | Adapters for the public sets in the mBRSET schema; here ODIR-5K (Kaggle mirror, `kaggle:andrewmvd/ocular-disease-recognition-odir5k`) with per-eye `normal_fundus` / quality / DR grade read from the diagnostic keywords |
 | **Segmentation** | |
 | `model_seg.py` | `GCGUNet` — `--encoder` / `--decoder` / `--lateral-channels`; gate init is RNG-isolated so GCG and control share every non-gate weight at a seed |
