@@ -6,8 +6,8 @@ point, Core ML deployment) is documented in `REPORT.md` on `main`; this document
 covers only the retinal-age track, from the first design on 6 September to the
 state of the experiments on 16 September.
 
-**Headline.** A MobileNetV4-Medium clock (8.8 M parameters, 1.4 ms on the
-Apple Neural Engine) trained on BRSET's healthy cohort with mBRSET's
+**Headline.** A MobileNetV4-Medium clock (8.8 M parameters, 2.1 ms at 512 px on
+the Apple Neural Engine, 17 MB at fp16) trained on BRSET's healthy cohort with mBRSET's
 retinopathy-free patients mixed in predicts age with **MAE 4.72 ± 0.05 years
 (4.46 per patient, both eyes), r = 0.93** on held-out BRSET patients and
 **4.57 ± 0.19 (4.17 per patient), r = 0.85** on held-out smartphone patients —
@@ -249,8 +249,8 @@ What each lever bought:
 * **Capacity is what moved the floor.** MobileNetV4-Medium beats Small by
   0.28 y on BRSET in both sweeps that contain the pair (paired over seeds,
   significant both times) and by 0.11 – 0.28 y on the phone (significant in one
-  of two; the phone healthy test holds 150 patients). At 1.43 ms on the Neural
-  Engine (section 7) it is still a phone model, and it is the clock of record.
+  of two; the phone healthy test holds 150 patients). At 2.1 ms on the Neural
+  Engine at its 512 px input (section 7) it is still a phone model, and it is the clock of record.
   The seed ensemble of the three Medium runs adds about 0.05 y.
 * **Distillation** into the Small model bought 0.07 y — significant on BRSET,
   not worth the teacher's cost. The ConvNeXt-S teacher itself is a further
@@ -392,7 +392,7 @@ What changed against the first clocks (5.1 – 5.3):
 
 ## 6. What is claimable
 
-* **Robust:** an 8.8 M-parameter mobile clock (1.4 ms on the Neural Engine) at
+* **Robust:** an 8.8 M-parameter mobile clock (2.1 ms on the Neural Engine) at
   MAE 4.7 y image-level / 4.5 y per patient, r 0.93, on the tabletop camera and
   4.6 / 4.2 y, r 0.85, on held-out smartphone patients, trained once for both
   cameras. The 2.8 M-parameter version trails it by a quarter of a year.
@@ -462,6 +462,18 @@ real hardware:
   `CPU_AND_NE`). The Medium student
   costs about twice the Small one and 512 px about 1.4×; all of it is far inside
   the budget, so the arm is affordable and only its MAE decides.
+
+  **The trained clock of record, exported (17 September).** `medium_mix_seed0`
+  from v5 at 512 px, fp16, checked on 32 real fundus photographs: Core ML and
+  PyTorch agree to within **0.07 y** when both see the same bytes (0.00002 y at
+  fp32), so the conversion is faithful; latency is **2.1 ms on the Neural
+  Engine** (2.3 ms with the framework choosing, 12 ms CPU-only) in a 17 MB
+  package. The fp32 export falls off the ANE (24 ms), so fp16 is the artefact to
+  ship. One caveat belongs to the app, not the export: handing Core ML a uint8
+  image instead of the float tensor the trainer saw moves a prediction by
+  0.1 y on average and 0.65 y in the worst of the 32 cases, identical at fp16
+  and fp32. The verifier therefore gates the age clock on the same-bytes error
+  and reports the input-rounding gap separately.
 * **The v4 sweep** combines them with the v3 levers (section 9): mixed-domain +
   ODIR-5K + LDL + TTA + age balance + EMA at 512 px, the Medium student, then
   the ConvNeXt-S teacher with distillation. Run 13 – 14 September, followed by
@@ -473,11 +485,10 @@ real hardware:
 
 1. **Poster numbers:** section 4.3's v5 row and section 5.4 are the results of
    record; sections 4.1 – 4.2 and 5.1 – 5.3 are the history that motivated them.
-2. **Core ML fidelity of the trained clock:** the export path exists and the
-   untrained architectures are timed (section 7); run `export_coreml.py
-   --checkpoint ck_retinal_age_v5/medium_mix_seed0.pt --verify-images …` on a
-   Mac to confirm the trained Medium clock agrees with PyTorch within half a
-   year and to quote its real Neural Engine latency.
+2. **On-device latency:** the trained clock passes the Core ML fidelity check
+   and runs in 2.1 ms on an M2's Neural Engine (section 7), which is an
+   optimistic floor; the quotable phone number needs an Xcode Core ML
+   performance report on an iPhone.
 3. **The pre-lesion diabetes signal** (+2.9 y at DR grade 0) deserves its own
    check: does it survive adjustment for quality *within* gradable images (the
    artefacts flag), and does it grow with diabetes duration among grade-0

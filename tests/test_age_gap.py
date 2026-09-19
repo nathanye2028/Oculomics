@@ -10,7 +10,7 @@ import pandas as pd
 from scipy import stats
 
 from analyze_age_gap import (assoc_binary, attach_brset_flags, bh_fdr, covariates, logit, ols,
-                             pick_gap_col, to_patients)
+                             pick_gap_col, prelesion, prelesion_lines, to_patients)
 
 
 def test_ols_matches_scipy_and_logit_recovers_planted_effect():
@@ -105,6 +105,34 @@ def test_assoc_recovers_planted_effects_with_covariates():
     assert assoc_binary(pat.head(15), X.head(15), "diabetes", "x")["note"].startswith("too few")
 
 
+def test_prelesion_recovers_the_grade0_diabetes_effect_strata_and_duration():
+    df = _table(1500, seed=4)
+    b = df[(df["dataset"] == "brset") & (df["gradable"] == 1.0)].copy()
+    # plant a duration dose-response on top of the flat +2.0: +1 y per decade of diabetes
+    dm = b["diabetes"] == "yes"
+    b.loc[dm, "gap_corrected"] += 0.1 * b.loc[dm, "dm_time"].astype(float)
+    pat = to_patients(b, "gap_corrected")
+    pl = prelesion(pat)
+    assert pl is not None and pl["n"] < len(pat)                 # grade >= 1 patients are excluded
+    o = pl["overall"]
+    # planted: +2.0 flat + 0.1 * mean duration (~12.5 y) = ~3.2; nothing from DR (grade 0 only)
+    assert o["n_exposed"] > 100 and 2.6 < o["adj_delta"] < 3.9 and o["p_adj"] < 1e-6
+    labs = [l for l, _ in pl["strata"]]
+    assert {"camera = A", "camera = B"} <= set(labs) and sum(l.startswith("age ") for l in labs) == 4
+    for lab, r in pl["strata"]:                                   # the effect lives in every stratum
+        if r["n_exposed"] >= 20 and r["n_ref"] >= 20:
+            assert r["adj_delta"] > 1.5, (lab, r["adj_delta"])
+    du = pl["duration"]
+    assert du is not None and du["lo"] < 1.0 < du["hi"] and du["p"] < 0.01
+    assert len(pl["tertiles"]) == 3 and pl["tertiles"][-1]["mean"] > pl["tertiles"][0]["mean"]
+    assert pl["insulin"] is not None and abs(pl["insulin"]["adj_delta"]) < 1.0      # no planted insulin effect
+    text = "\n".join(prelesion_lines("brset", pl))
+    assert "diabetes before retinopathy" in text and "| camera = A |" in text and "per 10 years" in text
+    # a set where every patient is diabetic (mBRSET) has no contrast to make
+    allmd = pat.copy(); allmd["diabetes"] = 1.0
+    assert prelesion(allmd) is None and prelesion(pat.drop(columns=["diabetes"])) is None
+
+
 def test_attach_brset_flags_joins_on_image_id(tmp_path):
     df = _table(10)
     raw = pd.DataFrame({"image_id": ["b0_1", "b0_2", "b1_1"], "amd": [1, 0, 0], "drusens": [0, 0, 1]})
@@ -132,6 +160,7 @@ def test_end_to_end_cli(tmp_path):
     assert "## brset" in out and "## mbrset" in out and "prevalence by quintile" in out
     assert "gap_bnadapt_recal_corrected" in out and "quality artefact check" in out
     assert "| amd |" in out and "| systemic hypertension |" in out and "by DR grade" in out
+    assert "brset: diabetes before retinopathy" in out and "mbrset: diabetes before retinopathy" not in out
     tab = pd.read_csv(tmp_path / "assoc" / "age_gap_associations.csv")
     d = tab[(tab["dataset"] == "brset") & (tab["column"] == "diabetes")].iloc[0]
     assert 2.1 < d["adj_delta"] < 3.1 and d["q_adj"] < 0.001

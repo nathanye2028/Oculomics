@@ -350,6 +350,90 @@ def assoc_duration(pat: pd.DataFrame, X: pd.DataFrame, within: Optional[str] = "
             "lo": float(o["lo"][0]), "hi": float(o["hi"][0]), "p": float(o["p"][0])}
 
 
+AGE_BANDS = ((0, 50, "< 50"), (50, 60, "50 – 59"), (60, 70, "60 – 69"), (70, 200, "70 +"))
+
+
+def prelesion(pat: pd.DataFrame) -> Optional[Dict[str, object]]:
+    """Diabetes BEFORE retinopathy: patients whose worst eye is DR grade 0 and who have no
+    macular edema, diabetics against non-diabetics.
+
+    The overall adjusted difference is the headline. Two families of checks ride with it:
+    the same difference inside every camera and every age band (a pathway / device artefact
+    or a residual age bias would make the effect live in one stratum), and — among the
+    grade-0 diabetics only — the slope on diabetes duration, the gap by duration tertile and
+    the insulin contrast (a dose-response inside the lesion-free group is what biology
+    predicts and what an acquisition artefact does not). None when the set has no usable
+    diabetes column (mBRSET: every patient is diabetic)."""
+    if "diabetes" not in pat.columns or "dr_grade" not in pat.columns:
+        return None
+    d = pat[(pat["dr_grade"] == 0) & pat["diabetes"].notna() & pat["gap"].notna()]
+    if "final_edema" in d.columns:
+        d = d[d["final_edema"] != 1.0]
+    if (d["diabetes"] == 1.0).sum() < MIN_CASES or (d["diabetes"] == 0.0).sum() < MIN_CASES:
+        return None
+    X, used = covariates(d)
+    out: Dict[str, object] = {"used": used, "n": int(len(d)),
+                              "overall": assoc_binary(d, X, "diabetes", "diabetes, DR grade 0, no edema")}
+    strata: List[Tuple[str, Dict[str, object]]] = []
+    if "camera" in d.columns:
+        for lvl, f in d.groupby(d["camera"].astype(str)):
+            if lvl in ("nan", ""):
+                continue
+            Xf, _ = covariates(f)                     # a single-camera stratum carries no camera dummy
+            strata.append((f"camera = {lvl}", assoc_binary(f, Xf, "diabetes", f"camera = {lvl}")))
+    for lo, hi, lab in AGE_BANDS:
+        f = d[(d["age"] >= lo) & (d["age"] < hi)]
+        if len(f):
+            Xf, _ = covariates(f)
+            strata.append((f"age {lab}", assoc_binary(f, Xf, "diabetes", f"age {lab}")))
+    out["strata"] = strata
+    dm = d[d["diabetes"] == 1.0]
+    Xd, _ = covariates(dm)
+    out["duration"] = assoc_duration(dm, Xd, within=None) if "dm_time" in dm.columns else None
+    t = dm[dm["dm_time"].notna()] if "dm_time" in dm.columns else dm.iloc[0:0]
+    tert = []
+    if len(t) >= 3 * MIN_CASES and t["dm_time"].nunique() >= 3:
+        q = pd.qcut(t["dm_time"], 3, duplicates="drop")
+        for iv, f in t.groupby(q, observed=True):
+            g = f["gap"].to_numpy(float)
+            se = g.std(ddof=1) / np.sqrt(len(g)) if len(g) > 1 else np.nan
+            tert.append({"years": f"{iv.left:.0f} – {iv.right:.0f}", "n": int(len(g)), "mean": float(g.mean()),
+                         "lo": float(g.mean() - 1.96 * se), "hi": float(g.mean() + 1.96 * se)})
+    out["tertiles"] = tert
+    out["insulin"] = (assoc_binary(dm, Xd, "insulin", "insulin use, DR grade 0 diabetics")
+                      if "insulin" in dm.columns else None)
+    return out
+
+
+def prelesion_lines(name: str, pl: Dict[str, object]) -> List[str]:
+    o = pl["overall"]
+    L = [f"\n### {name}: diabetes before retinopathy (worst eye DR grade 0, no macular edema; n={pl['n']})",
+         f"diabetics read {_f(o['adj_delta'], sign=True)} y [{_f(o['adj_lo'], sign=True)}, {_f(o['adj_hi'], sign=True)}] "
+         f"older than non-diabetics (n={o['n_exposed']} vs {o['n_ref']}, p={_f(o['p_adj'], 4)}, Cohen d "
+         f"{_f(o['cohen_d'])}; adjusted for {', '.join(pl['used'])}). Both groups are rows the clock never trained on.",
+         "\n| stratum | n diabetic / ref | adjusted Δ [95% CI] | p | note |", "|---|---|---|---|---|"]
+    for lab, r in pl["strata"]:
+        L.append(f"| {lab} | {r['n_exposed']} / {r['n_ref']} | {_f(r['adj_delta'], sign=True)} "
+                 f"[{_f(r['adj_lo'], sign=True)}, {_f(r['adj_hi'], sign=True)}] | {_f(r['p_adj'], 4)} | {r['note']} |")
+    du = pl.get("duration")
+    if du:
+        L.append(f"\nAmong the grade-0 diabetics (n={du['n']} with a duration): {_f(du['slope_per10y'], sign=True)} y per "
+                 f"10 years of diabetes [{_f(du['lo'], sign=True)}, {_f(du['hi'], sign=True)}], p={_f(du['p'], 4)}; "
+                 f"Spearman ρ={_f(du['rho'], 3)} (p={_f(du['p_rho'], 4)}).")
+    if pl.get("tertiles"):
+        L.append("Mean gap by duration tertile: " + "; ".join(
+            f"{t['years']} y: {_f(t['mean'], sign=True)} [{_f(t['lo'], sign=True)}, {_f(t['hi'], sign=True)}] (n={t['n']})"
+            for t in pl["tertiles"]) + ".")
+    ins = pl.get("insulin")
+    if ins and not (ins["note"] and ins["n_exposed"] < MIN_CASES):
+        L.append(f"Insulin users among them read {_f(ins['adj_delta'], sign=True)} y [{_f(ins['adj_lo'], sign=True)}, "
+                 f"{_f(ins['adj_hi'], sign=True)}] older (n={ins['n_exposed']} vs {ins['n_ref']}, p={_f(ins['p_adj'], 4)}).")
+    L.append("Reading: an effect of similar size in every camera and age band argues against a device, pathway or "
+             "residual-age artefact; a duration or insulin gradient inside the lesion-free group is the dose-response "
+             "biology predicts. An effect confined to one stratum, or flat in duration, is a warning.")
+    return L
+
+
 def exposures_for(pat: pd.DataFrame, is_external: bool, joined: List[str]) -> List[Tuple[str, str, Optional[str]]]:
     """(column, label, within) in report order, only for columns present."""
     ex: List[Tuple[str, str, Optional[str]]] = []
@@ -438,6 +522,10 @@ def analyse_dataset(df: pd.DataFrame, name: str, gap_override: Optional[str], jo
         L.append(f"Spearman ρ={_f(du['rho'], 3)} (p={_f(du['p_rho'], 4)}); adjusted slope "
                  f"{_f(du['slope_per10y'], sign=True)} y per 10 years of diabetes "
                  f"[{_f(du['lo'], sign=True)}, {_f(du['hi'], sign=True)}], p={_f(du['p'], 4)}")
+
+    pl = None if is_ext else prelesion(pat)
+    if pl:
+        L += prelesion_lines(name, pl)
 
     # Quality artefact: ungradable vs gradable among disease-free patients, all images.
     if "ungradable" in pat_all.columns and not is_ext:

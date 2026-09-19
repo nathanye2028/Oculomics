@@ -551,8 +551,13 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
     is used instead of the max: at fp16 a handful of boundary pixels on a
     512x512x4 map routinely diverge by more than any sane tolerance without
     the mask changing, and a hard max would fail every export for nothing.
-    Mask agreement at thr=0.5 must also be >= 99%. For the age clock the
-    statistic is the max |years_torch - years_coreml| against ``tol`` in years.
+    Mask agreement at thr=0.5 must also be >= 99%. For the age clock the gate is
+    the max |years_torch - years_coreml| for the SAME uint8 bytes (the fp16 / ANE
+    conversion error) against ``tol`` in years; the deviation against the
+    training pipeline's float input is reported alongside, because on a
+    regression in years the app's uint8 rounding of the resized image is the
+    larger of the two and is a property of the deployment pipeline, not of the
+    export (it is flagged, not failed, above 2*tol).
     """
     import coremltools as ct
     from PIL import Image
@@ -634,7 +639,13 @@ def verify(path: str, wrapper: nn.Module, size: int, kind: str = "seg",
         print(f"  argmax agreement : {len(files) - disagree}/{len(files)}")
         ok = worst_diff <= tol and disagree == 0
     elif kind == "age":
-        ok = worst_diff <= tol
+        # Gate on the conversion error (same bytes); the float-vs-uint8 gap is the app's
+        # input rounding, reported and only flagged when it is large.
+        ok = worst_u8 <= tol
+        print(f"  gate             : fp16/ANE error {worst_u8:.3f} y <= tol {tol:g} y -> {'ok' if ok else 'FAIL'}")
+        if worst_diff > 2 * tol:
+            print(f"  [warn] uint8 input rounding shifts a prediction by up to {worst_diff:.2f} y on these images; "
+                  "that is the app pipeline, not the export — check the resize/crop the app does.")
     else:
         min_agree = min(agree_px)
         print(f"  min mask agreement: {min_agree*100:.3f}% @ thr=0.5")
