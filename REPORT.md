@@ -17,10 +17,12 @@ phone-sized network. Mixing the phone domain into training solved transfer
 (zero-shot 14 y → 4.6); a bigger model in the same latency class moved the floor
 (Small → Medium −0.28 y on BRSET, −0.1 to −0.3 on the phone); more labelled-age
 data from ODIR-5K moved nothing, and distillation from a 50 M-parameter teacher
-bought 0.07 y. Under this clock the bias-corrected **retinal age gap tracks
-diabetes before any retinopathy** (grade-0 diabetics +2.9 y on BRSET, diabetes
-overall +4.2 y adjusted) and rises with DR grade, diabetes duration and insulin
-use on both cameras; on the phone smoking (+1.9 y) now clears FDR alongside
+bought 0.07 y. Under this clock the bias-corrected **retinal age gap** is +4.2 y
+in BRSET diabetics (adjusted) and rises with DR grade, diabetes duration and
+insulin use on both cameras; diabetics with **no visible retinopathy** still read
++2.1 y older than non-diabetics, an effect concentrated under age 70 and without
+a duration gradient of its own (section 5.4), so it is an association with
+diabetic status, not yet evidence of a progressive pre-lesion process; on the phone smoking (+1.9 y) now clears FDR alongside
 insulin, referable DR and edema, and hypertension stays borderline. An
 ungradable image is worth +1.1 y on the tabletop camera and +2.3 y on the phone,
 so every association uses gradable images only and phone effects under about
@@ -263,6 +265,32 @@ The phone "calibrated" column stays near 5.6 y because it includes every
 diseased patient, whose retinas read older by construction (referable minus
 DR-0: +3.0 y, section 5.4); it is not clock error.
 
+### 4.4 What the clock looks at (Grad-CAM on the v5 Medium clock)
+
+`explain_retinal_age.py` on `medium_mix_seed0`, 21 BRSET images (three typical
+ones per age bin, |gap| mostly under 2 y), positive Grad-CAM ("evidence for
+older") on the deepest trunk activation, a 16 × 16 map. Averaged over the 21
+images 39 % of the map's mass falls in the central quarter of the image (25 %
+would be uniform), but that average hides a shift with age:
+
+| age of the retina | images | mass in the central quarter | where the map fires |
+|---|---|---|---|
+| under 30 | 3 | 0.47 | fovea, disc rim and along the major arcades |
+| 35 – 40 | 4 | **0.77** | one tight spot on the fovea / papillomacular bundle |
+| 45 – 69 | 8 | **0.18** | disc margin and peripapillary zone, mid-periphery and the inferior-temporal edge where the choroid shows through |
+| 70 and over | 6 | 0.37 | mixed: papillomacular region, the disc, peripapillary atrophy; on the two images with macular or disc lesions, the lesions |
+
+Read descriptively (21 images, a coarse map, one seed): the clock reads a young
+adult's age off the macula — the foveal reflex and sheen that fade through the
+thirties — and a middle-aged or older one off the disc margin and the periphery,
+where tessellation, choroidal visibility and peripapillary change accumulate.
+That is the anatomy a clinician would name, and it matches the published clocks,
+which find diffuse vascular and peripapillary features rather than one landmark.
+Two reassuring details: on the image with a bright light-leak along its lower
+edge the map ignores the artefact and fires on the disc, and the one large miss
+in the set (age 81 read as 88) is an eye with marked peripapillary atrophy, on
+which the map sits. The grid is `exp_retinal_age_v5/explain/explain_grid.png`.
+
 ## 5. The retinal age gap against disease
 
 ### 5.1 BRSET (3,266 patients with gradable images)
@@ -367,14 +395,27 @@ BRSET diabetes 23 % → 64 %, referable DR 13 % → 47 %, edema 4 % → 30 %, in
 
 What changed against the first clocks (5.1 – 5.3):
 
-* **Diabetes without retinopathy is now the finding.** BRSET diabetics with no
-  lesions read +2.9 y older (was +0.7 with the v1 clock) and the overall
-  diabetes effect more than doubled (+1.9 → +4.2). This is the pre-lesion signal
-  section 8 asked for, and it is if anything understated: the clock was trained
-  on mBRSET diabetics labelled with their true ages, which pushes it to discount
-  diabetic appearance, and BRSET diabetics still read older. On the phone the
-  grade-0 effect is +0.6 y because there the grade-0 group *is* the reference
-  population.
+* **Diabetes without retinopathy: present, but not yet a pre-lesion biomarker.**
+  The overall diabetes effect more than doubled against the v1 clock (+1.9 →
+  +4.2), and grade-0 diabetics have a mean gap of +2.9 y (was +0.7). The
+  dedicated check (`analyze_age_gap.py`, "diabetes before retinopathy": worst eye
+  grade 0, no edema, diabetics vs non-diabetics, n = 890 vs 1,929, both never
+  trained on) puts the **adjusted difference at +2.05 y [+1.58, +2.52], d 0.32**.
+  Three things keep it from being a stronger claim. It is strongly
+  age-dependent: +4.4 y under 50, +1.1 at 50 – 59, +1.8 at 60 – 69 and a
+  non-significant +0.5 at 70 and over. It has **no duration gradient of its
+  own** (+0.30 y per decade [−0.28, +0.88]; tertiles +1.8 → +2.1 → +2.2), so the
+  +1.35 y per decade seen in all diabetics runs through retinopathy; insulin use
+  inside the group is +1.0 y, not significant. And the camera check is
+  uninformative because 96 % of these patients were photographed on the Canon.
+  What argues for it: the training bias points the other way (the clock learned
+  mBRSET diabetics at their true ages, so it discounts diabetic appearance).
+  Open explanations besides subclinical microvascular change: lesions below the
+  graders' threshold, which a clock this sensitive to lesions would pick up, and
+  an older non-diabetic reference that carries other eye disease (tested by the
+  "no other ophthalmic flag" rows and the diabetes × age term the script now
+  prints). On the phone the grade-0 effect is +0.6 y because there the grade-0
+  group *is* the reference population.
 * **The DR effect is larger than "about a year" again** (+4.7 BRSET, +2.6
   phone). The lesion-detection reading in 5.3 was based on the transferred
   clock; with a clock that reads both cameras well the phone number sits
@@ -401,8 +442,11 @@ What changed against the first clocks (5.1 – 5.3):
   set does not help, more capacity does.
 * **Robust:** on both cameras the corrected gap rises with diabetic eye disease
   in dose–response fashion — grade trend, duration trend, quintile gradients —
-  with d 0.6 – 0.75 on the tabletop camera, and **diabetics with no
-  retinopathy read about three years older** there.
+  with d 0.6 – 0.75 on the tabletop camera.
+* **Present, interpret carefully:** diabetics with no visible retinopathy read
+  +2.1 y older on the tabletop camera (d 0.32), concentrated under age 70 and
+  with no duration gradient inside the lesion-free group; an association with
+  diabetic status, not a demonstrated pre-lesion process.
 * **Robust, interpret carefully:** the size of the DR effect depends on the
   clock (+2.6 to +4.7 y for referable DR); lesion detection and biology cannot
   be separated with these labels.
@@ -489,10 +533,12 @@ real hardware:
    and runs in 2.1 ms on an M2's Neural Engine (section 7), which is an
    optimistic floor; the quotable phone number needs an Xcode Core ML
    performance report on an iPhone.
-3. **The pre-lesion diabetes signal** (+2.9 y at DR grade 0) deserves its own
-   check: does it survive adjustment for quality *within* gradable images (the
-   artefacts flag), and does it grow with diabetes duration among grade-0
-   patients only?
+3. **The grade-0 diabetes signal** (+2.05 y adjusted; section 5.4) is checked for
+   camera, age band, duration and insulin. Still open: whether the fade with age
+   survives restricting both groups to patients with no other ophthalmic flag
+   (rows now printed by the script), and whether sub-threshold lesions explain
+   it — the repository's lesion segmenter run on grade-0 diabetic vs
+   non-diabetic images would test that directly.
 4. **Sample size on the phone:** the healthy test partition is 150 patients; a
    5-fold patient-grouped cross-fit on mBRSET would tighten the phone MAE and
    the Medium-vs-Small contrast without new data.

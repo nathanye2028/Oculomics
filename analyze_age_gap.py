@@ -362,8 +362,11 @@ def prelesion(pat: pd.DataFrame) -> Optional[Dict[str, object]]:
     or a residual age bias would make the effect live in one stratum), and — among the
     grade-0 diabetics only — the slope on diabetes duration, the gap by duration tertile and
     the insulin contrast (a dose-response inside the lesion-free group is what biology
-    predicts and what an acquisition artefact does not). None when the set has no usable
-    diabetes column (mBRSET: every patient is diabetic)."""
+    predicts and what an acquisition artefact does not). Two more rows address an effect
+    that fades with age: the contrast restricted to patients with NO other ophthalmic flag
+    (older non-diabetics carry cataract-era pathology, which would shrink the contrast from
+    the reference side), overall and per age band, and the formal diabetes x age interaction.
+    None when the set has no usable diabetes column (mBRSET: every patient is diabetic)."""
     if "diabetes" not in pat.columns or "dr_grade" not in pat.columns:
         return None
     d = pat[(pat["dr_grade"] == 0) & pat["diabetes"].notna() & pat["gap"].notna()]
@@ -386,7 +389,27 @@ def prelesion(pat: pd.DataFrame) -> Optional[Dict[str, object]]:
         if len(f):
             Xf, _ = covariates(f)
             strata.append((f"age {lab}", assoc_binary(f, Xf, "diabetes", f"age {lab}")))
+    # the same contrast among patients free of every other ophthalmic flag (known-negative only)
+    path_cols = [c for c in PATHOLOGY_COLS if c in d.columns and d[c].notna().any()]
+    out["clean_cols"] = path_cols
+    if path_cols:
+        clean = d[(d[path_cols] == 0.0).all(axis=1)]
+        if len(clean):
+            Xc, _ = covariates(clean)
+            strata.append(("no other ophthalmic flag", assoc_binary(clean, Xc, "diabetes", "no other flag")))
+            for lo, hi, lab in AGE_BANDS:
+                f = clean[(clean["age"] >= lo) & (clean["age"] < hi)]
+                if len(f):
+                    Xf, _ = covariates(f)
+                    strata.append((f"no other flag, age {lab}", assoc_binary(f, Xf, "diabetes", f"clean {lab}")))
     out["strata"] = strata
+    # does the diabetes effect change with age? gap ~ diabetes + diabetes*age10 + covariates
+    keep = X.notna().all(axis=1)
+    dk, Xk = d[keep], X[keep]
+    x = dk["diabetes"].to_numpy(float)
+    o = ols(dk["gap"].to_numpy(float), np.column_stack([x, x * Xk["age10"].to_numpy(float), Xk.to_numpy(float)]))
+    out["interaction"] = {"per_decade": float(o["coef"][1]), "lo": float(o["lo"][1]), "hi": float(o["hi"][1]),
+                          "p": float(o["p"][1]), "at_mean_age": float(o["coef"][0]), "mean_age": float(dk["age"].mean())}
     dm = d[d["diabetes"] == 1.0]
     Xd, _ = covariates(dm)
     out["duration"] = assoc_duration(dm, Xd, within=None) if "dm_time" in dm.columns else None
@@ -415,6 +438,13 @@ def prelesion_lines(name: str, pl: Dict[str, object]) -> List[str]:
     for lab, r in pl["strata"]:
         L.append(f"| {lab} | {r['n_exposed']} / {r['n_ref']} | {_f(r['adj_delta'], sign=True)} "
                  f"[{_f(r['adj_lo'], sign=True)}, {_f(r['adj_hi'], sign=True)}] | {_f(r['p_adj'], 4)} | {r['note']} |")
+    it = pl.get("interaction")
+    if it:
+        L.append(f"\nDiabetes x age: the effect changes by {_f(it['per_decade'], sign=True)} y per decade of age "
+                 f"[{_f(it['lo'], sign=True)}, {_f(it['hi'], sign=True)}], p={_f(it['p'], 4)} "
+                 f"(it is {_f(it['at_mean_age'], sign=True)} y at the mean age of {_f(it['mean_age'], 1)}).")
+    if pl.get("clean_cols"):
+        L.append(f"'No other ophthalmic flag' = every one of {', '.join(pl['clean_cols'])} recorded as absent.")
     du = pl.get("duration")
     if du:
         L.append(f"\nAmong the grade-0 diabetics (n={du['n']} with a duration): {_f(du['slope_per10y'], sign=True)} y per "

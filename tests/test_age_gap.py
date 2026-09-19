@@ -111,6 +111,8 @@ def test_prelesion_recovers_the_grade0_diabetes_effect_strata_and_duration():
     # plant a duration dose-response on top of the flat +2.0: +1 y per decade of diabetes
     dm = b["diabetes"] == "yes"
     b.loc[dm, "gap_corrected"] += 0.1 * b.loc[dm, "dm_time"].astype(float)
+    # another ophthalmic flag on a third of the patients (both eyes), no effect on the gap
+    b["amd"] = b["patient"].map(lambda q: float(int(q[1:]) % 3 == 0))
     pat = to_patients(b, "gap_corrected")
     pl = prelesion(pat)
     assert pl is not None and pl["n"] < len(pat)                 # grade >= 1 patients are excluded
@@ -119,6 +121,11 @@ def test_prelesion_recovers_the_grade0_diabetes_effect_strata_and_duration():
     assert o["n_exposed"] > 100 and 2.6 < o["adj_delta"] < 3.9 and o["p_adj"] < 1e-6
     labs = [l for l, _ in pl["strata"]]
     assert {"camera = A", "camera = B"} <= set(labs) and sum(l.startswith("age ") for l in labs) == 4
+    assert "no other ophthalmic flag" in labs and sum(l.startswith("no other flag, age") for l in labs) == 4
+    clean = dict(pl["strata"])["no other ophthalmic flag"]
+    assert clean["n_exposed"] + clean["n_ref"] < pl["n"] and 2.4 < clean["adj_delta"] < 4.1
+    it = pl["interaction"]                                        # no planted age interaction
+    assert it["lo"] < 0.0 < it["hi"] and 2.4 < it["at_mean_age"] < 4.0
     for lab, r in pl["strata"]:                                   # the effect lives in every stratum
         if r["n_exposed"] >= 20 and r["n_ref"] >= 20:
             assert r["adj_delta"] > 1.5, (lab, r["adj_delta"])
@@ -128,6 +135,7 @@ def test_prelesion_recovers_the_grade0_diabetes_effect_strata_and_duration():
     assert pl["insulin"] is not None and abs(pl["insulin"]["adj_delta"]) < 1.0      # no planted insulin effect
     text = "\n".join(prelesion_lines("brset", pl))
     assert "diabetes before retinopathy" in text and "| camera = A |" in text and "per 10 years" in text
+    assert "Diabetes x age" in text and "every one of amd recorded as absent" in text
     # a set where every patient is diabetic (mBRSET) has no contrast to make
     allmd = pat.copy(); allmd["diabetes"] = 1.0
     assert prelesion(allmd) is None and prelesion(pat.drop(columns=["diabetes"])) is None
