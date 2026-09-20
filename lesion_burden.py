@@ -144,8 +144,9 @@ def score_all(net, lesions, rows: pd.DataFrame, images_dir: str, out_csv: str, d
 # Report
 # --------------------------------------------------------------------------- #
 def patient_burden(scores: pd.DataFrame, rows: pd.DataFrame) -> pd.DataFrame:
-    """Mean of every burden column over a patient's images."""
-    m = rows[["file", "patient"]].astype(str).merge(scores.astype({"file": str}), on="file", how="inner")
+    """Mean of every burden column over a patient's images. ``patient`` keeps the dtype it has in
+    ``rows`` (BRSET ids are integers) so the result merges back onto the patient table."""
+    m = rows[["file", "patient"]].astype({"file": str}).merge(scores.astype({"file": str}), on="file", how="inner")
     cols = [c for c in scores.columns if c.startswith(("ppm_", "blobs_", "pmax_"))]
     return m.groupby("patient", sort=False)[cols].mean().reset_index()
 

@@ -419,8 +419,10 @@ What changed against the first clocks (5.1 – 5.3):
   longer-standing patients and whose age the clock reads off the macula (section
   4.4). What still limits the claim: the lesion-free group has **no duration
   gradient of its own** (+0.30 y per decade [−0.28, +0.88]; tertiles +1.8 → +2.1
-  → +2.2), so the +1.35 y per decade seen in all diabetics runs through
-  retinopathy; insulin use inside the group is +1.0 y, not significant; the
+  → +2.2; +0.44 [−0.56, +1.44] in the pathology-free subset), so the +1.35 y per
+  decade seen in all diabetics runs through retinopathy; insulin use inside the
+  group is +1.0 y, not significant (+1.96 [−0.19, +4.10], p 0.07, in the
+  pathology-free subset — the one dose-response hint, and only a hint); the
   camera check is uninformative (96 % Canon); and lesions below the graders'
   threshold cannot be excluded, which a clock this sensitive to lesions would
   pick up. What argues for it beyond the numbers: the training bias points the

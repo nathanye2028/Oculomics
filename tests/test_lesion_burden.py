@@ -29,7 +29,7 @@ def _pred_table(n_pat=120, seed=0):
         dm = float(p % 3 == 0); age = float(rng.integers(35, 80))
         grade = 2 if (dm and p % 12 == 0) else 0                  # a few diabetics with DR: must be excluded
         for eye in (1, 2):
-            rows.append(dict(dataset="brset", file=f"img{p}_{eye}.jpg", patient=f"p{p}", split="test",
+            rows.append(dict(dataset="brset", file=f"img{p}_{eye}.jpg", patient=p, split="test",   # int ids, as in BRSET
                              cohort="healthy" if not dm else "nonhealthy", age=age, sex=float(p % 2),
                              dr_grade=grade, gradable=1.0 if (p + eye) % 10 else 0.0,
                              diabetes="yes" if dm else "no", dm_time=np.nan, final_edema="no", insulin="no",
