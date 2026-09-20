@@ -89,6 +89,8 @@ checkpoint under ``checkpoints/`` and ``exp_*/`` still loads:
 """
 from __future__ import annotations
 
+import contextlib
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -131,6 +133,11 @@ class GuidedContextGating(nn.Module):
     like ``skip``.
     """
 
+    # Gate-map capture. Off by default so training never keeps activation
+    # references alive; ``record_gcg_gates(model)`` flips it on and the forward
+    # stores the *detached* maps in ``last_gate`` (see ``collect_gcg_gates``).
+    record_gates: bool = False
+
     def __init__(
         self,
         skip_channels: int,
@@ -170,7 +177,62 @@ class GuidedContextGating(nn.Module):
 
         spatial_att = torch.sigmoid(self.spatial(x))          # [B,1,H,W]
         channel_att = torch.sigmoid(self.channel(x))          # [B,C,1,1]
+        if self.record_gates:
+            self.last_gate = {"spatial": spatial_att.detach(),
+                              "channel": channel_att.detach().flatten(1)}
         return skip * spatial_att * channel_att               # gated skip
+
+
+# --------------------------------------------------------------------------- #
+# Gate-map capture — what the GCG blocks actually attend to
+# --------------------------------------------------------------------------- #
+# Contract for any gate block (the baseline above and every gcg_blocks variant):
+# when ``module.record_gates`` is True, the forward stores
+#   module.last_gate = {"spatial": [B,1,h,w], "channel": [B,C]}   (detached;
+# whichever of the two the block computes). Nothing is stored otherwise, so a
+# custom block that ignores the flag simply yields no maps.
+def gcg_gate_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
+    """Every GCG gate in ``model``, in module order.
+
+    ``decoders.<i>.gcg`` (coarse -> fine) and ``up_full.gcg`` for
+    :class:`GCGUNet`; ``gcg`` for ``MBRSETClassifier``. Empty for a
+    ``--no-gcg`` model or a timm-backbone classifier (no gate exists).
+    """
+    return [(n, m) for n, m in model.named_modules() if n.split(".")[-1] == "gcg"]
+
+
+@contextlib.contextmanager
+def record_gcg_gates(model: nn.Module):
+    """While active, every gate keeps its most recent attention maps.
+
+    Usage::
+
+        with record_gcg_gates(net):
+            logits = net(x)
+            gates = collect_gcg_gates(net)      # OrderedDict name -> maps
+
+    Recording is switched off again on exit, so the flag never leaks into a
+    training loop. Yields the ``(name, module)`` list for convenience.
+    """
+    mods = gcg_gate_modules(model)
+    for _, m in mods:
+        m.record_gates = True
+        m.last_gate = None
+    try:
+        yield mods
+    finally:
+        for _, m in mods:
+            m.record_gates = False
+
+
+def collect_gcg_gates(model: nn.Module) -> "OrderedDict[str, Dict[str, torch.Tensor]]":
+    """The maps stored by the last forward under :func:`record_gcg_gates`."""
+    out: "OrderedDict[str, Dict[str, torch.Tensor]]" = OrderedDict()
+    for n, m in gcg_gate_modules(model):
+        g = getattr(m, "last_gate", None)
+        if g:
+            out[n] = g
+    return out
 
 
 # --------------------------------------------------------------------------- #
