@@ -491,3 +491,107 @@ Data: BRSET and mBRSET (PhysioNet), passed as `B=`/`M=` (on the lab box they
 live under `/data/users4/nshaik3/Datasets/{BRSET,mBRSET}` on `arctrdgndev101`); FGADR under
 the IIAI research-use agreement (non-redistributable; cite Zhou et al.,
 arXiv:2008.09772).
+
+## 10. RetinaReach: self-calibration + capability gate (24 September; branch `retinareach`)
+
+The RetinaReach plan (engineering goal: a phone model that re-calibrates to an
+unfamiliar camera from unlabelled captures and declares which targets it can
+screen on that device) is built as `retinareach.py`, `capability_gate.py`,
+`train_retinareach.py`, `export_retinareach.py`, `run_retinareach.sh`,
+`summarize_retinareach.py` (see CHANGELOG). The image model has **not** been
+trained yet: BRSET/mBRSET images are only on the lab box. Two parts of the
+system could be measured on the Mac today.
+
+### 10.1 The bar each target must clear on the handheld device (real mBRSET labels)
+
+`capability_gate.py --dataset mbrset` on the public mBRSET v0.1 table
+(5,164 images, 1,291 patients), RetinaReach split (split seed 42, test = 1,032
+images). Comparator = strongest intake-form model (age/sex/diabetes
+duration/oral treatment/insulin; logreg or GBM chosen by grouped CV on
+train+val). "Must reach" = comparator test AUROC + max(0.02, its CV SD); a
+target also needs the paired bootstrap CI of image − metadata to exclude 0.
+
+| target | prevalence | test pos. patients | comparator | metadata test AUROC | image must reach | full chart |
+|---|---|---|---|---|---|---|
+| dr_referable | 0.176 | 55 | clinical/logreg | 0.756 | 0.794 | 0.749 |
+| edema | 0.087 | 25 | clinical/logreg | 0.698 | 0.739 | 0.683 |
+| hypertension | 0.714 | 183 | clinical/logreg | 0.727 | 0.760 | 0.743 |
+| insulin | 0.208 | 56 | clinical/gbm | 0.806 | 0.845 | 0.812 |
+| alcohol | 0.140 | 32 | age_sex/logreg | 0.641 | 0.682 | 0.686 |
+| vascular_disease | 0.171 | 41 | clinical/logreg | 0.556 | 0.606 | 0.594 |
+| diabetic_foot | 0.137 | 38 | age_sex/logreg | 0.568 | 0.629 | 0.609 |
+| obesity | 0.080 | 24 | clinical/logreg | 0.503 | 0.584 | 0.614 |
+| myocardial_infarction | 0.077 | 13 — underpowered | clinical/logreg | 0.654 | 0.725 | 0.736 |
+| neuropathy | 0.043 | 16 — underpowered | age_sex/gbm | 0.475 | 0.556 | 0.479 |
+| nephropathy | 0.036 | 7 — underpowered | age_sex/logreg | 0.543 | 0.634 | 0.608 |
+| smoking | 0.064 | 11 — underpowered | clinical/gbm | 0.423 | 0.500 | 0.675 |
+
+The full-chart hypertension baseline (0.743) is in line with the published
+metadata-only ~0.765, a sanity check on the comparator. Four systemic targets
+cannot pass on mBRSET's test split at any image AUROC (< 20 positive patients):
+the gate will report them UNDERPOWERED, which is the honest answer at this
+dataset size.
+
+### 10.2 On-device self-calibration: fidelity and cost (Core ML, this Mac)
+
+`export_retinareach.py --verify-images`: 64 ODIR-5K photographs (a camera the
+trunk never saw) as the unlabelled captures, calibrated in 4 batches of 16 by
+(a) PyTorch AdaBN and (b) the Core ML calibrator averaged over batches, then
+scored by (a) the eval-mode network and (b) the statistics-input Core ML graph
+(fp16, CPU_AND_NE). Weights: V4-Medium = the retinal-age v5 trunk (a trained
+fundus trunk, used only for its numerics; heads random); V4-Small = random
+trunk (no trained V4-Small is on the Mac). No screening performance is claimed.
+
+| | V4-Small @384 | V4-Medium @512 |
+|---|---|---|
+| BN layers / statistics vector | 46 / 25,088 floats | 77 / 67,904 floats |
+| calibrator vs AdaBN statistics, max error (of layer scale) | 7.1e-5 | 1.8e-5 |
+| probabilities, Core ML vs PyTorch, max abs diff | 0.015 | 0.008 |
+| for scale: how far calibration moved the probabilities | 0.70 | 0.15 |
+| inference, BN folded (today's export), ANE median | 0.65 ms | 2.00 ms |
+| inference, BN from the statistics input, ANE median | 0.94 ms | 4.71 ms |
+| calibrator, one batch of 16, fp32: GPU / CPU | 37 / 116 ms | 188 / 943 ms |
+
+Both PASS (tolerance 0.02; the error is the fp16 inference graph's, identical
+with PyTorch-computed statistics). ALL ≈ CPU_AND_NE for the statistics-input
+graph, so it stays on the ANE. Calibration costs +0.3 ms per screen at the
+deployed V4-Small/384 (+2.7 ms for V4-Medium/512); a camera whose profile is
+known at export time can ship the folded graph (`--fused --fused-profile`) and
+pay nothing. An **fp16 calibrator fails on the ANE** (Program Inference error,
+V4-Medium/512, batch 16), so the calibrator ships fp32: calibration is a
+one-time cost of ~0.04–0.2 s per 16 captures on the GPU. Mac latencies are an
+optimistic bound; the iPhone number needs an Xcode performance report.
+
+### 10.3 Choices made in the build (review before the proposal)
+
+* Systemic targets are **linear probes on the frozen, calibrated trunk** (the
+  trunk never sees a handheld label, so the DR/edema transfer test stays
+  clean). The plan's [DECIDE] "shared trunk vs per-target models" is then
+  measurable against `run_systemic.sh`'s fine-tuned per-target models.
+* The gate's comparator is the **intake form** (`age_sex`, `clinical`); the
+  full chart is reported beside it but does not gate.
+* Gate margin 0.02 (the measured run-to-run SD) per run; across seeds the
+  final status is the worst per-seed status, demoted if the mean delta does
+  not clear the seed SD of the image AUROC.
+* Sensitivity floor for SUPPORTED: target 0.85 minus tolerance 0.10.
+* Calibration is **inductive**: profiles from each device's train+val images;
+  test patients are never in a calibration pool.
+* An unfamiliar camera outside every validated profile's envelope gets
+  NOT_VALIDATED for every target (conservative lookup, not a performance
+  estimate). Envelopes come from 20 pool draws per N; recognition and false
+  acceptance are scored out of sample on draws of test-patient captures
+  (labels unread), and the camera lookup always uses the unblended measured
+  statistics (the prior only enters the inference vector).
+* The metadata comparator's seed is fixed across training seeds, so the bar is
+  a property of the split, and per-seed image − metadata deltas stay paired.
+* BRSET's `insuline` column maps to `insulin`, so the mBRSET-fit insulin probe
+  also gets a tabletop row (a handheld → tabletop transfer test), provided the
+  encoding audit accepts that column on the real BRSET CSV.
+
+### 10.4 Next run (lab box)
+
+```bash
+B=<BRSET root> M=<mBRSET root> CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
+python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --fused --fused-profile handheld \
+    --verify-images <mBRSET images> --benchmark          # on the Mac
+```
