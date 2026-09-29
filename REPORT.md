@@ -562,7 +562,36 @@ V4-Medium/512, batch 16), so the calibrator ships fp32: calibration is a
 one-time cost of ~0.04–0.2 s per 16 captures on the GPU. Mac latencies are an
 optimistic bound; the iPhone number needs an Xcode performance report.
 
-### 10.3 Choices made in the build (review before the proposal)
+**INT8 (26 September).** `--weights int8` (convolutions int8, head float), same
+64 ODIR captures, V4-Medium/512 trained trunk: fidelity still PASS (max
+probability difference 0.013 vs the float PyTorch model), latency unchanged
+(4.46 ms calibratable / 1.97 ms folded on the ANE).
+
+| package | V4-Small @384 float → int8 | V4-Medium @512 float → int8 |
+|---|---|---|
+| screening model | 5.1 → 2.7 MB | 17.3 → 9.0 MB |
+| calibrator (fp32 compute) | 10.0 → 2.7 MB | 34.1 → 9.1 MB |
+
+The whole self-calibrating payload for the deployed V4-Small is 5.4 MB at int8.
+A multifunction bundle (screen + calibrate in one package) works but does not
+share weights (18.0 MB = 9.0 + 9.1): the two graphs compute at different
+precisions.
+
+### 10.3 The phone-side code (Swift reference)
+
+`app/RetinaReachKit` implements the app's procedure on Core ML's public API
+(identical on iOS): training-identical preprocessing, the calibrator averaged
+over capture batches, the camera lookup, screening at the shipped thresholds.
+Against Python on the same captures (a small trained checkpoint): calibration
+statistics identical to PyTorch AdaBN (camera distance 6e-11), capability
+statuses identical, probabilities within 5e-6. Crop + resize match the training
+pipeline to one gray level on 0.3 % of values; the JPEG decoder differs (Apple
+ImageIO vs libjpeg: ~24 % of values, mean 0.4 levels), which moves the
+calibrated statistics by ~1.5 % of the calibration shift. Full Xcode is needed
+to wrap it in an iPhone app; the package itself builds with the command-line
+tools.
+
+### 10.4 Choices made in the build (review before the proposal)
 
 * Systemic targets are **linear probes on the frozen, calibrated trunk** (the
   trunk never sees a handheld label, so the DR/edema transfer test stays
@@ -588,10 +617,40 @@ optimistic bound; the iPhone number needs an Xcode performance report.
   also gets a tabletop row (a handheld → tabletop transfer test), provided the
   encoding audit accepts that column on the real BRSET CSV.
 
-### 10.4 Next run (lab box)
+* Controls and mechanism checks now in every run: permuted-label probes,
+  a quality-flags-only comparator, calibration metrics, gradable vs
+  ungradable strata, camera decodability as-trained vs calibrated; one
+  shuffled-source-label run (`SHUFFLE=1`).
+* ODIR-5K is the third, unfamiliar camera (DR only; age/sex comparator): it
+  tests whether the phone's label-free report matches what that camera's own
+  labels show. No licence is stated for ODIR-5K: evaluation only, never
+  redistributed.
+
+### 10.5 Mechanism checks and the unfamiliar camera's bar (28 September)
+
+* **Vessel ablation** is built without a vessel model: the multi-scale line
+  detector (training-free, published) finds the vasculature, a fixed 12 % of
+  the field of view is inpainted, and the control removes the same mask
+  rotated 90° (13–16 % overlap with the vessels on ODIR images, vs ~11 % by
+  chance). Checked by eye on ODIR photographs: the tree is traced on normal
+  images; on hazy images with few visible vessels the fixed quota picks up
+  texture, which is why only the paired vessels-minus-control contrast is read.
+* **ODIR-5K bar:** age + sex predict referable DR there with AUROC 0.545
+  (image must reach 0.568; 135 positive test patients, well powered). On the
+  third camera the gate will turn on whether the threshold holds, not on the
+  metadata bar.
+* **Shared trunk vs per-target models** is now measurable (`PERTARGET=`), paired
+  on the same handheld test rows.
+
+### 10.6 Next run (lab box)
 
 ```bash
-B=<BRSET root> M=<mBRSET root> CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
-python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --fused --fused-profile handheld \
-    --verify-images <mBRSET images> --benchmark          # on the Mac
+B=<BRSET root> M=<mBRSET root> U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 \
+  PERTARGET="hypertension insulin" CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
+# (a preflight runs first and stops the sweep if anything is wrong; figures at the end
+#  if matplotlib is present, else: python3 plot_retinareach.py --dir exp_retinareach)
+# on the Mac, with a trained checkpoint
+python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --weights int8 --fused \
+    --fused-profile handheld --verify-images <captures> --benchmark \
+    --swift-cli app/RetinaReachKit/.build/release/retinareach-cli
 ```

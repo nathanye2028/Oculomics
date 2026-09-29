@@ -33,7 +33,12 @@ clinic's own captures. The app's whole calibration procedure is then:
 No labels, no gradient, no re-export.
 
 Precision: the inference graph runs fp16 (the ANE); the calibrator defaults to
-fp32 because it squares activations and runs once per camera, not per patient.
+fp32 because it squares activations and runs once per camera, not per patient
+(an fp16 calibrator failed on the ANE at V4-Medium / 512 px / batch 16).
+``--weights int8`` stores every graph's weights as int8 (compute precision
+unchanged); ``--bundle`` also writes ``RetinaReachBundle.mlpackage``, one
+multifunction package (``screen`` + ``calibrate``, iOS 18+) so the app ships one
+file; the export report lists every package's size.
 
     # a trained model
     python export_retinareach.py --checkpoint ck_retinareach/seed0.pt \\
@@ -128,6 +133,41 @@ def convert(module: nn.Module, example: tuple, inputs, out_name: str, precision:
                       compute_units=ct.ComputeUnit.ALL)
 
 
+def quantize_int8(mlmodel):
+    """int8 convolution weights, symmetric per-channel (export_coreml.py's recipe).
+    The linear head stays in float: it is ~1 % of the weights, and a probe row
+    left at zero (a target that was never fitted) has a zero quantisation scale,
+    i.e. a division by zero."""
+    from coremltools.optimize.coreml import (OpLinearQuantizerConfig, OptimizationConfig,
+                                             linear_quantize_weights)
+    cfg = OptimizationConfig(
+        global_config=OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8",
+                                              weight_threshold=512),
+        op_type_configs={"linear": None})
+    return linear_quantize_weights(mlmodel, config=cfg)
+
+
+def package_mb(path: str) -> float:
+    total = 0
+    for d, _, files in os.walk(path):
+        total += sum(os.path.getsize(os.path.join(d, f)) for f in files)
+    return total / 1e6
+
+
+def json_safe(obj):
+    """NaN / inf -> null, recursively: the file is read by Swift's JSONDecoder,
+    which (correctly) rejects the bare ``NaN`` tokens Python's json writes."""
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if np.isfinite(obj) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+
 def profiles_payload(net: RetinaReachNet, ck: Optional[dict], args) -> dict:
     order = [n for n, _ in bn_layers(net)]
     trained = get_bn_stats(net)
@@ -206,6 +246,17 @@ def verify(paths: Dict[str, str], net: RetinaReachNet, args) -> bool:
     err_infer = float(np.abs(ml_p_refvec - ref_p).max())
     shift = float(np.abs(ref_p - src_p).max())
     ok = err_total <= args.tol
+    bundle_err = None
+    if "bundle" in paths:
+        b_cal = ct.models.MLModel(paths["bundle"], function_name="calibrate", compute_units=cu)
+        b_scr = ct.models.MLModel(paths["bundle"], function_name="screen", compute_units=cu)
+        v_sep = calib.predict({"images": batches[0].numpy()})["bn_stats"]
+        v_bun = b_cal.predict({"images": batches[0].numpy()})["bn_stats"]
+        feed = {"image": Image.fromarray(u8[0]), "bn_stats": ml_vec.astype(np.float32)}
+        bundle_err = max(float(np.abs(v_sep - v_bun).max()),
+                         float(np.abs(infer.predict(feed)["probabilities"]
+                                      - b_scr.predict(feed)["probabilities"]).max()))
+        ok = ok and bundle_err <= 1e-3
     print(f"\n=== on-device calibration fidelity ({len(files)} captures from {args.verify_images}, "
           f"{len(batches)} batches of {B}, Core ML on {args.verify_units}) ===")
     print(f"  calibrator vs AdaBN statistics: max error {max(rel):.2e} of the layer scale; "
@@ -213,12 +264,118 @@ def verify(paths: Dict[str, str], net: RetinaReachNet, args) -> bool:
     print(f"  probabilities, Core ML calibrator+model vs PyTorch AdaBN model: max |diff| "
           f"{err_total:.4f}  (inference graph alone, PyTorch statistics: {err_infer:.4f})")
     print(f"  for scale: calibration itself moved probabilities by up to {shift:.4f} on these images")
+    if bundle_err is not None:
+        print(f"  bundle (screen + calibrate functions) vs separate packages: max diff {bundle_err:.2e}")
     print(f"  [{'PASS' if ok else 'FAIL'}] tolerance {args.tol}")
     paths["_verify"] = {"n_images": len(files), "batches": len(batches), "stats_max_rel_err": max(rel),
                         "camera_distance_ml_vs_ref": d_ml_ref, "camera_distance_src_vs_ref": d_src_ref,
                         "prob_max_err_total": err_total, "prob_max_err_inference": err_infer,
-                        "calibration_effect_max": shift, "tol": args.tol, "pass": ok}
+                        "calibration_effect_max": shift, "bundle_max_diff": bundle_err,
+                        "tol": args.tol, "pass": ok}
     return ok
+
+
+def swift_parity(paths: Dict[str, str], net: RetinaReachNet, ck: Optional[dict], args) -> dict:
+    """Run the Swift reference (app/RetinaReachKit, ``retinareach-cli``) on the
+    same captures as Python and compare every stage the phone performs:
+
+    1. preprocessing: Swift's decode + draft + FOV crop + antialiased resize vs
+       the training pipeline's bytes (export_coreml.preprocess_for_verify);
+    2. calibration: Swift's averaged calibrator output on Python's bytes vs
+       PyTorch AdaBN on the same bytes (statistics error, camera distance);
+    3. the capability lookup: Swift's report vs retinareach.device_capability on
+       the same measured vector (statuses must be identical);
+    4. screening: Swift's probabilities vs the PyTorch model under Swift's
+       statistics;
+    5. end to end from the raw files: camera distance between Swift's and
+       Python's measured statistics.
+    """
+    import subprocess
+    from PIL import Image
+    from retinareach import DeviceProfile, device_capability
+    cli, B, S = args.swift_cli, args.calib_batch, args.image_size
+    files = list_images(args.verify_images, args.verify_n)
+    n = (len(files) // B) * B
+    files = files[:n]
+    work = os.path.join(args.out_dir, "swift_parity")
+    for d in ("py_pre", "sw_pre"):
+        os.makedirs(os.path.join(work, d), exist_ok=True)
+    u8 = [preprocess_for_verify(f, S, "cls")[1] for f in files]
+    stems = [os.path.splitext(os.path.basename(f))[0] for f in files]
+    for st, u in zip(stems, u8):
+        Image.fromarray(u).save(os.path.join(work, "py_pre", st + ".png"))
+    run = lambda *a: subprocess.run([cli, *a], check=True, capture_output=True, text=True).stdout
+    units = {"CPU_ONLY": "cpu", "CPU_AND_NE": "ane"}.get(args.verify_units, "all")
+
+    # 1. preprocessing
+    run("preprocess", "--size", str(S), "--out", os.path.join(work, "sw_pre"), *files)
+    sw = [np.asarray(Image.open(os.path.join(work, "sw_pre", st + ".png")).convert("RGB")) for st in stems]
+    diff = np.abs(np.stack(sw).astype(int) - np.stack(u8).astype(int))
+    pre = {"max_abs": int(diff.max()), "mean_abs": float(diff.mean()),
+           "frac_differing": float((diff > 0).mean())}
+
+    # 2-4 on Python's bytes (isolates Core ML + Swift logic from preprocessing)
+    dev_json = os.path.join(work, "device.json")
+    run("calibrate", "--models", args.out_dir, "--captures", os.path.join(work, "py_pre"),
+        "--n", str(n), "--units", units, "--preprocessed", "--out", dev_json)
+    with open(dev_json) as fh:
+        dev = json.load(fh)
+    sw_vec = torch.tensor(dev["measured"], dtype=torch.float32)
+    raw = torch.from_numpy(np.stack(u8)).permute(0, 3, 1, 2).float()
+    norm = _Normalise()
+    cal, _ = self_calibrate(net, [{"image": norm(raw[i:i + B])} for i in range(0, n, B)],
+                            torch.device("cpu"))
+    order = [k for k, _ in bn_layers(net)]
+    ref_vec = stats_to_vector(get_bn_stats(cal), order)
+    sw_stats = vector_to_stats(sw_vec, net)
+    calib = {"max_abs": float((sw_vec - ref_vec).abs().max()),
+             "camera_distance_to_pytorch": camera_distance(sw_stats, get_bn_stats(cal)),
+             "camera_distance_trained_to_pytorch": camera_distance(get_bn_stats(net), get_bn_stats(cal))}
+    lookup = {"swift": dev["report"]}
+    if ck is not None and ck.get("profiles"):
+        profs = [DeviceProfile.from_dict({**p, "name": k}) for k, p in ck["profiles"].items()]
+        py = device_capability(profs, sw_stats, int(dev["nImages"]), net.targets)
+        sw_status = {t["target"]: t["status"] for t in dev["report"]["targets"]}
+        py_status = {t["target"]: t["status"] for t in py["targets"]}
+        lookup.update(python=py, statuses_equal=sw_status == py_status,
+                      nearest_equal=py["nearest_profile"] == dev["report"]["nearestProfile"],
+                      inside_equal=py["inside_envelope"] == dev["report"]["insideEnvelope"])
+    scr_json = os.path.join(work, "screen.json")
+    run("screen", "--models", args.out_dir, "--device", dev_json, "--units", units, "--preprocessed",
+        "--out", scr_json, *[os.path.join(work, "py_pre", st + ".png") for st in stems])
+    with open(scr_json) as fh:
+        scr = json.load(fh)
+    from retinareach import set_bn_stats
+    import copy
+    m = copy.deepcopy(net).eval()                    # the network under Swift's statistics
+    set_bn_stats(m, vector_to_stats(torch.tensor(dev["inference"], dtype=torch.float32), net))
+    with torch.no_grad():
+        ref_p = torch.sigmoid(m(norm(raw))).numpy()
+    sw_p = np.array([[r["probabilities"][t] for t in net.targets] for r in scr])
+    screen = {"max_abs": float(np.abs(sw_p - ref_p).max())}
+
+    # 5. end to end from the raw files
+    dev_raw = os.path.join(work, "device_raw.json")
+    run("calibrate", "--models", args.out_dir, "--captures", args.verify_images, "--n", str(n),
+        "--units", units, "--out", dev_raw)
+    with open(dev_raw) as fh:
+        raw_vec = torch.tensor(json.load(fh)["measured"], dtype=torch.float32)
+    e2e = {"camera_distance_to_python": camera_distance(vector_to_stats(raw_vec, net), sw_stats)}
+    out = {"n_images": n, "preprocessing": pre, "calibration": calib, "lookup": lookup,
+           "screen": screen, "end_to_end": e2e}
+    print(f"\n=== Swift reference parity ({n} captures, Core ML on {units}) ===")
+    print(f"  preprocessing bytes vs the training pipeline: max |diff| {pre['max_abs']}, mean "
+          f"{pre['mean_abs']:.3f}, {100 * pre['frac_differing']:.1f} % of values differ")
+    print(f"  calibration vs PyTorch AdaBN: max |diff| {calib['max_abs']:.2e}; camera distance "
+          f"{calib['camera_distance_to_pytorch']:.2e} (trained->calibrated "
+          f"{calib['camera_distance_trained_to_pytorch']:.3g})")
+    if "statuses_equal" in lookup:
+        print(f"  capability lookup: statuses equal {lookup['statuses_equal']}, nearest equal "
+              f"{lookup['nearest_equal']}, inside equal {lookup['inside_equal']}")
+    print(f"  screening probabilities vs PyTorch: max |diff| {screen['max_abs']:.2e}")
+    print(f"  end to end from raw files: camera distance Swift vs Python statistics "
+          f"{e2e['camera_distance_to_python']:.2e}")
+    return out
 
 
 def benchmark(path: str, inputs: dict, label: str, runs: int, warmup: int,
@@ -256,6 +413,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--collector-precision", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--precision", choices=["fp32", "fp16"], default="fp16",
                    help="inference graph precision")
+    p.add_argument("--weights", choices=["float", "int8"], default="float",
+                   help="weight storage for every exported graph")
+    p.add_argument("--bundle", action="store_true",
+                   help="also write one multifunction package (screen + calibrate; iOS 18+)")
     p.add_argument("--fused", action="store_true",
                    help="also export a BN-folded graph (no statistics input): the latency baseline, "
                         "and the fast path for a camera whose profile is known at export time")
@@ -270,6 +431,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    choices=["CPU_AND_NE", "ALL", "CPU_ONLY", "CPU_AND_GPU"])
     p.add_argument("--tol", type=float, default=0.02,
                    help="max |probability difference| Core ML vs PyTorch for PASS")
+    p.add_argument("--swift-cli", default=None,
+                   help="path to a built retinareach-cli (app/RetinaReachKit, `swift build -c "
+                        "release`): run the Swift reference on --verify-images and compare")
     p.add_argument("--benchmark", action="store_true")
     p.add_argument("--runs", type=int, default=50)
     p.add_argument("--warmup", type=int, default=10)
@@ -307,6 +471,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for k, v in meta.items():
         m.user_defined_metadata[k] = v
     paths["model"] = os.path.join(args.out_dir, "RetinaReach.mlpackage")
+    if args.weights == "int8":
+        m = quantize_int8(m)
     m.save(paths["model"])
 
     c = convert(col, (torch.randint(0, 256, (B, 3, S, S)).float(),),
@@ -317,6 +483,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for k, v in meta.items():
         c.user_defined_metadata[k] = v
     paths["calibrator"] = os.path.join(args.out_dir, "RetinaReachCalibrator.mlpackage")
+    if args.weights == "int8":
+        c = quantize_int8(c)
     c.save(paths["calibrator"])
     if args.fused:
         fused_net = net
@@ -332,14 +500,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         f.user_defined_metadata["bn_stats"] = args.fused_profile
         f.user_defined_metadata["targets"] = ",".join(net.targets)
         paths["fused"] = os.path.join(args.out_dir, f"RetinaReachFused_{args.fused_profile}.mlpackage")
+        if args.weights == "int8":
+            f = quantize_int8(f)
         f.save(paths["fused"])
+    if args.bundle:
+        from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+        if getattr(ct.target, args.min_target) < ct.target.iOS18:
+            raise SystemExit("[fatal] --bundle needs --min-target iOS18 (multifunction models)")
+        desc = MultiFunctionDescriptor()
+        desc.add_function(paths["model"], src_function_name="main", target_function_name="screen")
+        desc.add_function(paths["calibrator"], src_function_name="main",
+                          target_function_name="calibrate")
+        desc.default_function_name = "screen"
+        paths["bundle"] = os.path.join(args.out_dir, "RetinaReachBundle.mlpackage")
+        save_multifunction(desc, paths["bundle"])
     with open(os.path.join(args.out_dir, "retinareach_profiles.json"), "w") as fh:
-        json.dump(profiles_payload(net, ck, args), fh)
+        json.dump(json_safe(profiles_payload(net, ck, args)), fh, allow_nan=False)
+    sizes = {k: round(package_mb(v), 2) for k, v in paths.items() if not k.startswith("_")}
+    print("[size] " + ", ".join(f"{k} {v:.1f} MB" for k, v in sizes.items()) +
+          f"  (weights: {args.weights})")
     print("[ok] saved " + ", ".join(paths.values()) + " and retinareach_profiles.json")
 
     ok = True
     if args.verify_images:
         ok = verify(paths, net, args)
+        if args.swift_cli:
+            paths["_swift"] = swift_parity(paths, net, ck, args)
     bench = {}
     if args.benchmark:
         from PIL import Image
@@ -356,8 +542,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             paths["calibrator"], {"images": rng.integers(0, 256, (B, 3, S, S)).astype(np.float32)},
             f"calibrator, one batch of {B}", max(5, args.runs // 5), 3)
     with open(os.path.join(args.out_dir, "export_report.json"), "w") as fh:
-        json.dump({"args": vars(args), "stats_len": L, "latency_ms": bench,
-                   "verify": paths.get("_verify")}, fh, indent=2, default=float)
+        json.dump({"args": vars(args), "stats_len": L, "latency_ms": bench, "size_mb": sizes,
+                   "verify": paths.get("_verify"), "swift_parity": paths.get("_swift")},
+                  fh, indent=2, default=float)
     return 0 if ok else 1
 
 

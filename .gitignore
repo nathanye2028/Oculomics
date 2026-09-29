@@ -41,3 +41,7 @@ data/
 *.zip
 *.tar
 *.tar.gz
+
+# Swift package build products (app/RetinaReachKit)
+.build/
+.swiftpm/

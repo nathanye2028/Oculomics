@@ -235,7 +235,9 @@ def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0):
         b.train()
     seen = 0
     for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)
+        # non_blocking only on CUDA: MPS non-blocking copies from pageable memory
+        # are unsafe (they corrupted strided tensors in torch 2.8).
+        x = batch["image"].to(device, non_blocking=device.type == "cuda")
         if x.shape[0] < 2:
             continue
         m(x)
@@ -300,6 +302,24 @@ def load_init_weights(model: nn.Module, path: str, root: str = None,
             "n_loaded": len(loaded), "n_head_skipped": len(head),
             "n_shape_mismatch": len(mismatch), "n_missing": len(missing),
             "warning": warning}
+
+
+def splits_from_file(df: pd.DataFrame, path: str) -> dict:
+    """train/val/test DataFrames from a CSV with ``file`` and ``split`` columns
+    (train_retinareach.py writes one per device). Rows the file does not list
+    are excluded; a patient appearing in two splits is refused."""
+    sf = pd.read_csv(path)
+    if not {"file", "split"} <= set(sf.columns):
+        raise SystemExit(f"[fatal] --split-file {path}: needs columns file, split")
+    lab = df["file"].astype(str).map(dict(zip(sf["file"].astype(str), sf["split"])))
+    out = {k: df[(lab == k).to_numpy()].reset_index(drop=True) for k in ("train", "val", "test")}
+    pats = {k: set(v["patient"]) for k, v in out.items()}
+    if pats["train"] & pats["test"] or pats["train"] & pats["val"] or pats["val"] & pats["test"]:
+        raise SystemExit(f"[fatal] --split-file {path}: a patient appears in two splits")
+    n_out = int(lab.isna().sum())
+    if n_out:
+        print(f"[warn] --split-file: {n_out} rows of the label CSV are not in {path}; excluded")
+    return out
 
 
 def pick_device() -> torch.device:
@@ -428,6 +448,10 @@ def main() -> int:
                    help="Also fit a logistic regression on --covariate-features (train split) "
                         "and score it on the test split -> 'covariate_baseline' in the JSON. "
                         "The floor an image model must clear on an age-confounded target.")
+    p.add_argument("--split-file", default=None,
+                   help="CSV (file, split) fixing the train/val/test partition instead of the "
+                        "seed-derived one, e.g. <retinareach run>/split_handheld.csv: the per-target "
+                        "model is then paired row for row with the RetinaReach probe")
     p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
                    help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
                         "for the stricter chart-knowledge baseline).")
@@ -462,9 +486,14 @@ def main() -> int:
     src = load_any(args.root, args.dataset, image_ext=args.image_ext)
     img_dir = src["images_dir"]
 
-    # Patient-grouped, label-stratified 70/10/20 split (no patient leakage).
-    splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
-                              test_frac=0.20, group_col="patient", seed=args.seed)
+    # Patient-grouped, label-stratified 70/10/20 split (no patient leakage) --
+    # or a fixed partition from --split-file, e.g. RetinaReach's split_handheld.csv,
+    # so a per-target model and a RetinaReach probe are scored on the same rows.
+    if args.split_file:
+        splits = splits_from_file(src["df"], args.split_file)
+    else:
+        splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
+                                  test_frac=0.20, group_col="patient", seed=args.seed)
     gpu_aug = args.gpu_aug if args.gpu_aug is not None else (device.type == "cuda")
     mk = lambda df, sp, d=img_dir: MBRSETDataset(csv=df, images_dir=d, task=args.task,
                                                  split=sp, image_size=args.image_size,
@@ -737,6 +766,7 @@ def main() -> int:
               "domain_gap_auroc": (em["auroc"] - tm["auroc"]) if em else None,
               "external_bnadapt": None,
               "init_from": init_info,
+              "split_file": os.path.abspath(args.split_file) if args.split_file else None,
               "covariate_baseline": cb,
               "covariate_baseline_external": cb_ext,
               "image_minus_covariate_auroc": image_minus_covariate(tm["auroc"], cb) if cb else None,

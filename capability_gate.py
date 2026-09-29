@@ -193,6 +193,81 @@ def full_chart_auroc(fit_df: pd.DataFrame, test_df: pd.DataFrame, task: str,
     return _auc(yt, build_model("logreg", kinds, seed).fit(X, y).predict_proba(X_te)[:, 1])
 
 
+# Acquisition-quality flags every dataset carries (in the mBRSET schema).
+QUALITY_FEATURES = ("final_quality", "final_artifacts")
+
+
+def quality_only_auroc(fit_df: pd.DataFrame, test_df: pd.DataFrame, task: str,
+                       seed: int = 0) -> float:
+    """Negative control (plan 5.8): a logistic regression on the image-QUALITY
+    flags alone. A target this predicts well is partly a capture-quality
+    signal, and an image model's AUROC on it must be read against this line."""
+    banned = set(LABEL_REGISTRY[task].source_cols)
+    feats = [c for c in QUALITY_FEATURES if c in fit_df.columns and c in test_df.columns
+             and c not in banned and fit_df[c].notna().any()]
+    y_fit, y_te = target_vector(fit_df, task), target_vector(test_df, task)
+    if not feats or len(np.unique(y_fit[~np.isnan(y_fit)])) < 2 or \
+            len(np.unique(y_te[~np.isnan(y_te)])) < 2:
+        return float("nan")
+    X, y, _, kinds = _xy(fit_df, task, feats)
+    X_te, yt, _, _ = _xy(test_df, task, feats, kinds)
+    return _auc(yt, build_model("logreg", kinds, seed).fit(X, y).predict_proba(X_te)[:, 1])
+
+
+def calibration_metrics(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -> Dict[str, float]:
+    """Brier score, expected calibration error over equal-count bins, and
+    calibration-in-the-large (mean predicted risk vs observed prevalence).
+    Balanced-sampler training shifts predicted risk upward by design; the
+    shipped threshold, not the raw probability, is what the device acts on."""
+    order = np.argsort(p)
+    bins = np.array_split(order, min(n_bins, len(p)))
+    ece = sum(len(b) * abs(p[b].mean() - y[b].mean()) for b in bins if len(b)) / len(p)
+    return {"brier": float(np.mean((p - y) ** 2)), "ece": float(ece),
+            "mean_predicted": float(p.mean())}
+
+
+def quality_strata(test_df: pd.DataFrame, target: str, scores: np.ndarray,
+                   threshold: float) -> List[Dict[str, object]]:
+    """Mechanism check (plan 5.7): AUROC and sensitivity at the shipped threshold
+    separately on gradable and ungradable images (the dataset's own quality
+    grade). A target that holds up only on ungradable images is reading the
+    capture, not the retina."""
+    q = target_vector(test_df, "quality") if "final_quality" in test_df.columns else \
+        np.full(len(test_df), np.nan)
+    y_all = target_vector(test_df, target)
+    rows = []
+    for label, stratum in (("gradable", 1.0), ("ungradable", 0.0)):
+        ok = (q == stratum) & ~np.isnan(y_all) & ~np.isnan(scores)
+        y, p = y_all[ok].astype(int), scores[ok]
+        two = len(np.unique(y)) == 2
+        rows.append({"target": target, "stratum": label, "n": int(ok.sum()),
+                     "pos": int(y.sum()), "auroc": _auc(y, p) if two else float("nan"),
+                     "sensitivity": float((p[y == 1] >= threshold).mean())
+                     if (y == 1).any() and threshold == threshold else float("nan")})
+    return rows
+
+
+def decodability(X: np.ndarray, label: np.ndarray, groups: np.ndarray, seed: int = 0,
+                 folds: int = 5) -> Dict[str, float]:
+    """Mechanism check (plan 5.7): how well a linear read-out recovers a binary
+    ``label`` (e.g. which camera took the image) from embeddings ``X``;
+    patient-grouped CV AUROC. Near 1.0 = the representation encodes the camera;
+    0.5 = it does not. The two devices also differ in population, so after
+    calibration some residual decodability is expected from content alone."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    label = label.astype(int)
+    aucs = []
+    for tr, te in StratifiedGroupKFold(folds, shuffle=True, random_state=seed).split(X, label, groups):
+        clf = make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=3000))
+        clf.fit(X[tr], label[tr])
+        aucs.append(_auc(label[te], clf.decision_function(X[te])))
+    return {"auroc": float(np.mean(aucs)), "auroc_sd": float(np.std(aucs, ddof=1)),
+            "n": int(len(label)), "folds": folds}
+
+
 # --------------------------------------------------------------------------- #
 # Statistics
 # --------------------------------------------------------------------------- #
@@ -251,7 +326,8 @@ def gate_cell(target: str, device: str, protocol: str, test_df: pd.DataFrame,
               target_sens: float = 0.85, sens_tolerance: float = 0.10, gate_margin: float = 0.02,
               min_pos_patients: int = 20, n_boot: int = 1000, seed: int = 0,
               audit: Optional[Dict[str, object]] = None,
-              full_chart: float = float("nan")) -> Dict[str, object]:
+              full_chart: float = float("nan"), quality_only: float = float("nan"),
+              shuffle: Optional[Dict[str, float]] = None) -> Dict[str, object]:
     """One row of the capability table: discrimination, operating point at the
     shipped threshold, comparator, paired delta and status."""
     row: Dict[str, object] = {"target": target, "device": device, "protocol": protocol,
@@ -275,7 +351,7 @@ def gate_cell(target: str, device: str, protocol: str, test_df: pd.DataFrame,
                    patient_auroc=patient_auroc(y, p, g),
                    sensitivity=op["sensitivity"], specificity=op["specificity"], ppv=op["ppv"],
                    flagged_fraction=op["flagged_fraction"],
-                   oracle_threshold=thr_oracle)
+                   oracle_threshold=thr_oracle, **calibration_metrics(y, p))
         m = np.asarray(comparator.get("scores", np.full(len(test_df), np.nan)))[ok]
         if comparator.get("reason") is None and not np.isnan(m).any():
             meta_auc = _auc(y, m)
@@ -293,6 +369,9 @@ def gate_cell(target: str, device: str, protocol: str, test_df: pd.DataFrame,
                        meta_cv_sd=float("nan"), **pd_)
         row["margin"] = float(margin)
         row["full_chart_auroc"] = full_chart
+        row["quality_only_auroc"] = quality_only
+        if shuffle:
+            row.update(shuffle_auroc=shuffle.get("auroc"), shuffle_se=shuffle.get("se"))
         status, reason = gate_status(True, pos_pat, min_pos_patients, pd_["delta"],
                                      pd_["delta_lo"], margin, op["sensitivity"],
                                      target_sens, sens_tolerance)
@@ -307,8 +386,9 @@ def gate_cell(target: str, device: str, protocol: str, test_df: pd.DataFrame,
 
 TABLE_COLS = ["target", "device", "protocol", "status", "n", "pos_patients", "prevalence",
               "auroc", "auroc_lo", "auroc_hi", "meta_auroc", "meta_feature_set", "delta",
-              "delta_lo", "delta_hi", "margin", "full_chart_auroc", "threshold", "sensitivity",
-              "specificity", "ppv", "flagged_fraction", "reason"]
+              "delta_lo", "delta_hi", "margin", "full_chart_auroc", "quality_only_auroc",
+              "threshold", "sensitivity", "specificity", "ppv", "flagged_fraction", "ece",
+              "reason"]
 
 
 def format_table(rows: List[Dict[str, object]], cols: Sequence[str] = TABLE_COLS) -> str:
@@ -325,7 +405,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from retinareach import PROBE_TARGETS, SOURCE_TARGETS
     p = argparse.ArgumentParser(description="RetinaReach capability gate (metadata side, or re-gate "
                                             "a run's predictions).")
-    p.add_argument("--dataset", choices=["mbrset", "brset"], required=True)
+    from brset_dataset import DATASETS
+    p.add_argument("--dataset", choices=list(DATASETS), required=True)
     p.add_argument("--root", required=True, help="dataset root (directory holding the label CSV)")
     p.add_argument("--out", required=True)
     p.add_argument("--targets", nargs="+", default=list(SOURCE_TARGETS) + list(PROBE_TARGETS))

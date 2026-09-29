@@ -21,6 +21,14 @@ into the three deliverables of the plan (section 6):
    over seeds and repeats: AUROC and sensitivity at the shipped threshold vs N,
    with and without the source prior; plus the envelopes and the label-free
    device-recognition rate.
+4. **Controls and mechanism** -- permuted-label probes and the quality-only
+   AUROC per target, the ``shuffle_seed*`` negative-control runs (every
+   source-target AUROC must sit at chance), camera decodability as-trained vs
+   calibrated (paired by seed), AUROC on gradable vs ungradable images, and the
+   vessel ablation (vessels removed vs the same area elsewhere).
+5. **Unfamiliar cameras** -- the gate on each ``--unfamiliar`` camera from its
+   own labels, and how often the phone's label-free lookup showed a target those
+   labels do not support (unsafe) or hid one they do (missed), by N.
 
     python summarize_retinareach.py --dir exp_retinareach
 """
@@ -56,21 +64,85 @@ def md_table(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def load(d: str):
+def _csv(base: str, name: str, seed: int) -> pd.DataFrame:
+    path = os.path.join(base, name)
+    return pd.read_csv(path).assign(seed=seed) if os.path.exists(path) else pd.DataFrame()
+
+
+def load(d: str, prefix: str = "seed"):
+    """Runs under ``<d>/<prefix><N>/``; ``prefix="shuffle_seed"`` loads the
+    negative-control runs, which never enter the main tables."""
     runs = {}
-    for f in sorted(glob.glob(os.path.join(d, "seed*", "results.json"))):
+    for f in sorted(glob.glob(os.path.join(d, f"{prefix}*", "results.json"))):
         base = os.path.dirname(f)
-        m = re.fullmatch(r"seed(\d+)", os.path.basename(base))
+        m = re.fullmatch(prefix + r"(\d+)", os.path.basename(base))
         if m is None:                         # e.g. seed0_old/: not a run of this sweep
-            print(f"[skip] {base}: not a seed<N> run directory")
+            print(f"[skip] {base}: not a {prefix}<N> run directory")
             continue
         s = int(m.group(1))
-        cap = pd.read_csv(os.path.join(base, "capability.csv")).assign(seed=s)
-        sweep_p = os.path.join(base, "calibration_sweep.csv")
-        sweep = pd.read_csv(sweep_p).assign(seed=s) if os.path.exists(sweep_p) else pd.DataFrame()
         with open(f) as fh:
-            runs[s] = {"results": json.load(fh), "cap": cap, "sweep": sweep}
+            res = json.load(fh)
+        if res.get("shuffle_source_labels") and prefix == "seed":
+            print(f"[skip] {base}: a shuffled-label control run; move it to shuffle_seed{s}/")
+            continue
+        runs[s] = {"results": res, "cap": _csv(base, "capability.csv", s),
+                   "sweep": _csv(base, "calibration_sweep.csv", s),
+                   "strata": _csv(base, "quality_strata.csv", s),
+                   "unf": _csv(base, "capability_unfamiliar.csv", s),
+                   "lookup": _csv(base, "unfamiliar_lookup.csv", s),
+                   "ablation": _csv(base, "anatomy_ablation.csv", s),
+                   "pertarget": _pertarget(base, s)}
     return runs
+
+
+def _pertarget(base: str, seed: int) -> pd.DataFrame:
+    """train_mbrset.py per-target results written next to a seed's run."""
+    rows = []
+    for f in sorted(glob.glob(os.path.join(base, "pertarget_*.json"))):
+        with open(f) as fh:
+            r = json.load(fh)
+        rows.append({"seed": seed, "target": r["task"], "finetuned_auroc": (r.get("test") or {}).get("auroc"),
+                     "covariate_auroc": (r.get("covariate_baseline") or {}).get("auroc"),
+                     "n_test": (r.get("test") or {}).get("n")})
+    return pd.DataFrame(rows)
+
+
+def shared_vs_pertarget(cap: pd.DataFrame, pt: pd.DataFrame, device: str) -> List[dict]:
+    """Paired by seed on the same handheld test rows: fine-tuned per-target model
+    minus the shared-trunk calibrated probe."""
+    out = []
+    for t, g in pt.groupby("target"):
+        probe = cap[(cap["target"] == t) & (cap["device"] == device)
+                    & (cap["protocol"] == "calibrated")].set_index("seed")["auroc"].dropna().to_dict()
+        fine = g.set_index("seed")["finetuned_auroc"].dropna().to_dict()
+        ps = paired_stats(fine, probe)
+        out.append({"target": t, "seeds": ps["n"],
+                    "probe_auroc": float(np.mean(list(probe.values()))) if probe else np.nan,
+                    "finetuned_auroc": float(np.mean(list(fine.values()))) if fine else np.nan,
+                    "finetuned_minus_probe": (f"{ps['mean_delta']:+.3f} [{ps['ci95'][0]:+.3f}, "
+                                              f"{ps['ci95'][1]:+.3f}] {ps['n_positive']}/{ps['n']}"
+                                              + (" *" if ps["significant"] else "")) if ps["n"] else "n/a",
+                    "covariate_auroc": g["covariate_auroc"].mean()})
+    return out
+
+
+def _cat(runs, key) -> pd.DataFrame:
+    frames = [r[key] for r in runs.values() if len(r[key])]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def controls_table(cap: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ("shuffle_auroc", "quality_only_auroc", "meta_auroc", "auroc", "ece",
+                        "mean_predicted", "prevalence") if c in cap.columns]
+    c = cap[cap["protocol"] == "calibrated"].dropna(subset=["auroc"])
+    return c.groupby(["target", "device"])[cols].mean().reset_index() if len(c) else c
+
+
+def decode_table(runs) -> Dict[str, object]:
+    by = {pr: {s: r["results"]["camera_decodability"][pr]["auroc"] for s, r in runs.items()
+               if r["results"].get("camera_decodability")} for pr in ("trained", "calibrated")}
+    ps = paired_stats(by["calibrated"], by["trained"])
+    return {"trained": by["trained"], "calibrated": by["calibrated"], "paired": ps}
 
 
 def transfer_table(cap: pd.DataFrame, source_targets: List[str]) -> List[dict]:
@@ -150,6 +222,35 @@ def main(argv=None) -> int:
     sw = sweep_table(sweep, source_targets)
     env = {s: runs[s]["results"].get("envelope") for s in seeds}
     rec = {s: runs[s]["results"].get("device_recognition") for s in seeds}
+    fa = {s: runs[s]["results"].get("device_false_accept") for s in seeds}
+    ctl = controls_table(cap)
+    dec = decode_table(runs)
+    strata = _cat(runs, "strata")
+    st = (strata.groupby(["target", "device", "protocol", "stratum"])[["n", "auroc", "sensitivity"]]
+          .mean().reset_index() if len(strata) else strata)
+    shuf = load(a.dir, prefix="shuffle_seed")
+    shuf_cap = _cat(shuf, "cap")
+    shuf_t = (shuf_cap[shuf_cap["target"].isin(source_targets)]
+              .groupby(["target", "device", "protocol"])["auroc"].mean().reset_index()
+              if len(shuf_cap) else shuf_cap)
+    unf, look = _cat(runs, "unf"), _cat(runs, "lookup")
+    unf_ct = capability_table(unf) if len(unf) else unf
+    unf_tr = transfer_table(unf, source_targets) if len(unf) else []
+    lk = (look.groupby(["device", "target", "n"])[["shown_rate", "unsafe_rate", "missed_rate",
+                                                   "inside_rate"]].mean().reset_index()
+          if len(look) else look)
+    dps = dec["paired"]
+    pt = _cat(runs, "pertarget")
+    svp = shared_vs_pertarget(cap, pt, first["args"]["target_name"]) if len(pt) else []
+    ab = _cat(runs, "ablation")
+    ab_t = pd.DataFrame()
+    if len(ab):
+        ab_t = ab.groupby(["target", "device"]).agg(
+            seeds=("seed", "nunique"), auroc_intact=("auroc_intact", "mean"),
+            auroc_vessels=("auroc_vessels", "mean"), auroc_control=("auroc_control", "mean"),
+            vessels_minus_control=("vessels_minus_control", "mean"),
+            vmc_sd=("vessels_minus_control", "std"),
+            seeds_ci_below_0=("vmc_hi", lambda v: int((v < 0).sum()))).reset_index()
 
     ff = lambda v: f"{v:.3f}"
     md = [f"# RetinaReach — {len(seeds)} seeds ({', '.join(map(str, seeds))})", "",
@@ -163,15 +264,56 @@ def main(argv=None) -> int:
           md_table(ct), "",
           "## 3. Calibration size (handheld test; pooled over seeds and repeats)", "",
           md_table(sw) if len(sw) else "(no sweep)", "",
-          "Envelope (95th pct same-camera distance) and label-free device recognition by seed:", "",
-          "```", json.dumps({"envelope": env, "recognition": rec}, indent=1, default=float), "```"]
+          "Envelope (95th pct same-camera distance), out-of-sample recognition and false "
+          "acceptance by seed:", "",
+          "```", json.dumps({"envelope": env, "recognition": rec, "false_accept": fa}, indent=1,
+                            default=float), "```", "",
+          "## 4. Controls and mechanism", "",
+          "Per target (calibrated protocol, mean over seeds): permuted-label probe AUROC (must be "
+          "~0.5), quality-flags-only AUROC, intake-form AUROC, image AUROC, ECE, mean predicted "
+          "risk vs prevalence.", "",
+          md_table(ctl), "",
+          "Negative-control runs (source labels permuted in training; must sit at ~0.5): " +
+          (f"{len(shuf)} run(s)" if len(shuf) else "none found (run with SHUFFLE=1)"), "",
+          md_table(shuf_t) if len(shuf_t) else "", "",
+          "Camera decodability from the trunk embedding (patient-grouped linear read-out AUROC; "
+          "1.0 = the representation encodes the camera):", "",
+          (f"trained {np.mean(list(dec['trained'].values())):.3f}, calibrated "
+           f"{np.mean(list(dec['calibrated'].values())):.3f}; paired calibrated − trained "
+           f"{dps['mean_delta']:+.3f} [{dps['ci95'][0]:+.3f}, {dps['ci95'][1]:+.3f}] "
+           f"({dps['n']} seeds)") if dps["n"] else "(not recorded)", "",
+          "Gradable vs ungradable images:", "", md_table(st) if len(st) else "(none)", "",
+          "Vessel ablation (calibrated protocol; vessels_minus_control < 0 = the target leans on "
+          "the vasculature more than on the same area of other retina; seeds_ci_below_0 = runs "
+          "whose patient-bootstrap CI excludes 0):", "",
+          md_table(ab_t) if len(ab_t) else "(not run)", "",
+          "Shared trunk vs per-target models (handheld test rows, paired by seed; fine-tuned "
+          "per-target train_mbrset.py model minus the shared-trunk calibrated probe):", "",
+          md_table(pd.DataFrame(svp)) if svp else "(no PERTARGET runs)", "",
+          "## 5. Unfamiliar cameras (labels used only to score)", "",
+          md_table(unf_ct) if len(unf_ct) else "(no --unfamiliar camera in these runs)", "",
+          md_table(pd.DataFrame(unf_tr)) if unf_tr else "", "",
+          "Phone lookup vs the camera's own labels (mean over seeds and draws): shown = the "
+          "target is displayed; unsafe = displayed but not SUPPORTED by the labels; missed = "
+          "SUPPORTED but hidden.", "",
+          md_table(lk) if len(lk) else ""]
     os.makedirs(a.dir, exist_ok=True)
     with open(os.path.join(a.dir, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     ct.to_csv(os.path.join(a.dir, "capability_final.csv"), index=False)
     with open(os.path.join(a.dir, "summary.json"), "w") as f:
         json.dump({"seeds": seeds, "transfer": tr, "capability": ct.to_dict("records"),
-                   "sweep": sw.to_dict("records") if len(sw) else []}, f, indent=2, default=float)
+                   "sweep": sw.to_dict("records") if len(sw) else [],
+                   "controls": ctl.to_dict("records") if len(ctl) else [],
+                   "shuffle_runs": shuf_t.to_dict("records") if len(shuf_t) else [],
+                   "decodability": dec,
+                   "quality_strata": st.to_dict("records") if len(st) else [],
+                   "anatomy_ablation": ab_t.to_dict("records") if len(ab_t) else [],
+                   "shared_vs_pertarget": svp,
+                   "unfamiliar_capability": unf_ct.to_dict("records") if len(unf_ct) else [],
+                   "unfamiliar_transfer": unf_tr,
+                   "unfamiliar_lookup": lk.to_dict("records") if len(lk) else []},
+                  f, indent=2, default=float)
     print("\n".join(md[:4 + 1]))
     print(pd.DataFrame(tr).to_string(index=False) if tr else "")
     print("\n=== final capability ===")

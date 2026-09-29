@@ -215,6 +215,56 @@ def test_encoding_audit_catches_a_one_two_column():
     assert not encoding_audit(pd.DataFrame({"x": [0, 1]}), "hypertension")["ok"]
 
 
+def test_probe_shuffle_sits_at_chance_and_real_probe_does_not():
+    from train_retinareach import probe_shuffle
+    rng = np.random.default_rng(1)
+    X = rng.normal(0, 1, (400, 8))
+    y = (X[:, 0] + rng.normal(0, .5, 400) > 0).astype(int)
+    sh = probe_shuffle(X[:300], y[:300], X[300:], y[300:], C=1.0, n=20, seed=0)
+    assert abs(sh["auroc"] - 0.5) < 4 * sh["se"] + 0.05
+
+
+def test_quality_only_calibration_strata_and_decodability():
+    from capability_gate import (calibration_metrics, decodability, quality_only_auroc,
+                                 quality_strata)
+    rng = np.random.default_rng(0)
+    n = 400
+    q = rng.random(n) < 0.8
+    df = pd.DataFrame({"file": [f"{i}.jpg" for i in range(n)], "patient": np.arange(n) // 2,
+                       "final_quality": np.where(q, "yes", "no"),
+                       "final_artifacts": rng.choice(["yes", "no"], n),
+                       # the target is carried by image quality only
+                       "systemic_hypertension": (~q | (rng.random(n) < 0.1)).astype(int)})
+    assert quality_only_auroc(df.iloc[:300], df.iloc[300:], "hypertension") > 0.8
+    y = rng.integers(0, 2, 200).astype(float)
+    cm = calibration_metrics(y, np.clip(y * 0.8 + 0.1, 0, 1))
+    assert cm["ece"] < 0.2 and cm["brier"] < 0.05
+    rows = quality_strata(df, "hypertension", rng.random(n), 0.5)
+    assert [r["stratum"] for r in rows] == ["gradable", "ungradable"]
+    X = rng.normal(0, 1, (200, 5))
+    lab = np.r_[np.zeros(100), np.ones(100)]
+    X[lab == 1, 0] += 3.0                                       # a "camera" direction
+    g = np.arange(200) // 2
+    assert decodability(X, lab, g)["auroc"] > 0.95
+    assert abs(decodability(rng.normal(0, 1, (200, 5)), lab, g)["auroc"] - 0.5) < 0.15
+
+
+def test_odir_adapter_dispatches_through_load_any(tmp_path):
+    from brset_dataset import load_any
+    (tmp_path / "preprocessed_images").mkdir()
+    pd.DataFrame({"ID": [1, 1, 2, 2], "Patient Age": [60, 60, 1, 1],
+                  "Patient Sex": ["Male", "Male", "Female", "Female"],
+                  "Left-Diagnostic Keywords": ["moderate non proliferative retinopathy"] * 2
+                  + ["normal fundus"] * 2,
+                  "Right-Diagnostic Keywords": ["normal fundus"] * 2 + ["lens dust"] * 2,
+                  "filename": ["1_left.jpg", "1_right.jpg", "2_left.jpg", "2_right.jpg"]}
+                 ).to_csv(tmp_path / "full_df.csv", index=False)
+    df = load_any(str(tmp_path), "odir")["df"].set_index("file")
+    assert df.loc["1_left.jpg", "final_icdr"] == 2.0 and df.loc["1_right.jpg", "final_icdr"] == 0.0
+    assert np.isnan(df.loc["2_left.jpg", "age"])            # placeholder age 1 -> unknown
+    assert encoding_audit(df.reset_index(), "dr_referable")["ok"]
+
+
 def test_fit_probe_folds_into_raw_units():
     from sklearn.linear_model import LogisticRegression  # noqa: F401
     from train_retinareach import fit_probe
@@ -261,14 +311,14 @@ def _make_brset(root, n_pat, rng):
     pd.DataFrame(rows).to_csv(root / "labels.csv", index=False)
 
 
-def _make_mbrset(root, n_pat, rng):
+def _make_mbrset(root, n_pat, rng, cast=(0.8, 1.1, 1.3)):
     (root / "images").mkdir(parents=True)
     rows = []
     for pid in range(n_pat):
         ref, htn = pid % 3 == 0, pid % 2 == 0
         for k in (1, 2):
             f = f"{pid}.{k}.jpg"
-            _fundus(root / "images" / f, ref, (0.8, 1.1, 1.3), htn, rng)   # camera colour cast
+            _fundus(root / "images" / f, ref, cast, htn, rng)   # camera colour cast
             rows.append({"patient": pid, "age": 40 + pid % 30, "sex": pid % 2,
                          "dm_time": pid % 20, "insulin": pid % 2, "insulin_time": np.nan,
                          "oraltreatment_dm": 1, "systemic_hypertension": int(htn),
@@ -284,6 +334,7 @@ def test_end_to_end_synthetic(tmp_path):
     rng = np.random.default_rng(0)
     _make_brset(tmp_path / "brset", 45, rng)
     _make_mbrset(tmp_path / "mbrset", 45, rng)
+    _make_mbrset(tmp_path / "cam3", 30, rng, cast=(1.3, 0.9, 0.6))      # an unfamiliar camera
     out, ck = tmp_path / "out", tmp_path / "ck" / "s0.pt"
     rc = main(["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
                "--probe-targets", "hypertension", "nephropathy", "smoking",
@@ -291,7 +342,8 @@ def test_end_to_end_synthetic(tmp_path):
                "--epochs", "1", "--batch-size", "8", "--num-workers", "0", "--device", "cpu",
                "--calib-batch", "4", "--calib-sizes", "4", "8", "--calib-repeats", "2",
                "--prior-strengths", "8", "0", "--min-probe-pos", "2", "--n-boot", "20",
-               "--envelope-repeats", "4", "--demo-n", "8",
+               "--envelope-repeats", "4", "--demo-n", "8", "--n-shuffle", "3",
+               "--unfamiliar", str(tmp_path / "cam3"), "mbrset", "cam3",
                "--cv-repeats", "1", "--min-test-pos-patients", "2",
                "--out", str(out), "--ckpt", str(ck)])
     assert rc == 0
@@ -320,6 +372,25 @@ def test_end_to_end_synthetic(tmp_path):
     assert set(res["envelope"]) == {"tabletop", "handheld"}
     assert set(res["device_false_accept"]) == {"tabletop", "handheld"}
     assert res["device_report"]["n_images"] == 8
+    assert set(res["camera_decodability"]) == {"trained", "calibrated"}
+    assert 0.0 <= res["camera_decodability"]["trained"]["auroc"] <= 1.0
+    # controls and strata
+    hp = cap[(cap["target"] == "hypertension") & (cap["device"] == "handheld")
+             & (cap["protocol"] == "calibrated")].iloc[0]
+    assert "shuffle_auroc" in cap.columns and hp["shuffle_auroc"] == hp["shuffle_auroc"]
+    assert {"quality_only_auroc", "brier", "ece", "mean_predicted"} <= set(cap.columns)
+    strata = pd.read_csv(out / "quality_strata.csv")
+    assert {"gradable", "ungradable"} == set(strata["stratum"])
+    # the unfamiliar camera: gated with its own labels, and the phone's lookup recorded
+    unf = pd.read_csv(out / "capability_unfamiliar.csv")
+    assert set(unf["device"]) == {"cam3"} and len(unf) == len(targets) * 2
+    look = pd.read_csv(out / "unfamiliar_lookup.csv")
+    assert set(look["n"]) == {4, 8} and set(look["target"]) == set(targets)
+    assert ((look["unsafe_rate"] == 0) | (look["observed"] != "SUPPORTED")).all()
+    assert "cam3" in res["unfamiliar"]
+    abl = pd.read_csv(out / "anatomy_ablation.csv")
+    assert {"auroc_intact", "auroc_vessels", "auroc_control", "vessels_minus_control"} <= set(abl.columns)
+    assert set(abl["device"]) <= {"tabletop", "handheld"}
     prof = json.loads((out / "profiles.json").read_text())
     p = DeviceProfile.from_dict(prof["profiles"]["handheld"])
     assert p.n_pool > 0 and p.capability
@@ -340,10 +411,105 @@ def test_end_to_end_synthetic(tmp_path):
     exp = tmp_path / "seed99" / "exp"          # a seed-like parent must not confuse the loader
     shutil.copytree(out, exp / "seed0")
     shutil.copytree(out, exp / "seed1")
+    for sd, auc in (("seed0", 0.71), ("seed1", 0.69)):          # stand-ins for PERTARGET runs
+        (exp / sd / "pertarget_hypertension.json").write_text(json.dumps(
+            {"task": "hypertension", "test": {"auroc": auc, "n": 10},
+             "covariate_baseline": {"auroc": 0.6}}))
     assert summarize(["--dir", str(exp)]) == 0
     final = pd.read_csv(exp / "capability_final.csv")
     assert len(final) == len(cap) and set(final["final"]) <= set(cap["status"]) | {"NO_IMAGE_EVIDENCE"}
-    assert (exp / "summary.md").read_text().startswith("# RetinaReach")
+    md = (exp / "summary.md").read_text()
+    assert md.startswith("# RetinaReach")
+    assert "## 4. Controls and mechanism" in md and "## 5. Unfamiliar cameras" in md
+    assert "cam3" in md and "Camera decodability" in md
+    summ = json.loads((exp / "summary.json").read_text())
+    assert summ["decodability"]["paired"]["n"] == 2 and summ["unfamiliar_lookup"]
+    svp = summ["shared_vs_pertarget"]
+    assert len(svp) == 1 and svp[0]["target"] == "hypertension" and svp[0]["seeds"] == 2
+    assert "Shared trunk vs per-target" in md
+    # poster figures: any Python with matplotlib + pandas (the repo .venv has no matplotlib)
+    import shutil
+    import subprocess
+    import sys as _sys
+    py = next((c for c in (_sys.executable, shutil.which("python3")) if c and subprocess.run(
+        [c, "-c", "import matplotlib, pandas"], capture_output=True).returncode == 0), None)
+    if py:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        subprocess.run([py, os.path.join(root, "plot_retinareach.py"), "--dir", str(exp)],
+                       check=True, capture_output=True)
+        for i, name in enumerate(("threshold_transfer", "capability", "calibration_size",
+                                  "mechanism", "unfamiliar"), 1):
+            assert (exp / "figures" / f"fig{i}_{name}.png").exists()
+            assert (exp / "figures" / f"fig{i}_{name}.csv").exists()
+
+
+def _vessel_image(size=192, seed=0):
+    """A fundus-like disc with a dark branching 'vessel' tree; returns (x01, vessel_truth)."""
+    rng = np.random.default_rng(seed)
+    img = Image.new("RGB", (size, size), (0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([4, 4, size - 4, size - 4], fill=(190, 95, 50))
+    truth = Image.new("L", (size, size), 0)
+    dt = ImageDraw.Draw(truth)
+    c = size // 2
+    for k in range(7):                                     # radial vessels from a 'disc'
+        ang = 2 * np.pi * k / 7 + rng.uniform(-.2, .2)
+        pts = [(c + r * np.cos(ang + 0.3 * np.sin(r / 20)), c + r * np.sin(ang + 0.3 * np.sin(r / 20)))
+               for r in range(8, size // 2 - 12, 2)]
+        d.line(pts, fill=(120, 40, 25), width=3)
+        dt.line(pts, fill=255, width=3)
+    x = torch.from_numpy(np.asarray(img)).permute(2, 0, 1)[None].float() / 255
+    return x, torch.from_numpy(np.asarray(truth) > 0)
+
+
+def test_vessel_mask_finds_vessels_and_inpainting_removes_them():
+    from vessel_ablation import control_mask, fov_mask, inpaint, vessel_mask
+    x, truth = _vessel_image()
+    # quota = the true vessel fraction of the FOV, so precision is measurable
+    frac = float(truth.sum() / fov_mask(x).sum())
+    m = vessel_mask(x, frac=frac)[0, 0]
+    recall = float((m & truth).sum() / truth.sum())
+    precision = float((m & truth).sum() / m.sum())
+    assert recall > 0.6 and precision > 0.4, (recall, precision)
+    c = control_mask(m[None, None], fov_mask(x))[0, 0]
+    assert float((c & truth).sum() / c.sum()) < precision          # the control is mostly off-vessel
+    out = inpaint(x, m[None, None])
+    bg = x[0, :, fov_mask(x)[0, 0] & ~m].mean(1)
+    before = (x[0][:, truth & m].mean(1) - bg).abs().sum()
+    after = (out[0][:, truth & m].mean(1) - bg).abs().sum()
+    assert after < 0.3 * before                                      # vessel pixels now look like background
+    assert torch.equal(out[0][:, ~m], x[0][:, ~m])                  # nothing else changes
+
+
+def test_ablate_normalised_keeps_shape_and_range():
+    from vessel_ablation import ablate_normalised
+    x, _ = _vessel_image(96)
+    mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    xn = (x - mean) / std
+    for kind in ("vessels", "control"):
+        y = ablate_normalised(xn, kind)
+        assert y.shape == xn.shape and torch.isfinite(y).all() and not torch.equal(y, xn)
+    with pytest.raises(ValueError):
+        ablate_normalised(xn, "nope")
+
+
+def test_preflight_passes_and_catches_a_broken_unfamiliar_root(tmp_path, capsys):
+    from train_retinareach import main as train
+    rng = np.random.default_rng(0)
+    _make_brset(tmp_path / "brset", 30, rng)
+    _make_mbrset(tmp_path / "mbrset", 30, rng)
+    base = ["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
+            "--probe-targets", "hypertension", "--backbone", BACKBONE, "--no-pretrained",
+            "--image-size", "64", "--epochs", "2", "--batch-size", "8", "--num-workers", "0",
+            "--device", "cpu", "--calib-batch", "4", "--calib-sizes", "4", "8",
+            "--out", str(tmp_path / "pf"), "--ckpt", str(tmp_path / "pf.pt"), "--preflight"]
+    assert train(base) == 0
+    out = capsys.readouterr().out
+    assert "PREFLIGHT OK" in out and "positive patients" in out and "estimate:" in out
+    assert not (tmp_path / "pf" / "results.json").exists()          # nothing was trained
+    assert train(base + ["--unfamiliar", str(tmp_path / "nowhere"), "odir"]) == 1
+    assert "PREFLIGHT FAILED" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(__import__("sys").platform != "darwin", reason="Core ML runs on macOS only")
@@ -366,3 +532,103 @@ def test_coreml_calibration_matches_pytorch(tmp_path):
     assert rep["pass"] and rep["stats_max_rel_err"] < 1e-3 and rep["prob_max_err_total"] < 1e-3
     prof = json.loads((out / "retinareach_profiles.json").read_text())
     assert len(prof["trained_stats"]) == 2 * sum(prof["stats_layout"]["channels"])
+
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin" or not os.environ.get("RR_SWIFT"),
+                    reason="Swift reference parity: macOS + a Swift toolchain, opt in with RR_SWIFT=1")
+def test_swift_reference_matches_python(tmp_path):
+    """app/RetinaReachKit (the phone-side code) against Python on the same captures:
+    identical calibration statistics, capability lookup and screening probabilities;
+    preprocessing close (JPEG decoders differ)."""
+    import shutil
+    import subprocess
+    pytest.importorskip("coremltools")
+    if shutil.which("swift") is None:
+        pytest.skip("no swift toolchain")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg = os.path.join(root, "app", "RetinaReachKit")
+    subprocess.run(["swift", "build", "-c", "release", "--package-path", pkg], check=True,
+                   capture_output=True)
+    cli = os.path.join(pkg, ".build", "release", "retinareach-cli")
+    from export_retinareach import main as export
+    from train_retinareach import main as train
+    rng = np.random.default_rng(0)
+    _make_brset(tmp_path / "brset", 45, rng)
+    _make_mbrset(tmp_path / "mbrset", 45, rng)
+    _make_mbrset(tmp_path / "cam3", 12, rng, cast=(1.3, 0.9, 0.6))
+    assert train(["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
+                  "--probe-targets", "hypertension", "--backbone", BACKBONE, "--no-pretrained",
+                  "--image-size", "64", "--epochs", "1", "--batch-size", "8", "--num-workers", "0",
+                  "--device", "cpu", "--calib-batch", "4", "--calib-sizes", "4", "8",
+                  "--calib-repeats", "2", "--envelope-repeats", "4", "--prior-strengths", "0",
+                  "--min-probe-pos", "2", "--n-boot", "20", "--cv-repeats", "1",
+                  "--min-test-pos-patients", "2", "--demo-n", "8", "--n-shuffle", "2",
+                  "--out", str(tmp_path / "out"), "--ckpt", str(tmp_path / "ck.pt")]) == 0
+    out = tmp_path / "export"
+    assert export(["--checkpoint", str(tmp_path / "ck.pt"), "--precision", "fp32",
+                   "--verify-images", str(tmp_path / "cam3" / "images"), "--verify-n", "16",
+                   "--verify-units", "CPU_ONLY", "--swift-cli", cli, "--out-dir", str(out)]) == 0
+    par = json.loads((out / "export_report.json").read_text())["swift_parity"]
+    cal = par["calibration"]
+    assert cal["camera_distance_to_pytorch"] < 1e-6 * max(1.0, cal["camera_distance_trained_to_pytorch"])
+    assert par["lookup"]["statuses_equal"] and par["lookup"]["nearest_equal"]
+    assert par["lookup"]["inside_equal"]
+    assert par["screen"]["max_abs"] < 1e-4
+    assert par["preprocessing"]["mean_abs"] < 1.0                   # JPEG decoders differ slightly
+    assert par["end_to_end"]["camera_distance_to_python"] < 0.1 * cal["camera_distance_trained_to_pytorch"]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple-GPU (MPS) regression")
+def test_mps_run_with_spawned_workers_trains_on_real_labels(tmp_path):
+    """Two Mac-only failures, both silent: (1) a non_blocking copy of the strided
+    label slice to MPS delivered garbage labels (loss 1e15, then negative);
+    (2) with spawn-started workers, a numpy view of the dataset labels taken
+    before the first loader ran pointed at freed memory after torch moved the
+    storage to shared memory (validation AUROC undefined every epoch)."""
+    from train_retinareach import main as train
+    rng = np.random.default_rng(0)
+    _make_brset(tmp_path / "brset", 45, rng)
+    _make_mbrset(tmp_path / "mbrset", 45, rng)
+    out = tmp_path / "out"
+    assert train(["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
+                  "--probe-targets", "hypertension", "--backbone", BACKBONE, "--no-pretrained",
+                  "--image-size", "64", "--epochs", "2", "--batch-size", "8", "--num-workers", "2",
+                  "--device", "mps", "--calib-batch", "4", "--calib-sizes", "4",
+                  "--calib-repeats", "1", "--envelope-repeats", "2", "--prior-strengths", "0",
+                  "--min-probe-pos", "2", "--n-boot", "10", "--cv-repeats", "1",
+                  "--min-test-pos-patients", "2", "--demo-n", "4", "--n-shuffle", "0",
+                  "--out", str(out), "--ckpt", str(tmp_path / "ck.pt")]) == 0
+    res = json.loads((out / "results.json").read_text())
+    assert res["best_epoch"] > 0 and 0.0 <= res["best_val_mean_auroc"] <= 1.0
+
+
+def test_split_file_pairs_a_per_target_model_with_the_retinareach_split(tmp_path, monkeypatch):
+    import sys as _sys
+    import train_mbrset
+    from brset_dataset import load_any
+    from metadata_model import target_vector
+    rng = np.random.default_rng(0)
+    _make_mbrset(tmp_path / "m", 30, rng)
+    df = load_any(str(tmp_path / "m"), "mbrset")["df"]
+    sp = multitask_split(df, "dr_referable", seed=42)
+    split_csv = tmp_path / "split_handheld.csv"
+    pd.concat([v.assign(split=k)[["file", "patient", "split"]] for k, v in sp.items()]).to_csv(
+        split_csv, index=False)
+    got = train_mbrset.splits_from_file(df, str(split_csv))
+    assert got["test"]["file"].tolist() == sp["test"]["file"].tolist()
+    bad = pd.read_csv(split_csv)
+    bad.loc[bad["file"] == sp["test"]["file"].iloc[0], "split"] = "train"   # breaks patient grouping
+    bad.to_csv(tmp_path / "bad.csv", index=False)
+    with pytest.raises(SystemExit):
+        train_mbrset.splits_from_file(df, str(tmp_path / "bad.csv"))
+    out = tmp_path / "pt.json"
+    monkeypatch.setattr(_sys, "argv", [
+        "train_mbrset.py", "--dataset", "mbrset", "--root", str(tmp_path / "m"), "--task", "hypertension",
+        "--split-file", str(split_csv), "--backbone", BACKBONE, "--no-gcg", "--no-pretrained",
+        "--image-size", "64", "--epochs", "1", "--batch-size", "8", "--num-workers", "0",
+        "--covariate-baseline", "--ckpt-dir", str(tmp_path / "ck"), "--run-name", "hypertension_seed0",
+        "--results-json", str(out)])
+    assert train_mbrset.main() == 0
+    res = json.loads(out.read_text())
+    n_labelled = int((~np.isnan(target_vector(sp["test"], "hypertension"))).sum())
+    assert res["split_file"].endswith("split_handheld.csv") and res["test"]["n"] == n_labelled
