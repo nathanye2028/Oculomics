@@ -85,8 +85,15 @@ def load(d: str, prefix: str = "seed"):
         if res.get("shuffle_source_labels") and prefix == "seed":
             print(f"[skip] {base}: a shuffled-label control run; move it to shuffle_seed{s}/")
             continue
+        sweep = _csv(base, "calibration_sweep.csv", s)
+        if res.get("prior_mode") != "in_forward" and len(sweep) and "prior_strength" in sweep:
+            # written before the in-forward prior: its prior > 0 rows are invalid
+            n_bad = int((sweep["prior_strength"] > 0).sum())
+            sweep = sweep[sweep["prior_strength"] <= 0]
+            if n_bad:
+                print(f"[note] {base}: dropped {n_bad} post-hoc-prior sweep rows (pre-fix run)")
         runs[s] = {"results": res, "cap": _csv(base, "capability.csv", s),
-                   "sweep": _csv(base, "calibration_sweep.csv", s),
+                   "sweep": sweep,
                    "strata": _csv(base, "quality_strata.csv", s),
                    "unf": _csv(base, "capability_unfamiliar.csv", s),
                    "lookup": _csv(base, "unfamiliar_lookup.csv", s),

@@ -107,7 +107,7 @@ from dataset import DeviceAug, LabelSpec, MBRSETDataset  # noqa: E402
 from fundus_utils import seed_everything, seed_worker  # noqa: E402
 from metadata_model import FEATURE_SETS, _auc, load_table, threshold_at_sensitivity  # noqa: E402
 from retinareach import (DEFAULT_BACKBONE, PROBE_TARGETS, SOURCE_TARGETS,  # noqa: E402
-                         DeviceProfile, RetinaReachNet, blend_stats, camera_distance,
+                         DeviceProfile, RetinaReachNet, camera_distance,
                          device_capability, get_bn_stats, self_calibrate, set_bn_stats,
                          stats_to_lists)
 from train_mbrset import ModelEMA, pick_device  # noqa: E402
@@ -797,10 +797,11 @@ def main(argv: Sequence[str] = None) -> int:
     sweep.append(score_row(preds[("calibrated", T, "test")], len(tgt_pool), 0, 0.0, "full_pool"))
     rng = np.random.default_rng(a.seed)
 
-    def subset_calibration(ds, n, seed):
-        idx = rng.choice(len(ds), size=n, replace=False)
-        cal, info = self_calibrate(model, calib_loader(Subset(ds, idx), seed), dev)
-        return cal, get_bn_stats(cal), info
+    def subset_calibration(ds, n, seed, prior=0.0, idx=None):
+        idx = rng.choice(len(ds), size=n, replace=False) if idx is None else idx
+        cal, info = self_calibrate(model, calib_loader(Subset(ds, idx), seed), dev,
+                                   prior_strength=prior)
+        return cal, get_bn_stats(cal), info, idx
 
     # (a) How many captures: calibrate on N handheld POOL images (never test
     #     images), score the handheld test split at the shipped thresholds. Every
@@ -809,15 +810,18 @@ def main(argv: Sequence[str] = None) -> int:
         if n > len(tgt_pool):
             continue
         for r in range(a.calib_repeats):
-            cal, st, info = subset_calibration(tgt_pool, n, a.seed + r)
+            # the camera distance is always of the plain (prior-free) measurement
+            cal0, st, info0, idx = subset_calibration(tgt_pool, n, a.seed + r)
             for prior in a.prior_strengths:
-                set_bn_stats(cal, st if prior <= 0 else
-                             blend_stats(trained_stats, st, info.n_images, prior))
+                if prior > 0:                        # same captures, prior applied in-forward
+                    cal, _, info, _ = subset_calibration(tgt_pool, n, a.seed + r, prior, idx)
+                else:
+                    cal, info = cal0, info0
                 row = score_row(predict(cal, loaders[(T, "test")], dev), n, r, prior, "subset")
                 row.update(dist_own=camera_distance(st, stats[T]),
                            dist_other=camera_distance(st, stats[S]), n_used=info.n_images)
                 sweep.append(row)
-            del cal
+            del cal0, cal
     sweep_df = pd.DataFrame(sweep)
     sweep_df.to_csv(os.path.join(a.out, "calibration_sweep.csv"), index=False)
     if len(sweep_df):
@@ -836,7 +840,7 @@ def main(argv: Sequence[str] = None) -> int:
                 continue
             d = []
             for r in range(a.envelope_repeats):
-                cal, st, _ = subset_calibration(pool, n, a.seed + 1000 + r)
+                cal, st, _, _ = subset_calibration(pool, n, a.seed + 1000 + r)
                 d.append(camera_distance(st, stats[name]))
                 del cal
             envelope[name][n] = float(np.percentile(d, 95))
@@ -855,7 +859,7 @@ def main(argv: Sequence[str] = None) -> int:
                 continue
             ok, fa = [], []
             for r in range(a.calib_repeats):
-                cal, st, _ = subset_calibration(ds, n, a.seed + 2000 + r)
+                cal, st, _, _ = subset_calibration(ds, n, a.seed + 2000 + r)
                 d_own, d_oth = camera_distance(st, stats[name]), camera_distance(st, stats[other])
                 ok.append(d_own < d_oth and d_own <= envelope[name][n])
                 fa.append(d_oth < d_own and d_oth <= envelope[other].get(n, -np.inf))
@@ -876,7 +880,7 @@ def main(argv: Sequence[str] = None) -> int:
     # What the phone prints after N FRESH captures (test patients, labels unread),
     # not the profile compared with itself.
     demo_n = max(2, min(a.demo_n, len(tgt_test)))
-    cal, demo_stats, _ = subset_calibration(tgt_test, demo_n, a.seed + 3000)
+    cal, demo_stats, _, _ = subset_calibration(tgt_test, demo_n, a.seed + 3000)
     del cal
     report = device_capability(list(profiles.values()), demo_stats, demo_n, targets)
     print(f"\n=== what the phone reports after {demo_n} fresh {T} captures ===")
@@ -927,7 +931,7 @@ def main(argv: Sequence[str] = None) -> int:
                 continue
             reps = []
             for r in range(a.calib_repeats):
-                cal, st, _ = subset_calibration(pool_u, n, a.seed + 4000 + r)
+                cal, st, _, _ = subset_calibration(pool_u, n, a.seed + 4000 + r)
                 del cal
                 reps.append(device_capability(list(profiles.values()), st, n, targets))
             nearest = pd.Series([x["nearest_profile"] for x in reps]).value_counts().to_dict()
@@ -979,6 +983,7 @@ def main(argv: Sequence[str] = None) -> int:
                "device_report": report, "camera_decodability": decode,
                "anatomy_ablation": ablation_rows,
                "unfamiliar": unf_info, "shuffle_source_labels": a.shuffle_source_labels,
+               "prior_mode": "in_forward",   # runs without this key blended the prior post hoc
                "calibration": {S: vars(info_s), T: vars(info_t)},
                "camera_distance": {"trained_to_" + S: camera_distance(trained_stats, stats[S]),
                                    "trained_to_" + T: camera_distance(trained_stats, stats[T]),

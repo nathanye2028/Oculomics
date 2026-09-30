@@ -82,17 +82,81 @@ def test_graphs_leave_the_source_model_untouched(net):
     assert all(torch.equal(before[k], after[k]) for k in before)
 
 
+class _Imgs(torch.utils.data.Dataset):
+    def __init__(self, x):
+        self.x = x
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return {"image": self.x[i]}
+
+
+def _loader(n=12, b=4, shift=0.5, seed=1):
+    x = torch.cat([_norm(t) for t in _batches(n_batches=n // b, b=b, shift=shift, seed=seed)])
+    return torch.utils.data.DataLoader(_Imgs(x), batch_size=b, shuffle=False)
+
+
 def test_prior_zero_is_adabn_and_large_prior_is_source(net):
-    loader = [{"image": _norm(x)} for x in _batches(shift=0.5)]
     src = get_bn_stats(net)
-    plain, _ = self_calibrate(net, loader, torch.device("cpu"), prior_strength=0.0)
-    huge, _ = self_calibrate(net, loader, torch.device("cpu"), prior_strength=1e9)
+    plain, _ = self_calibrate(net, _loader(), torch.device("cpu"), prior_strength=0.0)
+    huge, info = self_calibrate(net, _loader(), torch.device("cpu"), prior_strength=1e9)
     k = next(iter(src))
     assert not torch.allclose(get_bn_stats(plain)[k][0], src[k][0])
     assert torch.allclose(get_bn_stats(huge)[k][0], src[k][0], atol=1e-5)
-    # the blend is linear in the pseudo-count
+    assert info.alpha == pytest.approx(1e9 / (1e9 + 12)) and info.prior_strength == 1e9
+    with pytest.raises(ValueError):                       # the prior needs a sized dataset
+        self_calibrate(net, [{"image": torch.randn(4, 3, 64, 64)}], torch.device("cpu"), prior_strength=8)
+    # the post-hoc vector blend (phone path) is still linear in the pseudo-count
     half = blend_stats(src, get_bn_stats(plain), n_target=12, prior_strength=12)
     assert torch.allclose(half[k][0], 0.5 * (src[k][0] + get_bn_stats(plain)[k][0]))
+
+
+def test_calibrate_blended_endpoints_and_shallow_only_exactness(net):
+    from retinareach import bn_layers, calibrate_blended
+    dev = torch.device("cpu")
+    names = [n for n, _ in bn_layers(net)]
+    src = get_bn_stats(net)
+    ada, _ = self_calibrate(net, _loader(), dev)
+    a0, info0 = calibrate_blended(net, _loader(), dev, alpha=0.0)
+    for n in names:                                        # alpha 0 == AdaBN
+        assert torch.allclose(get_bn_stats(a0)[n][0], get_bn_stats(ada)[n][0], atol=1e-5)
+        assert torch.allclose(get_bn_stats(a0)[n][1], get_bn_stats(ada)[n][1], rtol=1e-4, atol=1e-5)
+    a1, _ = calibrate_blended(net, _loader(), dev, alpha=1.0)
+    assert all(torch.allclose(get_bn_stats(a1)[n][0], src[n][0]) for n in names)   # alpha 1 == source
+    k = len(names) // 3
+    part, info = calibrate_blended(net, _loader(), dev, adapt=names[:k])
+    assert info.n_bn_layers == k
+    for n in names[:k]:                                    # first K identical to full AdaBN
+        assert torch.allclose(get_bn_stats(part)[n][0], get_bn_stats(ada)[n][0], atol=1e-5)
+    for n in names[k:]:                                    # the rest untouched
+        assert torch.equal(get_bn_stats(part)[n][0], src[n][0])
+    # no patched forward is left behind on the copy
+    assert all("forward" not in vars(m) for _, m in bn_layers(part))
+    other = {n: (m + 1.0, v * 2.0) for n, (m, v) in src.items()}
+    moved, _ = calibrate_blended(net, _loader(), dev, adapt=[], source=other)
+    assert torch.equal(get_bn_stats(moved)[names[0]][0], other[names[0]][0])
+
+
+def test_em_prevalence_threshold_and_prevalence_pools():
+    from redesign_calibration import em_prevalence, expected_sensitivity_threshold, prevalence_subset
+    rng = np.random.default_rng(0)
+    pi_s, pi_t, n = 0.1, 0.3, 20000
+    y = (rng.random(n) < pi_t).astype(int)
+    s = rng.normal(np.where(y == 1, 1.5, 0.0), 1.0)
+    lr = np.exp(1.5 * s - 1.125)                           # likelihood ratio of the two normals
+    q = pi_s * lr / (pi_s * lr + (1 - pi_s))               # posterior calibrated at the SOURCE prior
+    est, post = em_prevalence(q, pi_s)
+    assert abs(est - pi_t) < 0.02
+    thr = expected_sensitivity_threshold(s, y.astype(float), 0.85)
+    assert abs(float((s[y == 1] >= thr).mean()) - 0.85) < 0.01
+    thr_soft = expected_sensitivity_threshold(s, post, 0.85)
+    assert abs(float((s[y == 1] >= thr_soft).mean()) - 0.85) < 0.03   # label-free, still on target
+    yy = np.r_[np.ones(50), np.zeros(450), np.full(20, np.nan)]
+    idx = prevalence_subset(yy, 0.2, 100, rng)
+    assert len(idx) == 100 and yy[idx].sum() == 20
+    assert prevalence_subset(yy, 0.5, 200, rng).shape[0] == 100      # shrinks to what the pool allows
 
 
 def test_self_calibrate_counts_out_batches_of_one(net):
@@ -411,6 +475,10 @@ def test_end_to_end_synthetic(tmp_path):
     exp = tmp_path / "seed99" / "exp"          # a seed-like parent must not confuse the loader
     shutil.copytree(out, exp / "seed0")
     shutil.copytree(out, exp / "seed1")
+    # seed1 plays a run from before the in-forward prior: its prior rows must be dropped
+    r1 = json.loads((exp / "seed1" / "results.json").read_text())
+    r1.pop("prior_mode")
+    (exp / "seed1" / "results.json").write_text(json.dumps(r1))
     for sd, auc in (("seed0", 0.71), ("seed1", 0.69)):          # stand-ins for PERTARGET runs
         (exp / sd / "pertarget_hypertension.json").write_text(json.dumps(
             {"task": "hypertension", "test": {"auroc": auc, "n": 10},
@@ -427,6 +495,10 @@ def test_end_to_end_synthetic(tmp_path):
     svp = summ["shared_vs_pertarget"]
     assert len(svp) == 1 and svp[0]["target"] == "hypertension" and svp[0]["seeds"] == 2
     assert "Shared trunk vs per-target" in md
+    from summarize_retinareach import load as load_runs
+    loaded = load_runs(str(exp))
+    assert (loaded[0]["sweep"]["prior_strength"] > 0).any()          # in-forward run keeps them
+    assert not (loaded[1]["sweep"]["prior_strength"] > 0).any()      # pre-fix run: dropped
     # poster figures: any Python with matplotlib + pandas (the repo .venv has no matplotlib)
     import shutil
     import subprocess
@@ -632,3 +704,39 @@ def test_split_file_pairs_a_per_target_model_with_the_retinareach_split(tmp_path
     res = json.loads(out.read_text())
     n_labelled = int((~np.isnan(target_vector(sp["test"], "hypertension"))).sum())
     assert res["split_file"].endswith("split_handheld.csv") and res["test"]["n"] == n_labelled
+
+
+def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
+    from redesign_calibration import main as redesign
+    from train_retinareach import main as train
+    rng = np.random.default_rng(0)
+    _make_brset(tmp_path / "brset", 40, rng)
+    _make_mbrset(tmp_path / "mbrset", 40, rng)
+    _make_mbrset(tmp_path / "cam3", 30, rng, cast=(1.3, 0.9, 0.6))
+    ck = tmp_path / "ck.pt"
+    assert train(["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
+                  "--probe-targets", "hypertension", "--backbone", BACKBONE, "--no-pretrained",
+                  "--image-size", "64", "--epochs", "1", "--batch-size", "8", "--num-workers", "0",
+                  "--device", "cpu", "--calib-batch", "4", "--calib-sizes", "4",
+                  "--calib-repeats", "1", "--envelope-repeats", "2", "--prior-strengths", "0",
+                  "--min-probe-pos", "2", "--n-boot", "10", "--cv-repeats", "1",
+                  "--min-test-pos-patients", "2", "--demo-n", "4", "--n-shuffle", "0",
+                  "--ablation-frac", "0", "--unfamiliar", str(tmp_path / "cam3"), "mbrset", "cam3",
+                  "--out", str(tmp_path / "out"), "--ckpt", str(ck)]) == 0
+    out = tmp_path / "redesign"
+    assert redesign(["--ckpt", str(ck), "--out", str(out), "--pool-size", "12", "--repeats", "1",
+                     "--depth-fractions", "0", "1", "--alphas", "0.5", "--num-workers", "0",
+                     "--device", "cpu"]) == 0
+    df = pd.read_csv(out / "redesign.csv")
+    assert {"baseline", "A_prevalence", "B1_shallow", "B2_prior", "B3_threshold"} <= set(df["experiment"])
+    assert {"tabletop", "handheld", "cam3"} <= set(df["device"])
+    a = df[df["experiment"] == "A_prevalence"]
+    assert (a["device"] == "tabletop").any()                     # the no-camera-change control
+    b3 = df[df["experiment"] == "B3_threshold"]
+    assert b3["est_prev"].between(0, 1).all() and b3["pool_prev"].notna().all()
+    # K = 0 layers is the tabletop-statistics baseline, K = all is full AdaBN
+    b1 = df[(df["experiment"] == "B1_shallow") & (df["device"] == "handheld") & (df["target"] == "dr_referable")]
+    base = df[(df["experiment"] == "baseline") & (df["device"] == "handheld") & (df["target"] == "dr_referable")]
+    k0 = b1[b1["layers"] == 0]["auroc"].iloc[0]
+    assert k0 == pytest.approx(base[base["setting"] == "tabletop statistics"]["auroc"].iloc[0])
+    assert (out / "redesign_summary.txt").exists()

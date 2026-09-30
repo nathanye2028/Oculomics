@@ -265,6 +265,7 @@ class CalibrationInfo:
     n_batches: int
     n_bn_layers: int
     prior_strength: float
+    alpha: float = 0.0                 # weight on the source statistics, applied in-forward
 
 
 @torch.no_grad()
@@ -278,15 +279,101 @@ def self_calibrate(model: nn.Module, loader: Iterable, device: torch.device,
     collector's (batch statistics depend on it). Batches of one are skipped
     by ``adapt_bn``, and counted out of ``n_images`` here.
     """
+    if prior_strength > 0:
+        # The prior is applied IN the forward pass (Schneider et al. 2020): every
+        # layer normalises with the blended statistics, so the layers below it see
+        # the inputs they will see at screening time. Blending independently
+        # estimated per-layer statistics after the fact is inconsistent -- on real
+        # data it pushed sensitivity below both endpoints.
+        n_exp = len(loader.dataset) if hasattr(loader, "dataset") else None
+        if not n_exp:
+            raise ValueError("prior_strength > 0 needs a DataLoader over a sized dataset: "
+                             "the blend weight is N0 / (N0 + N)")
+        cal, info = calibrate_blended(model, loader, device,
+                                      alpha=prior_strength / (prior_strength + n_exp))
+        info.prior_strength = float(prior_strength)
+        return cal, info
     from train_mbrset import adapt_bn
     counted = _CountingLoader(loader)
     adapted, n_bn = adapt_bn(model, counted, device)
     if n_bn == 0:
         raise ValueError("model has no BatchNorm layers: self-calibration is a no-op")
-    if prior_strength > 0:
-        set_bn_stats(adapted, blend_stats(get_bn_stats(model), get_bn_stats(adapted),
-                                          counted.n_images, prior_strength))
-    return adapted, CalibrationInfo(counted.n_images, counted.n_batches, n_bn, float(prior_strength))
+    return adapted, CalibrationInfo(counted.n_images, counted.n_batches, n_bn, 0.0)
+
+
+def _blended_forward(self, x):
+    """Calibration-time BN: normalise with alpha*source + (1-alpha)*batch
+    statistics; record the batch mean and unbiased variance. alpha = 0 is exactly
+    train-mode BN, i.e. AdaBN."""
+    dims = [0] + list(range(2, x.dim()))
+    shape = (1, -1) + (1,) * (x.dim() - 2)
+    n = 1
+    for d in dims:
+        n *= int(x.shape[d])
+    mean_b = x.mean(dim=dims)
+    var_b = ((x - mean_b.view(shape)) ** 2).mean(dim=dims)
+    acc = self._rr_acc
+    acc[0] += mean_b
+    acc[1] += var_b * (n / (n - 1) if n > 1 else 1.0)
+    acc[2] += 1
+    a = self._rr_alpha
+    m_s, v_s = self._rr_src
+    return _bn_affine(self, x, a * m_s + (1 - a) * mean_b, a * v_s + (1 - a) * var_b)
+
+
+@torch.no_grad()
+def calibrate_blended(model: nn.Module, loader: Iterable, device: torch.device,
+                      alpha: float = 0.0, adapt: Optional[Iterable[str]] = None,
+                      source: Optional[Stats] = None) -> Tuple[nn.Module, CalibrationInfo]:
+    """Calibration with two knobs, both applied in the forward pass.
+
+    ``alpha``   weight on the source statistics (0 = AdaBN, 1 = no change).
+    ``adapt``   names of the BN layers to recalibrate (default: all). The others
+                keep the source statistics: ``adapt`` = the first K layers is
+                "shallow-only" recalibration -- camera colour and blur live in the
+                early layers, and the deeper, more disease-specific statistics stay
+                as trained. On the phone this needs no new graph: layer k's batch
+                statistics depend only on layers below it, so the first K entries of
+                the collector's vector are exactly these.
+    ``source``  the statistics treated as "source" (default: the model's own).
+
+    Returns a calibrated copy; ``model`` is untouched.
+    """
+    m = copy.deepcopy(model).eval()
+    layers = bn_layers(m)
+    if not layers:
+        raise ValueError("model has no BatchNorm layers: self-calibration is a no-op")
+    if source is not None:
+        set_bn_stats(m, source)
+    src = get_bn_stats(m)
+    names = [n for n, _ in layers]
+    chosen = set(names if adapt is None else adapt)
+    unknown = chosen - set(names)
+    if unknown:
+        raise KeyError(f"not BN layers of this model: {sorted(unknown)[:3]}")
+    patched = []
+    for n, b in layers:
+        if n not in chosen:
+            continue
+        b._rr_alpha = float(alpha)
+        b._rr_src = (src[n][0].to(device), src[n][1].to(device))
+        b._rr_acc = [torch.zeros_like(b.running_mean), torch.zeros_like(b.running_var), 0]
+        b.forward = types.MethodType(_blended_forward, b)
+        patched.append((n, b))
+    counted = _CountingLoader(loader)
+    for batch in counted:
+        x = batch["image"].to(device, non_blocking=device.type == "cuda")
+        if x.shape[0] < 2:
+            continue
+        m(x)
+    for n, b in patched:
+        s_m, s_v, k = b._rr_acc
+        if k:
+            b.running_mean.copy_(alpha * b._rr_src[0] + (1 - alpha) * s_m / k)
+            b.running_var.copy_(alpha * b._rr_src[1] + (1 - alpha) * s_v / k)
+        del b.forward, b._rr_alpha, b._rr_src, b._rr_acc
+    return m.eval(), CalibrationInfo(counted.n_images, counted.n_batches, len(patched), 0.0,
+                                     float(alpha))
 
 
 class _CountingLoader:
@@ -433,7 +520,13 @@ def calibrate_with_collector(collector: BatchStatCollector,
 
 def blend_vector(source: torch.Tensor, measured: torch.Tensor, n: int,
                  prior_strength: float) -> torch.Tensor:
-    """:func:`blend_stats` on the flat Core ML vector: the inference statistics."""
+    """:func:`blend_stats` on the flat Core ML vector.
+
+    CAUTION: this is the post-hoc blend, which is inconsistent across layers
+    (measured on BRSET -> mBRSET it pushed sensitivity below both endpoints).
+    :func:`self_calibrate` now applies the prior in-forward; until the collector
+    does the same, ship prior_strength = 0 (plain AdaBN) or shallow-only
+    recalibration on the device."""
     if prior_strength <= 0:
         return measured
     a = prior_strength / (prior_strength + n)

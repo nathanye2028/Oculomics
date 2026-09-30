@@ -75,7 +75,10 @@ def load_runs(d: str) -> Dict[str, pd.DataFrame]:
         for k, f in files.items():
             p = os.path.join(base, f)
             if os.path.exists(p):
-                out[k].append(pd.read_csv(p).assign(seed=s))
+                t = pd.read_csv(p).assign(seed=s)
+                if k == "sweep" and res.get("prior_mode") != "in_forward" and "prior_strength" in t:
+                    t = t[t["prior_strength"] <= 0]        # pre-fix post-hoc prior rows are invalid
+                out[k].append(t)
     frames = {k: (pd.concat(v, ignore_index=True) if v else pd.DataFrame()) for k, v in out.items()}
     frames["results"] = results
     return frames

@@ -2,6 +2,12 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-09-30 RetinaReach: calibration redesign  (branch `retinareach`)
+
+- First lab-box results (seeds 0 and 3) in REPORT.md §10.6: AdaBN raises phone/ODIR AUROC but lowers sensitivity at the shipped threshold.
+- `retinareach.calibrate_blended`: calibration with the source prior applied IN the forward pass (Schneider et al. 2020) and/or only the first K BN layers recalibrated (shallow-only; the first K entries equal full AdaBN's, so the existing collector serves it on device). `self_calibrate(prior_strength > 0)` uses it (blend weight from the dataset size). Fixes the post-hoc per-layer blend, which on real data pushed sensitivity below both endpoints; `train_retinareach.py`'s sweep recalibrates the same captures per prior (and no longer depends on the order of `--prior-strengths`); results record `prior_mode`, and the summarizer and plots drop pre-fix prior rows.
+- `redesign_calibration.py`: on finished checkpoints, no retraining — (A) prevalence-controlled calibration pools on every camera, including the tabletop one (mechanism); (B1) shallow-only depth sweep; (B2) in-forward prior; (B3) EM prevalence estimate (Saerens et al. 2002) on Platt-calibrated outputs + expected-sensitivity threshold. `redesign.csv`, `redesign_summary.txt`.
+
 ## [Unreleased] — 2026-09-28 RetinaReach: preflight, vessel ablation, shared-vs-per-target, figures  (branch `retinareach`)
 
 - `train_retinareach.py --preflight` (run once by `run_retinareach.sh` before any seed, `PREFLIGHT=1`): data roots, encodings, images on disk, positive patients per target and device (UNDERPOWERED flagged up front), unfamiliar cameras, one training step on the real device (loss must be plausible), one calibration (finite statistics), pretrained weights, disk, GPU memory, a wall-clock estimate; the sweep stops if it fails.

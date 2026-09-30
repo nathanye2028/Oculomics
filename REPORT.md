@@ -642,7 +642,45 @@ tools.
 * **Shared trunk vs per-target models** is now measurable (`PERTARGET=`), paired
   on the same handheld test rows.
 
-### 10.6 Next run (lab box)
+### 10.6 First lab-box results: seeds 0 and 3 of 5 (30 September; preliminary)
+
+**The gate behaves as designed.** DR and edema are SUPPORTED on the tabletop
+camera (DR AUROC 0.978 / 0.988, sensitivity at the shipped threshold 0.87 /
+0.85) and THRESHOLD_DRIFT on the phone camera and on ODIR (they rank well; the
+shipped threshold misses too many). All ten systemic targets are suppressed:
+six NO_IMAGE_EVIDENCE (hypertension probe 0.63 / 0.57 against an intake-form
+bar of 0.76; insulin 0.66 / 0.63 against 0.85), four UNDERPOWERED as §10.1
+predicted. Per-target fine-tuned models on the same split are no better
+(hypertension 0.615 / 0.599, insulin 0.573 / 0.583), so the systemic result is
+not an artefact of the frozen trunk.
+
+**Self-calibration improves ranking but moves the threshold the wrong way.**
+
+| referable DR | AUROC trained → AdaBN | sensitivity at shipped threshold, trained → AdaBN |
+|---|---|---|
+| phone camera (mBRSET) | 0.894 → 0.935 · 0.906 → 0.923 | 0.638 → 0.572 · 0.645 → 0.487 |
+| unfamiliar camera (ODIR) | 0.794 → 0.830 · 0.831 → 0.851 | 0.603 → 0.411 · 0.500 → 0.350 |
+
+Edema behaves the same (phone sensitivity 0.65 → 0.46 · 0.94 → 0.49). The
+calibration-size sweep shows the drop is systematic: 16 captures already give
+the full AUROC gain and the same sensitivity as 4,132. Working hypothesis:
+AdaBN re-centres features on the clinic's own average, and the phone and ODIR
+populations have ~2.5× BRSET's referable-DR prevalence, so part of the disease
+signal is normalised away. `redesign_calibration.py` tests it (prevalence-
+controlled calibration pools, including on the tabletop camera where only
+prevalence changes) and three label-free fixes (shallow-only recalibration,
+the in-forward prior, EM prevalence estimation with an expected-sensitivity
+threshold).
+
+**A defect found in the first results.** The source prior had been blended
+into each layer's statistics after the fact; with it, sensitivity fell to 0.16
+at N = 16, below both endpoints. The prior is now applied in the forward pass
+(Schneider et al. 2020); runs record `prior_mode`, and the summary and figures
+drop the prior rows of runs made before the fix. The phone path
+(`blend_vector`) still blends post hoc: ship prior 0 or shallow-only until the
+collector blends in-forward.
+
+### 10.7 Next run (lab box)
 
 ```bash
 B=<BRSET root> M=<mBRSET root> U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 \
