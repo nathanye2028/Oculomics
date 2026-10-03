@@ -95,6 +95,7 @@ def load(d: str, prefix: str = "seed"):
         runs[s] = {"results": res, "cap": _csv(base, "capability.csv", s),
                    "sweep": sweep,
                    "strata": _csv(base, "quality_strata.csv", s),
+                   "op": _csv(base, "operating_point.csv", s),
                    "unf": _csv(base, "capability_unfamiliar.csv", s),
                    "lookup": _csv(base, "unfamiliar_lookup.csv", s),
                    "ablation": _csv(base, "anatomy_ablation.csv", s),
@@ -202,13 +203,28 @@ def capability_table(cap: pd.DataFrame) -> pd.DataFrame:
 
 
 def sweep_table(sweep: pd.DataFrame, targets: List[str]) -> pd.DataFrame:
+    """Mean/SD per (kind, prior, N) of ``<metric>_<target>`` and of the label-free
+    threshold columns ``<metric>_<target>__<method>``."""
     if sweep.empty:
         return sweep
-    cols = [c for c in sweep.columns if c.split("_", 1)[0] in ("auroc", "sens", "flagged")
-            and c.split("_", 1)[1] in targets]
+    cols = [c for c in sweep.columns if c.split("_", 1)[0] in ("auroc", "sens", "flagged", "prev")
+            and "_" in c and c.split("_", 1)[1].split("__")[0] in targets]
     agg = sweep.groupby(["kind", "prior_strength", "n"])[cols].agg(["mean", "std"])
     agg.columns = [f"{a}_{b}" for a, b in agg.columns]
     return agg.reset_index()
+
+
+def operating_point_table(op: pd.DataFrame) -> pd.DataFrame:
+    """Per target x device x threshold method, over seeds: sensitivity (mean, SD,
+    seeds whose point estimate reaches the floor), flagged fraction, EM prevalence."""
+    if op.empty:
+        return op
+    return op.groupby(["target", "device", "method"], sort=False).agg(
+        seeds=("seed", "nunique"), sensitivity=("sensitivity", "mean"),
+        sens_sd=("sensitivity", "std"), seeds_meet_floor=("meets_floor", "sum"),
+        specificity=("specificity", "mean"), flagged=("flagged_fraction", "mean"),
+        est_prev=("est_prev", "mean"), pool_prev=("pool_prev", "mean"),
+        test_prev=("test_prev", "mean")).reset_index()
 
 
 def main(argv=None) -> int:
@@ -227,6 +243,7 @@ def main(argv=None) -> int:
     tr = transfer_table(cap, source_targets)
     ct = capability_table(cap)
     sw = sweep_table(sweep, source_targets)
+    opt = operating_point_table(_cat(runs, "op"))
     env = {s: runs[s]["results"].get("envelope") for s in seeds}
     rec = {s: runs[s]["results"].get("device_recognition") for s in seeds}
     fa = {s: runs[s]["results"].get("device_false_accept") for s in seeds}
@@ -270,7 +287,12 @@ def main(argv=None) -> int:
           "image-minus-metadata delta does not clear the seed-SD noise floor)", "",
           md_table(ct), "",
           "## 3. Calibration size (handheld test; pooled over seeds and repeats)", "",
+          "`__em` / `__anchor` columns: the threshold re-set label-free from the same N "
+          "captures the statistics came from; `prev_*__em` = EM's prevalence estimate.", "",
           md_table(sw) if len(sw) else "(no sweep)", "",
+          "Label-free operating point (calibrated protocol, full unlabelled pool per device, "
+          "scored on that device's test split; `shipped` = the source-fixed threshold):", "",
+          md_table(opt) if len(opt) else "(not recorded: runs predate operating_point.csv)", "",
           "Envelope (95th pct same-camera distance), out-of-sample recognition and false "
           "acceptance by seed:", "",
           "```", json.dumps({"envelope": env, "recognition": rec, "false_accept": fa}, indent=1,
@@ -311,6 +333,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.dir, "summary.json"), "w") as f:
         json.dump({"seeds": seeds, "transfer": tr, "capability": ct.to_dict("records"),
                    "sweep": sw.to_dict("records") if len(sw) else [],
+                   "operating_point": opt.to_dict("records") if len(opt) else [],
                    "controls": ctl.to_dict("records") if len(ctl) else [],
                    "shuffle_runs": shuf_t.to_dict("records") if len(shuf_t) else [],
                    "decodability": dec,

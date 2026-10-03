@@ -2,6 +2,14 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-02 RetinaReach: label-free threshold  (branch `retinareach`)
+
+- `retinareach.label_free_threshold` (+ `ThresholdReference`, `fit_threshold_reference`; `em_prevalence` and `expected_sensitivity_threshold` moved here from `redesign_calibration.py`): the device re-sets each source threshold from the unlabelled captures it calibrated on — `em` (Saerens EM prevalence on Platt-calibrated scores, expected-sensitivity threshold) or `anchor` (shipped threshold moved in logit space by the shift of the captures' lower score quartile, `--anchor-quantile`). Pure numpy, scalar references, for a direct port to the phone.
+- `train_retinareach.py`: references fit on tabletop validation and shipped in `profiles.json`, the checkpoint and `results.json`; `operating_point.csv` (each device's full pool × method: sensitivity with a patient-bootstrap CI, specificity, flagged fraction, EM prevalence vs the pool's); the calibration-size sweep adds `sens_<t>__<method>`, `flagged_<t>__<method>`, `prev_<t>__em` from the same N captures; `--calib-sizes` default now starts at 4.
+- `redesign_calibration.py`: B3 runs both methods through the shared function; new experiment C — N captures (`--small-n`, `--small-n-repeats`) give both the statistics and the threshold, every method on tabletop statistics and on AdaBN; the summary reports how often a single draw reaches the sensitivity floor. `--anchor-q`.
+- `summarize_retinareach.py`: label-free sweep columns and an operating-point table. `plot_retinareach.py`: fig3 draws the shipped, EM and anchored thresholds from the same captures with the floor marked (older runs: prior lines as before); title no longer collides with the legend on a one-target figure.
+- REPORT.md §10.6 (flag rate below prevalence on the phone), §10.7 (the two methods in simulation: EM fails under a score shift, the anchor holds; capture count for the threshold).
+
 ## [Unreleased] — 2026-09-30 RetinaReach: calibration redesign  (branch `retinareach`)
 
 - First lab-box results (seeds 0 and 3) in REPORT.md §10.6: AdaBN raises phone/ODIR AUROC but lowers sensitivity at the shipped threshold.

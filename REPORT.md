@@ -672,6 +672,17 @@ prevalence changes) and three label-free fixes (shallow-only recalibration,
 the in-forward prior, EM prevalence estimation with an expected-sensitivity
 threshold).
 
+**The shipped threshold flags fewer phone images than are diseased.** Referable
+DR is 5.5 % of tabletop test images and 15.6 % of phone test images (2.8×). On
+the phone the shipped threshold flags 11.3 % as trained (both seeds) and 10.5 % /
+8.0 % after AdaBN. Even if every flagged image were a true case, sensitivity
+could not exceed 0.113 / 0.156 ≈ 0.72, below the 0.75 floor, before calibration
+makes it worse. The flags themselves are mostly right (85–95 % are referable
+DR; specificity ~98–99 %): the threshold is too strict for this population, not
+the ranking too weak. A fix therefore has to raise the flag rate on the phone,
+which also means "flagged fraction stable across devices" is the wrong design
+criterion when prevalence differs; sensitivity at the floor is.
+
 **A defect found in the first results.** The source prior had been blended
 into each layer's statistics after the fact; with it, sensitivity fell to 0.16
 at N = 16, below both endpoints. The prior is now applied in the forward pass
@@ -680,9 +691,54 @@ drop the prior rows of runs made before the fix. The phone path
 (`blend_vector`) still blends post hoc: ship prior 0 or shallow-only until the
 collector blends in-forward.
 
-### 10.7 Next run (lab box)
+### 10.7 Label-free threshold (2 October; simulated, not yet on real data)
+
+The same unlabelled captures that give the BN statistics can re-set the
+threshold (`retinareach.label_free_threshold`, references fit on tabletop
+validation and shipped in `profiles.json`):
+
+- **em**: estimate the clinic's prevalence by EM on Platt-calibrated scores
+  (Saerens et al. 2002), then take the threshold whose expected sensitivity
+  under the EM posteriors reaches the target.
+- **anchor**: move the shipped threshold in logit space by how far the lower
+  quartile of the captures' scores sits from tabletop validation. The lower
+  quartile is almost all disease-free eyes at any plausible prevalence, so it
+  tracks a shift of the whole score distribution without estimating prevalence.
+
+In simulation (binormal scores, source prevalence 0.055, target 0.85):
+
+| scenario | shipped | em | anchor |
+|---|---|---|---|
+| prevalence 0.156, no score shift | 0.83 | 0.85 | 0.81 |
+| prevalence 0.156, scores shifted down 1 logit | 0.51 | 0.37 | 0.83 |
+| as above, positives lose a further 0.5 | 0.31 | 0.19 | 0.66 |
+| prevalence 0.35, no score shift | 0.85 | 0.86 | 0.75 |
+
+EM is right only under a pure prevalence change: a score shift reads to it as
+"almost no disease here" (estimated prevalence 0.002–0.03) and its threshold
+ends up worse than the shipped one. The phone data show a score shift, so EM is
+expected to fail there. The anchor survives a uniform shift, loses some
+sensitivity as prevalence rises, and only partly recovers when disease signal
+itself shrinks. Capture count matters more for the threshold than for AUROC:
+from N = 16 captures, 66–80 % of simulated clinics reach the floor (two
+simulation seeds); from N = 128, 95–99 %. If real data agree, a clinic would
+calibrate the statistics on its first 16 captures and keep refining the
+threshold over its first ~100–150 screens.
+
+What the real runs now record: `operating_point.csv` (each device's full pool,
+every method, sensitivity with a patient-bootstrap CI; the tabletop rows check
+the home camera loses nothing); `sens_<t>__em` / `sens_<t>__anchor` columns in
+the calibration-size sweep (N = 4 … 512, threshold from the same N captures);
+`redesign_calibration.py` experiment C (both methods from N captures on the
+finished seed-0 and seed-3 checkpoints, 10 draws per N). Not yet on the phone:
+`app/RetinaReachKit` still applies the shipped threshold.
+
+### 10.8 Next run (lab box)
 
 ```bash
+# minutes per checkpoint, no retraining: mechanism (A), the fixes (B1-B3), capture count (C)
+python redesign_calibration.py --ckpt ck_retinareach/seed0.pt ck_retinareach/seed3.pt \
+    --out exp_retinareach/redesign
 B=<BRSET root> M=<mBRSET root> U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 \
   PERTARGET="hypertension insulin" CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
 # (a preflight runs first and stops the sweep if anything is wrong; figures at the end

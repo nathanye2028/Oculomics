@@ -40,7 +40,16 @@ B3 Re-estimated threshold: the clinic's prevalence estimated from the model's ow
    outputs on the unlabelled pool (EM, Saerens, Latinne & Decaestecker 2002, on
    outputs Platt-calibrated on tabletop validation), then the threshold that keeps
    the EXPECTED sensitivity at the target under those soft labels. The estimated
-   prevalence is reported next to the true pool prevalence.
+   prevalence is reported next to the true pool prevalence. Alongside it, the
+   anchored threshold: the shipped threshold moved in logit space by how far the
+   lower quartile of the captures' scores sits from source validation
+   (``retinareach.label_free_threshold``).
+C  Deployment-sized calibration sets. The phone has N captures, not a pool of
+   thousands, and one draw gives it both the BN statistics and the threshold. N
+   random captures at the camera's natural prevalence (``--small-n`` x
+   ``--small-n-repeats``), each threshold method on tabletop statistics and on
+   AdaBN from those same N: mean and SD of sensitivity, and how often a single
+   clinic's draw reaches the sensitivity floor.
 
 Outputs: ``<out>/redesign.csv`` (one row per checkpoint x experiment x camera x
 setting x repeat x target) and a printed summary.
@@ -50,6 +59,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -62,53 +72,19 @@ from brset_dataset import load_any  # noqa: E402
 from capability_gate import multitask_split  # noqa: E402
 from fundus_utils import seed_worker  # noqa: E402
 from metadata_model import _auc, load_table  # noqa: E402
-from retinareach import (bn_layers, build_from_checkpoint, calibrate_blended,  # noqa: E402
+from retinareach import (THRESHOLD_METHODS, bn_layers, build_from_checkpoint,  # noqa: E402
+                         calibrate_blended, fit_threshold_reference, label_free_threshold,
                          set_bn_stats, stats_from_lists)
 from train_mbrset import pick_device  # noqa: E402
 from train_retinareach import MultiTargetDataset, parse_unfamiliar, predict  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
-# Label-free prevalence and threshold (B3)
+# Label-free prevalence and threshold (B3, C): retinareach.label_free_threshold
 # --------------------------------------------------------------------------- #
 def _logit(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, 1e-6, 1 - 1e-6)
     return np.log(p / (1 - p))
-
-
-def platt(scores: np.ndarray, y: np.ndarray):
-    """1-D logistic map from model probability to calibrated probability, fit on
-    labelled source validation outputs."""
-    from sklearn.linear_model import LogisticRegression
-    lr = LogisticRegression(C=1e6, max_iter=2000).fit(_logit(scores)[:, None], y)
-    return lambda s: lr.predict_proba(_logit(s)[:, None])[:, 1]
-
-
-def em_prevalence(q: np.ndarray, prior_src: float, iters: int = 200, tol: float = 1e-7):
-    """Saerens et al. (2002): EM re-estimate of the class prior on unlabelled
-    data from posteriors ``q`` calibrated at prior ``prior_src``. Returns
-    (estimated prior, adjusted posteriors)."""
-    pi = prior_src
-    for _ in range(iters):
-        a = (pi / prior_src) * q
-        b = ((1 - pi) / (1 - prior_src)) * (1 - q)
-        post = a / np.clip(a + b, 1e-12, None)
-        new = float(post.mean())
-        if abs(new - pi) < tol:
-            pi = new
-            break
-        pi = new
-    return pi, post
-
-
-def expected_sensitivity_threshold(scores: np.ndarray, soft: np.ndarray, target: float) -> float:
-    """Highest threshold whose EXPECTED sensitivity under soft labels ``soft``
-    (sum of soft positives at or above it / all soft positives) is >= target."""
-    order = np.argsort(-scores)
-    s, w = scores[order], soft[order]
-    cum = np.cumsum(w) / max(w.sum(), 1e-12)
-    k = int(np.searchsorted(cum, target))
-    return float(s[min(k, len(s) - 1)])
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +104,13 @@ def prevalence_subset(y: np.ndarray, prev: float, size: int, rng: np.random.Gene
     idx = np.concatenate([rng.choice(pos, n_pos, replace=False),
                           rng.choice(neg, size - n_pos, replace=False)])
     return rng.permutation(idx)
+
+
+def _prevalence(y: np.ndarray) -> np.ndarray:
+    """Per-column prevalence of a label matrix; NaN (quietly) where a column is unlabelled."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(y, axis=0)
 
 
 def metrics(y: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
@@ -244,36 +227,68 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
             add("B2_prior", dname, f"alpha {alpha:.2f}", score(cal, dname, thr_cal), alpha=alpha)
             del cal
 
-    # B3: EM prevalence + expected-sensitivity threshold (label-free)
+    # Label-free threshold references, as the trainer ships them: fit on the
+    # tabletop-statistics source validation outputs, per source target.
     va = devs[S]["val"]
     q_val = predict(tab_model, DataLoader(va, batch_size=64, num_workers=a.num_workers), dev)
     y_val = va.label_array()
+    refs = {}
+    for t in src_targets:
+        k = targets.index(t)
+        ok = ~np.isnan(y_val[:, k])
+        if t in thr_cal and len(np.unique(y_val[ok, k])) == 2:
+            refs[t] = fit_threshold_reference(q_val[:, k], y_val[:, k], thr_cal[t], a.target_sens,
+                                              a.anchor_q)
+    floor = a.target_sens - float(args.get("sens_tolerance", 0.10))
+    plain = lambda ds: DataLoader(ds, batch_size=64, num_workers=a.num_workers)
+
+    def threshold_rows(exp, dname, base_name, q_cap, q_te, methods, **extra):
+        """One row per target x method: the threshold set from the captures'
+        scores ``q_cap``, scored on the camera's test split ``q_te``."""
+        y_te = devs[dname]["test"].label_array()
+        for t, ref in refs.items():
+            k = targets.index(t)
+            for method in methods:
+                thr, est = label_free_threshold(q_cap[:, k], ref, method)
+                m = metrics(y_te[:, k], q_te[:, k], thr)
+                if m:
+                    rows.append({"ckpt": os.path.basename(path), "seed": seed, "experiment": exp,
+                                 "device": dname, "setting": f"{base_name} + {method} threshold",
+                                 "target": t, **m, "base": base_name, "method": method,
+                                 "est_prev": est.get("est_prev"), "meets_floor": m["sensitivity"] >= floor,
+                                 **{kk: (v[k] if isinstance(v, np.ndarray) else v)
+                                    for kk, v in extra.items()}})
+
+    # B3: label-free thresholds from the full natural pool
     for dname in others:
         pool = devs[dname]["pool"]
         full, _ = calibrate_blended(tab_model, calib_loader(pool, seed), dev)
+        prev = _prevalence(devs[dname]["pool_y"])
         for base_name, model in (("tabletop statistics", tab_model), ("AdaBN (full pool)", full)):
-            q_pool = predict(model, DataLoader(pool, batch_size=64, num_workers=a.num_workers), dev)
-            thr_new = {}
-            est = {}
-            for t in src_targets:
-                k = targets.index(t)
-                ok = ~np.isnan(y_val[:, k])
-                if len(np.unique(y_val[ok, k])) < 2:
-                    continue
-                cal_fn = platt(q_val[ok, k], y_val[ok, k].astype(int))
-                pi_s = float(y_val[ok, k].mean())
-                pi_hat, post = em_prevalence(cal_fn(q_pool[:, k]), pi_s)
-                thr_new[t] = expected_sensitivity_threshold(q_pool[:, k], post, a.target_sens)
-                est[t] = pi_hat
-            res = score(model, dname, thr_new)
-            for t, m in res.items():
-                if m:
-                    true_prev = float(np.nanmean(devs[dname]["pool_y"][:, targets.index(t)]))
-                    rows.append({"ckpt": os.path.basename(path), "seed": seed,
-                                 "experiment": "B3_threshold", "device": dname,
-                                 "setting": f"{base_name} + EM threshold", "target": t, **m,
-                                 "est_prev": est.get(t), "pool_prev": true_prev})
+            threshold_rows("B3_threshold", dname, base_name, predict(model, plain(pool), dev),
+                           predict(model, loaders[dname], dev), ("em", "anchor"), pool_prev=prev)
         del full
+
+    # C: deployment-sized calibration sets -- one draw of N captures gives both the
+    #    BN statistics and the threshold, as on the device
+    for dname in others:
+        pool, y_pool = devs[dname]["pool"], devs[dname]["pool_y"]
+        q_te_tab = predict(tab_model, loaders[dname], dev)
+        for n in a.small_n:
+            if n > len(pool):
+                continue
+            for r in range(a.small_n_repeats):
+                idx = rng.choice(len(pool), size=n, replace=False)
+                sub = Subset(pool, idx)
+                cal, info = calibrate_blended(tab_model, calib_loader(sub, seed + 5000 + r), dev)
+                prev = _prevalence(y_pool[idx])
+                for base_name, model, q_te in (("tabletop statistics", tab_model, q_te_tab),
+                                               ("AdaBN", cal, None)):
+                    q_te = predict(model, loaders[dname], dev) if q_te is None else q_te
+                    threshold_rows("C_small_n", dname, base_name, predict(model, plain(sub), dev),
+                                   q_te, THRESHOLD_METHODS, n_captures=n, repeat=r,
+                                   n_images=info.n_images, pool_prev=prev)
+                del cal
     return rows
 
 
@@ -288,6 +303,16 @@ def summarise(df: pd.DataFrame, primary: str) -> str:
         cols += [c for c in ("pool_prev", "est_prev") if c in e and e[c].notna().any()]
         g = e.groupby(["device", "setting"], sort=False)[cols].mean()
         out.append(f"\n--- {exp} ({primary}; mean over checkpoints and repeats) ---\n"
+                   + g.to_string(float_format=lambda v: f"{v:.3f}"))
+    c = d[d["experiment"] == "C_small_n"]
+    if len(c):
+        g = c.groupby(["device", "base", "method", "n_captures"], sort=False).agg(
+            sens=("sensitivity", "mean"), sens_sd=("sensitivity", "std"),
+            meets_floor=("meets_floor", "mean"), flagged=("flagged", "mean"),
+            specificity=("specificity", "mean"), est_prev=("est_prev", "mean"),
+            pool_prev=("pool_prev", "mean"), draws=("sensitivity", "size"))
+        out.append(f"\n--- C_small_n ({primary}; N captures give both statistics and threshold; "
+                   f"meets_floor = share of draws whose sensitivity reaches the floor) ---\n"
                    + g.to_string(float_format=lambda v: f"{v:.3f}"))
     return "\n".join(out)
 
@@ -304,6 +329,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--depth-fractions", type=float, nargs="+",
                    default=[0.0, 0.125, 0.25, 0.5, 0.75, 1.0])
     p.add_argument("--alphas", type=float, nargs="+", default=[0.25, 0.5, 0.75])
+    p.add_argument("--small-n", type=int, nargs="+", default=[8, 16, 32, 64, 128, 512],
+                   help="C: capture counts the device calibrates and re-thresholds from")
+    p.add_argument("--small-n-repeats", type=int, default=10)
+    p.add_argument("--anchor-q", type=float, default=0.25,
+                   help="score quantile the anchored threshold tracks (low = disease-free eyes)")
     p.add_argument("--target-sens", type=float, default=None,
                    help="default: the checkpoint's own --target-sens")
     p.add_argument("--num-workers", type=int, default=4)

@@ -30,7 +30,13 @@ Pipeline (one seed)
    by val AUROC), folded into its row of the head. The trunk stays frozen.
 5. **Thresholds.** Fixed on the home validation split at ``--target-sens``,
    never on the device they are applied to: source targets on BRSET val, under
-   each protocol; probes on mBRSET val.
+   each protocol; probes on mBRSET val. **Label-free re-thresholding**
+   (``retinareach.label_free_threshold``): from the same unlabelled captures the
+   statistics come from, each device re-sets every source threshold -- ``em``
+   (Saerens EM prevalence on Platt-calibrated scores, then the expected-
+   sensitivity threshold) or ``anchor`` (the shipped threshold moved in logit
+   space by the shift of the captures' lower score quartile). Scored per device
+   in ``operating_point.csv`` (full pool) and per capture count in the sweep.
 6. **Evaluation.** Every target x device x protocol --
    ``trained`` (as-trained BN statistics: what ships today) and ``calibrated``
    (each device's own AdaBN statistics: RetinaReach). AUROC with a
@@ -42,7 +48,8 @@ Pipeline (one seed)
    need? Random N-image subsets of the handheld pool (``--calib-sizes`` x
    ``--calib-repeats``), with and without the Schneider prior
    (``--prior-strengths``): handheld test AUROC, sensitivity at the shipped
-   threshold, flagged fraction.
+   threshold, flagged fraction -- and the same at each label-free threshold set
+   from those N captures (``sens_<t>__em``, ``sens_<t>__anchor``, ...).
 9. **Envelopes and recognition.** Each profile's envelope = 95th percentile of
    the same-camera distance of N-capture calibrations drawn from its own pool
    (``--envelope-repeats``). Recognition is then scored OUT OF SAMPLE on
@@ -69,7 +76,7 @@ Pipeline (one seed)
    ``unsafe_rate`` (shown but not supported) and ``missed_rate``.
 
 Outputs (``--out``): ``results.json``, ``capability.csv``,
-``calibration_sweep.csv``, ``quality_strata.csv``,
+``calibration_sweep.csv``, ``operating_point.csv``, ``quality_strata.csv``,
 ``capability_unfamiliar.csv`` + ``unfamiliar_lookup.csv`` (with --unfamiliar),
 ``predictions_<device>_<protocol>.csv``, ``split_<device>.csv``,
 ``profiles.json`` (what ``export_retinareach.py`` ships). ``--ckpt`` holds the weights (as-trained statistics + probes) with the
@@ -105,11 +112,12 @@ from capability_gate import (GATE_FEATURE_SETS, decodability, encoding_audit,  #
 from vessel_ablation import ablate_normalised  # noqa: E402
 from dataset import DeviceAug, LabelSpec, MBRSETDataset  # noqa: E402
 from fundus_utils import seed_everything, seed_worker  # noqa: E402
-from metadata_model import FEATURE_SETS, _auc, load_table, threshold_at_sensitivity  # noqa: E402
+from metadata_model import (FEATURE_SETS, _auc, load_table, operating_point,  # noqa: E402
+                            threshold_at_sensitivity)
 from retinareach import (DEFAULT_BACKBONE, PROBE_TARGETS, SOURCE_TARGETS,  # noqa: E402
-                         DeviceProfile, RetinaReachNet, camera_distance,
-                         device_capability, get_bn_stats, self_calibrate, set_bn_stats,
-                         stats_to_lists)
+                         THRESHOLD_METHODS, DeviceProfile, RetinaReachNet, camera_distance,
+                         device_capability, fit_threshold_reference, get_bn_stats,
+                         label_free_threshold, self_calibrate, set_bn_stats, stats_to_lists)
 from train_mbrset import ModelEMA, pick_device  # noqa: E402
 
 
@@ -229,6 +237,28 @@ def probe_shuffle(X_tr: np.ndarray, y_tr: np.ndarray, X_te: np.ndarray, y_te: np
                  .fit(Z_tr, rng.permutation(y_tr)).decision_function(Z_te)) for _ in range(n)]
     return {"auroc": float(np.mean(aucs)),
             "se": float(np.std(aucs, ddof=1) / np.sqrt(n)) if n > 1 else float("nan"), "n": n}
+
+
+def pool_labels(pool) -> np.ndarray:
+    """Label matrix of a ConcatDataset pool (audit only: a pool's labels are never read
+    by calibration or thresholding)."""
+    return np.concatenate([d.label_array() for d in pool.datasets])
+
+
+def sensitivity_ci(y: np.ndarray, p: np.ndarray, groups: np.ndarray, thr: float,
+                   n_boot: int, seed: int) -> List[float]:
+    """Patient-cluster bootstrap 95 % CI of the sensitivity at a fixed threshold."""
+    rng = np.random.default_rng(seed)
+    uniq, inv = np.unique(groups, return_inverse=True)
+    members = [np.flatnonzero(inv == i) for i in range(len(uniq))]
+    flag, vals = p >= thr, []
+    for _ in range(n_boot):
+        idx = np.concatenate([members[i] for i in rng.integers(0, len(uniq), len(uniq))])
+        pos = y[idx] == 1
+        if pos.any():
+            vals.append(float(flag[idx][pos].mean()))
+    return ([float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))] if vals
+            else [float("nan")] * 2)
 
 
 def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict], audits,
@@ -392,7 +422,7 @@ def main(argv: Sequence[str] = None) -> int:
     # calibration / probes / thresholds / gate
     p.add_argument("--calib-batch", type=int, default=16,
                    help="calibration batch size -- must equal the exported collector's")
-    p.add_argument("--calib-sizes", type=int, nargs="*", default=[16, 32, 64, 128, 256, 512])
+    p.add_argument("--calib-sizes", type=int, nargs="*", default=[4, 8, 16, 32, 64, 128, 256, 512])
     p.add_argument("--calib-repeats", type=int, default=5,
                    help="draws per N for the calibration-size sweep and for recognition")
     p.add_argument("--envelope-repeats", type=int, default=20,
@@ -422,6 +452,9 @@ def main(argv: Sequence[str] = None) -> int:
                    help="positive training images needed to fit a probe at all")
     p.add_argument("--target-sens", type=float, default=0.85)
     p.add_argument("--sens-tolerance", type=float, default=0.10)
+    p.add_argument("--anchor-quantile", type=float, default=0.25,
+                   help="label-free 'anchor' threshold: the score quantile it tracks between "
+                        "source validation and the new camera's captures (low = disease-free eyes)")
     p.add_argument("--gate-margin", type=float, default=0.02)
     p.add_argument("--gate-feature-sets", nargs="+", default=list(GATE_FEATURE_SETS),
                    choices=list(FEATURE_SETS))
@@ -655,6 +688,56 @@ def main(argv: Sequence[str] = None) -> int:
             ok = ~np.isnan(y)
             thresholds[proto][t] = threshold_at_sensitivity(y[ok].astype(int), q[ok], a.target_sens)
 
+    # ---- label-free operating point ----------------------------------------- #
+    # The calibrated statistics move the ranking; the threshold must move with the
+    # clinic too. References fit on source val (calibrated protocol); each device
+    # re-sets its threshold from its own unlabelled pool captures, and the result is
+    # scored on that device's test split -- the home camera must not lose what the
+    # shipped threshold already gives it.
+    y_sv = src_val.label_array()
+    threshold_refs = {}
+    for t in a.source_targets:
+        k = model.index(t)
+        ok = ~np.isnan(y_sv[:, k])
+        if t in thresholds["calibrated"] and len(np.unique(y_sv[ok, k])) == 2:
+            threshold_refs[t] = fit_threshold_reference(
+                preds[("calibrated", S, "val")][:, k], y_sv[:, k], thresholds["calibrated"][t],
+                a.target_sens, a.anchor_quantile)
+    q_pool_cal, op_rows = {}, []
+    print(f"\n=== label-free operating point (calibrated protocol; threshold re-set from each "
+          f"device's unlabelled pool, scored on its test split; floor "
+          f"{a.target_sens - a.sens_tolerance:.2f}) ===")
+    for name, pool, ds in ((S, src_pool, src_test), (T, tgt_pool, tgt_test)):
+        m_ = with_stats(model, stats[name]).to(dev)
+        q_pool_cal[name] = predict(m_, dl(pool), dev)
+        del m_
+        y_pool, y_te = pool_labels(pool), ds.label_array()
+        for t, ref in threshold_refs.items():
+            k = model.index(t)
+            ok = ~np.isnan(y_te[:, k])
+            if len(np.unique(y_te[ok, k])) < 2:
+                continue
+            yy, qq, gg = y_te[ok, k].astype(int), preds[("calibrated", name, "test")][ok, k], ds.patients[ok]
+            for method in THRESHOLD_METHODS:
+                thr, est = label_free_threshold(q_pool_cal[name][:, k], ref, method)
+                op = operating_point(yy, qq, thr)
+                lo, hi = sensitivity_ci(yy, qq, gg, thr, a.n_boot, a.seed)
+                op_rows.append({"target": t, "device": name, "method": method, "threshold": thr,
+                                "sensitivity": op["sensitivity"], "sens_lo": lo, "sens_hi": hi,
+                                "specificity": op["specificity"], "ppv": op["ppv"],
+                                "flagged_fraction": op["flagged_fraction"],
+                                "meets_floor": op["sensitivity"] >= a.target_sens - a.sens_tolerance,
+                                "est_prev": est.get("est_prev", float("nan")),
+                                "pool_prev": float(np.nanmean(y_pool[:, k])),
+                                "test_prev": float(yy.mean()), "n_pool": len(pool),
+                                "pos_patients": int(len(np.unique(gg[yy == 1])))})
+    if op_rows:
+        op_df = pd.DataFrame(op_rows)
+        op_df.to_csv(os.path.join(a.out, "operating_point.csv"), index=False)
+        print(op_df[["target", "device", "method", "sensitivity", "sens_lo", "sens_hi", "specificity",
+                     "flagged_fraction", "est_prev", "pool_prev"]]
+              .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
     for proto in ("trained", "calibrated"):
         for name, ds in ((S, src_test), (T, tgt_test)):
             q = preds[(proto, name, "test")]
@@ -778,7 +861,11 @@ def main(argv: Sequence[str] = None) -> int:
     sweep = []
     y_tt = tgt_test.label_array()
 
-    def score_row(q, n, r, prior, kind):
+    def score_row(q, n, r, prior, kind, q_cap=None):
+        """``q_cap``: the calibrated model's scores on the captures it was calibrated
+        from -- the device re-sets each source threshold from them
+        (``sens_<t>__<method>``, ``flagged_<t>__<method>``; ``prev_<t>__em`` = EM's
+        prevalence estimate)."""
         row = {"n": n, "repeat": r, "prior_strength": prior, "kind": kind}
         for t in targets:
             k = model.index(t)
@@ -791,10 +878,19 @@ def main(argv: Sequence[str] = None) -> int:
             row[f"auroc_{t}"] = _auc(yy, qq)
             row[f"sens_{t}"] = float(flag[yy == 1].mean())
             row[f"flagged_{t}"] = float(flag.mean())
+            if q_cap is not None and t in threshold_refs:
+                for method in THRESHOLD_METHODS[1:]:
+                    thr_m, est = label_free_threshold(q_cap[:, k], threshold_refs[t], method)
+                    f_m = qq >= thr_m
+                    row[f"sens_{t}__{method}"] = float(f_m[yy == 1].mean())
+                    row[f"flagged_{t}__{method}"] = float(f_m.mean())
+                    if "est_prev" in est:
+                        row[f"prev_{t}__{method}"] = est["est_prev"]
         return row
 
     sweep.append(score_row(preds[("trained", T, "test")], 0, 0, 0.0, "trained"))
-    sweep.append(score_row(preds[("calibrated", T, "test")], len(tgt_pool), 0, 0.0, "full_pool"))
+    sweep.append(score_row(preds[("calibrated", T, "test")], len(tgt_pool), 0, 0.0, "full_pool",
+                           q_pool_cal[T]))
     rng = np.random.default_rng(a.seed)
 
     def subset_calibration(ds, n, seed, prior=0.0, idx=None):
@@ -817,7 +913,8 @@ def main(argv: Sequence[str] = None) -> int:
                     cal, _, info, _ = subset_calibration(tgt_pool, n, a.seed + r, prior, idx)
                 else:
                     cal, info = cal0, info0
-                row = score_row(predict(cal, loaders[(T, "test")], dev), n, r, prior, "subset")
+                row = score_row(predict(cal, loaders[(T, "test")], dev), n, r, prior, "subset",
+                                predict(cal, dl(Subset(tgt_pool, idx)), dev))
                 row.update(dist_own=camera_distance(st, stats[T]),
                            dist_other=camera_distance(st, stats[S]), n_used=info.n_images)
                 sweep.append(row)
@@ -966,6 +1063,7 @@ def main(argv: Sequence[str] = None) -> int:
     profiles_json = {"targets": targets, "source_targets": list(a.source_targets),
                      "probe_targets": list(a.probe_targets), "thresholds": thresholds,
                      "target_sens": a.target_sens, "calib_batch": a.calib_batch,
+                     "threshold_reference": {t: r.to_dict() for t, r in threshold_refs.items()},
                      "trained_stats": stats_to_lists(trained_stats),
                      "profiles": {k: v.to_dict() for k, v in profiles.items()}}
     with open(os.path.join(a.out, "profiles.json"), "w") as f:
@@ -973,12 +1071,15 @@ def main(argv: Sequence[str] = None) -> int:
     torch.save({"model": {k: v.cpu() for k, v in model.state_dict().items()},
                 "config": {**model.config(), "image_size": a.image_size},
                 "thresholds": thresholds, "profiles": profiles_json["profiles"],
+                "threshold_reference": profiles_json["threshold_reference"],
                 "trained_stats": profiles_json["trained_stats"], "probe_info": probe_info,
                 "capability": cap_rows, "args": vars(a), "best_epoch": best_ep,
                 "best_val": best}, a.ckpt)
     results = {"args": vars(a), "best_epoch": best_ep, "best_val_mean_auroc": best,
                "targets": targets, "probe_info": probe_info, "audits": audits,
                "thresholds": thresholds, "capability": cap_rows, "envelope": envelope,
+               "threshold_reference": profiles_json["threshold_reference"],
+               "operating_point": op_rows,
                "device_recognition": recog, "device_false_accept": false_accept,
                "device_report": report, "camera_decodability": decode,
                "anatomy_ablation": ablation_rows,

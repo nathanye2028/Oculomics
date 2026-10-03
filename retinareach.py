@@ -87,7 +87,7 @@ from __future__ import annotations
 import copy
 import math
 import types
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -620,3 +620,118 @@ def device_capability(profiles: Sequence[DeviceProfile], stats: Stats, n_images:
             "inside_envelope": inside, "n_images": int(n_images),
             "shown": [r["target"] for r in report if r["status"] == "SUPPORTED"],
             "targets": report}
+
+
+# --------------------------------------------------------------------------- #
+# Label-free operating point
+# --------------------------------------------------------------------------- #
+# Calibrated statistics restore the ranking on a new camera, not the operating
+# point: on BRSET -> mBRSET the shipped threshold flagged 8-11 % of handheld test
+# images while 15.6 % had referable DR, which caps sensitivity below the floor
+# whatever the AUROC. So the threshold has to move with the clinic too, from the
+# same unlabelled captures the BN statistics come from. Pure numpy and scalar
+# reference parameters, so the device runs the same arithmetic.
+THRESHOLD_METHODS = ("shipped", "em", "anchor")
+
+
+def _logit_np(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def _sigmoid_np(z: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.asarray(z, dtype=float)))
+
+
+@dataclass
+class ThresholdReference:
+    """One source target: what the device needs to re-set its threshold from
+    unlabelled captures, fit once on the labelled source validation outputs of
+    the calibrated protocol."""
+    threshold: float            # the shipped threshold (source val, at target_sens)
+    target_sens: float
+    prior: float                # source validation prevalence
+    platt_a: float              # calibrated probability = sigmoid(a * logit(q) + b)
+    platt_b: float
+    anchor_q: float             # quantile of the score distribution used as the anchor
+    anchor_logit: float         # that quantile of logit(q) on source validation
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ThresholdReference":
+        return cls(**{k: float(d[k]) for k in cls.__dataclass_fields__})
+
+
+def fit_threshold_reference(q_val: np.ndarray, y_val: np.ndarray, threshold: float,
+                            target_sens: float, anchor_q: float = 0.25) -> ThresholdReference:
+    """Platt map (1-D logistic regression on logit q) and anchor quantile from
+    source validation scores ``q_val`` with labels ``y_val`` (NaN = unlabelled)."""
+    from sklearn.linear_model import LogisticRegression
+    ok = ~np.isnan(np.asarray(y_val, dtype=float)) & ~np.isnan(np.asarray(q_val, dtype=float))
+    q, y = np.asarray(q_val, dtype=float)[ok], np.asarray(y_val, dtype=float)[ok].astype(int)
+    if len(np.unique(y)) < 2:
+        raise ValueError("fit_threshold_reference needs both classes in the validation labels")
+    lr = LogisticRegression(C=1e6, max_iter=2000).fit(_logit_np(q)[:, None], y)
+    return ThresholdReference(float(threshold), float(target_sens), float(y.mean()),
+                              float(lr.coef_[0, 0]), float(lr.intercept_[0]), float(anchor_q),
+                              float(np.quantile(_logit_np(q), anchor_q)))
+
+
+def em_prevalence(p_cal: np.ndarray, prior: float, iters: int = 200,
+                  tol: float = 1e-7) -> Tuple[float, np.ndarray]:
+    """Saerens, Latinne & Decaestecker (2002): EM re-estimate of the class prior
+    on unlabelled data from posteriors ``p_cal`` calibrated at ``prior``.
+    Returns (estimated prior, posteriors adjusted to it)."""
+    p_cal = np.asarray(p_cal, dtype=float)
+    pi, post = float(prior), p_cal
+    for _ in range(iters):
+        a = (pi / prior) * p_cal
+        b = ((1 - pi) / (1 - prior)) * (1 - p_cal)
+        post = a / np.clip(a + b, 1e-12, None)
+        new = float(post.mean())
+        if abs(new - pi) < tol:
+            pi = new
+            break
+        pi = new
+    return pi, post
+
+
+def expected_sensitivity_threshold(scores: np.ndarray, soft: np.ndarray, target: float) -> float:
+    """Highest threshold whose EXPECTED sensitivity under soft labels ``soft``
+    (soft positives at or above it / all soft positives) reaches ``target``."""
+    order = np.argsort(-np.asarray(scores, dtype=float), kind="stable")
+    s, w = np.asarray(scores, dtype=float)[order], np.asarray(soft, dtype=float)[order]
+    cum = np.cumsum(w) / max(float(w.sum()), 1e-12)
+    k = int(np.searchsorted(cum, target))
+    return float(s[min(k, len(s) - 1)])
+
+
+def label_free_threshold(q_captures: np.ndarray, ref: ThresholdReference,
+                         method: str) -> Tuple[float, Dict[str, float]]:
+    """The threshold the device applies after scoring N unlabelled captures
+    ``q_captures`` with its calibrated model, and what it estimated on the way.
+
+    shipped  ``ref.threshold``, unchanged.
+    em       the clinic's prevalence by EM on the Platt-calibrated scores, then
+             the highest threshold whose expected sensitivity under the EM
+             posteriors reaches ``target_sens``. Assumes the Platt map still
+             holds on the new camera (label shift only) -- the thing to test.
+    anchor   the shipped threshold moved in logit space by how far the
+             ``anchor_q`` quantile of the captures sits from source validation.
+             A low quantile is made of disease-free eyes at any plausible
+             prevalence, so it tracks a shift of the whole score distribution
+             (camera, calibration) without estimating the prevalence.
+    """
+    q = np.asarray(q_captures, dtype=float)
+    q = q[~np.isnan(q)]
+    if method == "shipped" or len(q) == 0:
+        return float(ref.threshold), {}
+    if method == "em":
+        pi, post = em_prevalence(_sigmoid_np(ref.platt_a * _logit_np(q) + ref.platt_b), ref.prior)
+        return expected_sensitivity_threshold(q, post, ref.target_sens), {"est_prev": pi}
+    if method == "anchor":
+        shift = float(np.quantile(_logit_np(q), ref.anchor_q) - ref.anchor_logit)
+        return float(_sigmoid_np(_logit_np(ref.threshold) + shift)), {"shift": shift}
+    raise ValueError(f"unknown threshold method {method!r}; expected one of {THRESHOLD_METHODS}")

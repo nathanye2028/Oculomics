@@ -17,8 +17,10 @@ Five figures, each with a CSV of exactly what it plots (the table view):
 2. ``fig2_capability``          the final capability matrix (targets x cameras,
    self-calibrated protocol): status label + AUROC and image-minus-metadata delta.
 3. ``fig3_calibration_size``    sensitivity and AUROC on the handheld test split vs
-   the number of unlabelled captures, with and without the source prior; the
-   uncalibrated and full-pool values as reference lines.
+   the number of unlabelled captures: at the shipped threshold and at the two
+   label-free thresholds set from the same captures (older runs: with and without
+   the source prior); uncalibrated, full-pool and the sensitivity floor as
+   reference lines.
 4. ``fig4_mechanism``           camera decodability as trained vs calibrated (one
    line per seed), and AUROC with the vessels removed vs the same area elsewhere.
 5. ``fig5_unfamiliar``          how often the phone shows each target on the
@@ -263,40 +265,56 @@ def fig_capability(plt, final: pd.DataFrame, targets: List[str], devices: List[s
     plt.close(fig)
 
 
-def fig_calibration_size(plt, sweep: pd.DataFrame, source: List[str], device: str, out: str) -> None:
+def fig_calibration_size(plt, sweep: pd.DataFrame, source: List[str], device: str, out: str,
+                         floor: Optional[float] = None) -> None:
     if sweep.empty:
         return
     fig, axes = plt.subplots(len(source), 2, figsize=(10, 3.1 * len(source)), squeeze=False)
     rows = []
-    priors = sorted(sweep.loc[sweep["kind"] == "subset", "prior_strength"].unique())[:2]
+    sub = sweep[sweep["kind"] == "subset"]
+    # Runs with label-free thresholds: one calibration (AdaBN), three ways to set the
+    # threshold from the same captures. Older runs: AdaBN with and without the prior.
+    label_free = any(c.endswith(("__em", "__anchor")) for c in sweep.columns)
+    if label_free:
+        lines = [(0.0, "", "shipped threshold"), (0.0, "__em", "threshold re-set by EM prevalence"),
+                 (0.0, "__anchor", "threshold anchored to the lower quartile")]
+    else:
+        lines = [(pr, "", "AdaBN only" if pr == 0 else f"with source prior (N0 = {pr:g})")
+                 for pr in sorted(sub["prior_strength"].unique())[:2]]
     for i, t in enumerate(source):
-        for j, (m, title) in enumerate(((f"sens_{t}", "sensitivity at the shipped threshold"),
-                                        (f"auroc_{t}", "AUROC"))):
+        for j, (base, title) in enumerate(((f"sens_{t}", "sensitivity" if label_free else
+                                            "sensitivity at the shipped threshold"),
+                                           (f"auroc_{t}", "AUROC"))):
             ax = axes[i][j]
             hairgrid(ax, "y")
-            if m not in sweep:
+            if base not in sweep:
                 continue
-            sub = sweep[sweep["kind"] == "subset"]
-            for k, pr in enumerate(priors):
+            # AUROC does not depend on the threshold: one line per calibration
+            for k, (pr, suffix, lab) in enumerate(lines):
+                m = base + suffix
+                if m not in sub or (j == 1 and suffix):
+                    continue
                 g = sub[sub["prior_strength"] == pr].groupby("n")[m].agg(["mean", "std"]).reset_index()
-                lab = "AdaBN only" if pr == 0 else f"with source prior (N0 = {pr:g})"
                 ax.fill_between(g["n"], g["mean"] - g["std"], g["mean"] + g["std"],
                                 color=SERIES[k], alpha=0.10, lw=0)
                 ax.plot(g["n"], g["mean"], color=SERIES[k], lw=1.5,
                         label=lab if (i == 0 and j == 0) else None)
                 for _, r in g.iterrows():
                     dot(ax, r["n"], r["mean"], SERIES[k])
-                    rows.append({"target": t, "metric": m.split("_")[0], "prior": pr, "n": r["n"],
+                    rows.append({"target": t, "metric": base.split("_")[0], "prior": pr,
+                                 "threshold": suffix.strip("_") or "shipped", "n": r["n"],
                                  "mean": r["mean"], "sd": r["std"]})
             xmax = sub["n"].max()
             ax.set_ylim(-0.03, 1.05)
             refs = []
             for kind, lab in (("trained", "no calibration"), ("full_pool", "full pool")):
-                v = sweep.loc[sweep["kind"] == kind, m].mean()
+                v = sweep.loc[sweep["kind"] == kind, base].mean()
                 if v == v:
                     refs.append((v, lab))
-                    rows.append({"target": t, "metric": m.split("_")[0], "prior": None, "n": kind,
-                                 "mean": v, "sd": None})
+                    rows.append({"target": t, "metric": base.split("_")[0], "prior": None,
+                                 "threshold": "shipped", "n": kind, "mean": v, "sd": None})
+            if j == 0 and floor is not None:
+                refs.append((floor, "floor"))
             ref_lines(ax, refs)
             ax.set_xscale("log", base=2)
             ns = sorted(sub["n"].unique())
@@ -308,11 +326,16 @@ def fig_calibration_size(plt, sweep: pd.DataFrame, source: List[str], device: st
             if i == len(source) - 1:
                 ax.set_xlabel(f"unlabelled {device} captures used to calibrate")
     fig.tight_layout(rect=(0, 0, 0.93, 0.93))
-    fig.suptitle("How many unlabelled captures does a clinic need?", x=0.0, y=1.0, ha="left",
-                 va="bottom", fontsize=14, fontweight="bold")
-    fig.legend(loc="lower left", bbox_to_anchor=(0.0, 0.94), ncol=2)
-    fig.text(0.0, -0.02, "Mean over seeds and random draws; band = SD. Sensitivity at the "
-                         "threshold shipped with self-calibration.", fontsize=8, color=MUTED)
+    # the legend row is ~0.35 in tall whatever the figure height: the title sits above it
+    fig.suptitle("How many unlabelled captures does a clinic need?", x=0.0,
+                 y=0.94 + 0.35 / fig.get_figheight(), ha="left", va="bottom", fontsize=14,
+                 fontweight="bold")
+    fig.legend(loc="lower left", bbox_to_anchor=(0.0, 0.94), ncol=3 if label_free else 2)
+    fig.text(0.0, -0.02, "Mean over seeds and random draws; band = SD. " +
+             ("Every line calibrates on the same N captures; the re-set thresholds use only "
+              "those captures' scores, never their labels." if label_free else
+              "Sensitivity at the threshold shipped with self-calibration."),
+             fontsize=8, color=MUTED)
     save(fig, out, "fig3_calibration_size", pd.DataFrame(rows))
     plt.close(fig)
 
@@ -447,7 +470,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         fig_capability(plt, final, source + probes, [S, T] + unf, out, unfamiliar=unf)
     else:
         print("  (no capability_final.csv: run summarize_retinareach.py first for fig2)")
-    fig_calibration_size(plt, runs["sweep"], source, T, out)
+    fig_calibration_size(plt, runs["sweep"], source, T, out,
+                         first["target_sens"] - first["sens_tolerance"])
     fig_mechanism(plt, runs["results"], runs["ablation"], out)
     fig_unfamiliar(plt, runs["lookup"], out)
     return 0

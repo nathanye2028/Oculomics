@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 
 from capability_gate import encoding_audit, gate_status, multitask_split
 from retinareach import (BatchStatCollector, DeviceProfile, RetinaReachNet, StatInputNet,
+                         ThresholdReference,
                          blend_stats, build_from_checkpoint, calibrate_with_collector,
                          camera_distance, device_capability, get_bn_stats, self_calibrate,
                          set_bn_stats, stats_to_vector, vector_to_stats)
@@ -140,7 +141,8 @@ def test_calibrate_blended_endpoints_and_shallow_only_exactness(net):
 
 
 def test_em_prevalence_threshold_and_prevalence_pools():
-    from redesign_calibration import em_prevalence, expected_sensitivity_threshold, prevalence_subset
+    from redesign_calibration import prevalence_subset
+    from retinareach import em_prevalence, expected_sensitivity_threshold
     rng = np.random.default_rng(0)
     pi_s, pi_t, n = 0.1, 0.3, 20000
     y = (rng.random(n) < pi_t).astype(int)
@@ -157,6 +159,54 @@ def test_em_prevalence_threshold_and_prevalence_pools():
     idx = prevalence_subset(yy, 0.2, 100, rng)
     assert len(idx) == 100 and yy[idx].sum() == 20
     assert prevalence_subset(yy, 0.5, 200, rng).shape[0] == 100      # shrinks to what the pool allows
+
+
+def _scores(rng, n, prev, shift=0.0, sep=2.5):
+    """Labels at ``prev`` and model probabilities whose logits separate the classes
+    by ``sep`` SD, all moved by ``shift`` (a camera / calibration shift)."""
+    y = (rng.random(n) < prev).astype(float)
+    z = rng.normal(np.where(y == 1, sep, 0.0), 1.0) - 2.5 + shift
+    return y, 1.0 / (1.0 + np.exp(-z))
+
+
+def test_label_free_threshold_methods():
+    from metadata_model import threshold_at_sensitivity
+    from retinareach import (THRESHOLD_METHODS, ThresholdReference, fit_threshold_reference,
+                             label_free_threshold)
+    rng = np.random.default_rng(1)
+    y_v, q_v = _scores(rng, 20000, 0.055)
+    thr = threshold_at_sensitivity(y_v.astype(int), q_v, 0.85)
+    ref = fit_threshold_reference(q_v, y_v, thr, 0.85)
+    assert ref.prior == pytest.approx(0.055, abs=0.005) and ref.platt_a > 0
+    assert ThresholdReference.from_dict(ref.to_dict()) == ref
+    with pytest.raises(ValueError):
+        fit_threshold_reference(q_v, np.zeros_like(y_v), thr, 0.85)
+    assert label_free_threshold(q_v, ref, "shipped") == (thr, {})
+    assert label_free_threshold(np.array([np.nan]), ref, "em")[0] == thr      # nothing to estimate from
+    with pytest.raises(ValueError):
+        label_free_threshold(q_v, ref, "median")
+    assert THRESHOLD_METHODS[0] == "shipped"
+    sens = lambda y, q, t: float((q[y == 1] >= t).mean())
+    # anchor: a pure logit shift at the SAME prevalence is undone exactly
+    y_s, q_s = y_v, 1.0 / (1.0 + np.exp(-(np.log(q_v / (1 - q_v)) - 1.0)))
+    t_anchor, info = label_free_threshold(q_s, ref, "anchor")
+    assert info["shift"] == pytest.approx(-1.0, abs=1e-6)
+    assert sens(y_s, q_s, t_anchor) == pytest.approx(sens(y_v, q_v, thr), abs=1e-9)
+    # the handheld case: scores shifted down AND 2.8x the prevalence -- the shipped
+    # threshold misses the floor; the anchor comes back near target
+    y_h, q_h = _scores(rng, 20000, 0.156, shift=-1.0)
+    assert sens(y_h, q_h, thr) < 0.75
+    t_an, _ = label_free_threshold(q_h, ref, "anchor")
+    assert abs(sens(y_h, q_h, t_an) - 0.85) < 0.05
+    # EM assumes label shift only: a score shift reads as "almost no disease here",
+    # and its threshold ends up worse than the shipped one (the limitation it has)
+    t_em, est = label_free_threshold(q_h, ref, "em")
+    assert est["est_prev"] < 0.10 and sens(y_h, q_h, t_em) < sens(y_h, q_h, thr)
+    # label shift only (no score shift): EM recovers the prevalence and keeps the target
+    y_l, q_l = _scores(rng, 20000, 0.156)
+    t_l, est_l = label_free_threshold(q_l, ref, "em")
+    assert est_l["est_prev"] == pytest.approx(0.156, abs=0.02)
+    assert abs(sens(y_l, q_l, t_l) - 0.85) < 0.03
 
 
 def test_self_calibrate_counts_out_batches_of_one(net):
@@ -468,6 +518,22 @@ def test_end_to_end_synthetic(tmp_path):
     assert m1.head.weight[m1.index("hypertension")].abs().sum() > 0
     x = torch.randn(2, 3, 64, 64)
     assert not torch.allclose(m0(x), m1(x))
+    # label-free operating point: every device x method; the references ship with the profiles
+    op = pd.read_csv(out / "operating_point.csv")
+    assert set(op["method"]) == {"shipped", "em", "anchor"} and set(op["device"]) == {"tabletop", "handheld"}
+    assert set(op["target"]) == set(res["threshold_reference"]) and len(op) == 3 * 2 * len(set(op["target"]))
+    assert op.loc[op["method"] == "em", "est_prev"].between(0, 1).all()
+    assert op.loc[op["method"] != "em", "est_prev"].isna().all()
+    for t, thr in res["thresholds"]["calibrated"].items():
+        if t in res["threshold_reference"]:
+            shipped = op.loc[(op["method"] == "shipped") & (op["target"] == t), "threshold"]
+            assert shipped.to_numpy() == pytest.approx(np.full(len(shipped), thr))
+            assert ThresholdReference.from_dict(prof["threshold_reference"][t]).threshold == thr
+    assert ckd["threshold_reference"] == prof["threshold_reference"]
+    t0 = next(iter(res["threshold_reference"]))
+    assert {f"sens_{t0}__em", f"flagged_{t0}__anchor", f"prev_{t0}__em"} <= set(sweep.columns)
+    assert sweep.loc[sweep["kind"] == "trained", f"sens_{t0}__em"].isna().all()
+    assert sweep.loc[sweep["kind"] != "trained", f"sens_{t0}__anchor"].notna().all()
 
     # the multi-seed summary runs on the per-seed layout (the same run twice here)
     import shutil
@@ -495,6 +561,9 @@ def test_end_to_end_synthetic(tmp_path):
     svp = summ["shared_vs_pertarget"]
     assert len(svp) == 1 and svp[0]["target"] == "hypertension" and svp[0]["seeds"] == 2
     assert "Shared trunk vs per-target" in md
+    assert "Label-free operating point" in md and summ["operating_point"]
+    assert {r["method"] for r in summ["operating_point"]} == {"shipped", "em", "anchor"}
+    assert any(k.startswith(f"sens_{t0}__em") for k in summ["sweep"][0])
     from summarize_retinareach import load as load_runs
     loaded = load_runs(str(exp))
     assert (loaded[0]["sweep"]["prior_strength"] > 0).any()          # in-forward run keeps them
@@ -726,6 +795,7 @@ def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
     out = tmp_path / "redesign"
     assert redesign(["--ckpt", str(ck), "--out", str(out), "--pool-size", "12", "--repeats", "1",
                      "--depth-fractions", "0", "1", "--alphas", "0.5", "--num-workers", "0",
+                     "--small-n", "4", "999999", "--small-n-repeats", "2",
                      "--device", "cpu"]) == 0
     df = pd.read_csv(out / "redesign.csv")
     assert {"baseline", "A_prevalence", "B1_shallow", "B2_prior", "B3_threshold"} <= set(df["experiment"])
@@ -733,10 +803,21 @@ def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
     a = df[df["experiment"] == "A_prevalence"]
     assert (a["device"] == "tabletop").any()                     # the no-camera-change control
     b3 = df[df["experiment"] == "B3_threshold"]
-    assert b3["est_prev"].between(0, 1).all() and b3["pool_prev"].notna().all()
+    assert set(b3["method"]) == {"em", "anchor"} and b3["pool_prev"].notna().all()
+    assert b3.loc[b3["method"] == "em", "est_prev"].between(0, 1).all()
+    assert b3.loc[b3["method"] == "anchor", "est_prev"].isna().all()
+    # C: N captures give both the statistics and the threshold, every method on both bases
+    c = df[df["experiment"] == "C_small_n"]
+    assert set(c["method"]) == {"shipped", "em", "anchor"}
+    assert set(c["base"]) == {"tabletop statistics", "AdaBN"} and set(c["n_captures"]) == {4}
+    assert c["meets_floor"].isin([True, False]).all() and (c["repeat"] < 2).all()
+    shipped = c[(c["method"] == "shipped") & (c["base"] == "tabletop statistics")]
+    # no captures read: identical on every draw
+    assert shipped.groupby(["device", "target"])["sensitivity"].nunique().eq(1).all()
     # K = 0 layers is the tabletop-statistics baseline, K = all is full AdaBN
     b1 = df[(df["experiment"] == "B1_shallow") & (df["device"] == "handheld") & (df["target"] == "dr_referable")]
     base = df[(df["experiment"] == "baseline") & (df["device"] == "handheld") & (df["target"] == "dr_referable")]
     k0 = b1[b1["layers"] == 0]["auroc"].iloc[0]
     assert k0 == pytest.approx(base[base["setting"] == "tabletop statistics"]["auroc"].iloc[0])
-    assert (out / "redesign_summary.txt").exists()
+    summary = (out / "redesign_summary.txt").read_text()
+    assert "C_small_n" in summary and "meets_floor" in summary
