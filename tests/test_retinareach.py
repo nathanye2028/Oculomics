@@ -161,6 +161,36 @@ def test_em_prevalence_threshold_and_prevalence_pools():
     assert prevalence_subset(yy, 0.5, 200, rng).shape[0] == 100      # shrinks to what the pool allows
 
 
+def test_dr_proxy_check_separates_a_dr_proxy_from_independent_signal():
+    from dr_proxy_check import proxy_rows, within_stratum_auroc
+    rng = np.random.default_rng(0)
+    n = 6000
+    grade = rng.choice([0, 1, 2, 3, 4], size=n, p=[0.6, 0.15, 0.12, 0.08, 0.05]).astype(float)
+    other = rng.normal(size=n)                               # image signal unrelated to DR
+    # "proxy" follows the DR grade only; "own" also follows the unrelated signal
+    y_proxy = (rng.random(n) < 1 / (1 + np.exp(-(0.8 * grade - 1.5)))).astype(float)
+    y_own = (rng.random(n) < 1 / (1 + np.exp(-(1.2 * other - 1.0)))).astype(float)
+    table = pd.DataFrame({"file": [f"{i}.jpg" for i in range(n)], "patient": np.arange(n) // 2,
+                          "final_icdr": grade, "insulin": y_proxy, "systemic_hypertension": y_own})
+    table.loc[:9, "final_icdr"] = np.nan                     # ungradable eyes are left out of the strata
+    pred = pd.DataFrame({"file": table["file"], "patient": table["patient"],
+                         "p_dr_referable": 1 / (1 + np.exp(-(grade - 2 + rng.normal(0, 0.5, n)))),
+                         "p_insulin": 1 / (1 + np.exp(-(grade + rng.normal(0, 0.5, n)))),
+                         "p_hypertension": 1 / (1 + np.exp(-(other + rng.normal(0, 0.5, n))))})
+    rows = {r["target"]: r for r in proxy_rows(pred, table, ["insulin", "hypertension", "smoking"],
+                                               n_boot=200)}
+    assert set(rows) == {"insulin", "hypertension"}          # no smoking column -> no row
+    px, own = rows["insulin"], rows["hypertension"]
+    assert px["auroc_probe"] > 0.62 and abs(px["auroc_dr_score"] - px["auroc_probe"]) < 0.03
+    assert abs(px["auroc_within_grade"] - 0.5) < 0.03 and px["within_lo"] < 0.5 < px["within_hi"]
+    assert abs(px["auroc_no_dr"] - 0.5) < 0.04
+    assert own["auroc_within_grade"] > 0.7 and own["within_lo"] > 0.5
+    assert abs(own["auroc_dr_score"] - 0.5) < 0.03 and own["n_no_dr"] > 3000
+    y = np.array([1, 0, 1, 0]); sc = np.array([0.9, 0.1, 0.2, 0.8])
+    assert within_stratum_auroc(y, sc, np.array([0, 0, 1, 1])) == 0.5      # 1.0 and 0.0, equal weight
+    assert np.isnan(within_stratum_auroc(y, sc, np.array([0, 1, 0, 1])))   # no stratum has both classes
+
+
 def _scores(rng, n, prev, shift=0.0, sep=2.5):
     """Labels at ``prev`` and model probabilities whose logits separate the classes
     by ``sep`` SD, all moved by ``shift`` (a camera / calibration shift)."""
@@ -561,6 +591,11 @@ def test_end_to_end_synthetic(tmp_path):
     svp = summ["shared_vs_pertarget"]
     assert len(svp) == 1 and svp[0]["target"] == "hypertension" and svp[0]["seeds"] == 2
     assert "Shared trunk vs per-target" in md
+    from dr_proxy_check import main as dr_proxy
+    assert dr_proxy(["--dir", str(exp), "--n-boot", "20"]) == 0
+    px = pd.read_csv(exp / "dr_proxy.csv")
+    assert set(px["seed"]) == {0, 1} and set(px["target"]) <= {"hypertension", "nephropathy"}
+    assert {"auroc_probe", "auroc_dr_score", "auroc_no_dr", "auroc_within_grade"} <= set(px.columns)
     assert "Label-free operating point" in md and summ["operating_point"]
     assert {r["method"] for r in summ["operating_point"]} == {"shipped", "em", "anchor"}
     assert any(k.startswith(f"sens_{t0}__em") for k in summ["sweep"][0])

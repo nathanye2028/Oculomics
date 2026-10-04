@@ -823,6 +823,8 @@ small labelled check is done there.
 ### 10.9 Next run (lab box)
 
 ```bash
+# seconds, no GPU: are the systemic probes reading DR as a stand-in? (needs the mBRSET label table)
+python dr_proxy_check.py --dir exp_retinareach
 # minutes per checkpoint, no retraining: mechanism (A), the fixes (B1-B3), capture count (C);
 # rerun on every checkpoint as seeds 1, 2, 4 finish
 python redesign_calibration.py --ckpt ck_retinareach/seed0.pt ck_retinareach/seed3.pt \

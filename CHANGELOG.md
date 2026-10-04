@@ -2,6 +2,10 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-04 RetinaReach: DR-proxy check  (branch `retinareach`)
+
+- `dr_proxy_check.py`: on a finished sweep's saved predictions (no GPU), per systemic probe on the handheld test split — the probe's AUROC, the AUROC of the model's own referable-DR output and of the grader's ICDR grade as predictors of the same condition, the probe's AUROC among ICDR-0 eyes, and its within-grade AUROC (pairs of eyes with the same ICDR grade; patient-bootstrap CI). `dr_proxy.csv`. Answers whether a probe reads the systemic condition or DR as a stand-in for it.
+
 ## [Unreleased] — 2026-10-03 RetinaReach: redesign round 1  (branch `retinareach`)
 
 - REPORT.md §10.8: first redesign results on real data — prevalence drives the threshold shift (shown on the tabletop camera alone); most of the earlier AUROC gain comes from re-estimating statistics on clean source images, not from the target camera; shallow-only recalibration keeps the AUROC and drops the sensitivity cost; EM works only on unadapted scores.
