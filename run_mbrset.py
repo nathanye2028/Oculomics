@@ -33,9 +33,11 @@ METRICS = ["auroc", "acc", "f1", "kappa"]
 def main() -> int:
     p = argparse.ArgumentParser(description="GCG vs control on mBRSET classification.")
     p.add_argument("--root", required=True)
+    from dataset import LABEL_REGISTRY                         # noqa: E402
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
-                            "quality", "artifacts"])
+                   choices=[t for t, sp in LABEL_REGISTRY.items() if sp.num_classes],
+                   help="Any classification task in dataset.LABEL_REGISTRY, including the "
+                        "systemic targets (hypertension, nephropathy, ...).")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
