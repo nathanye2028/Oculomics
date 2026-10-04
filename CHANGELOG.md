@@ -2,6 +2,11 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-03 RetinaReach: redesign round 1  (branch `retinareach`)
+
+- REPORT.md §10.8: first redesign results on real data — prevalence drives the threshold shift (shown on the tabletop camera alone); most of the earlier AUROC gain comes from re-estimating statistics on clean source images, not from the target camera; shallow-only recalibration keeps the AUROC and drops the sensitivity cost; EM works only on unadapted scores.
+- `redesign_calibration.py`: B3 and C add a shallow-only base (`--shallow-frac`, default half the BN layers), so the candidate design — shallow recalibration for the camera, label-free threshold for the prevalence — is measured end to end.
+
 ## [Unreleased] — 2026-10-02 RetinaReach: label-free threshold  (branch `retinareach`)
 
 - `retinareach.label_free_threshold` (+ `ThresholdReference`, `fit_threshold_reference`; `em_prevalence` and `expected_sensitivity_threshold` moved here from `redesign_calibration.py`): the device re-sets each source threshold from the unlabelled captures it calibrated on — `em` (Saerens EM prevalence on Platt-calibrated scores, expected-sensitivity threshold) or `anchor` (shipped threshold moved in logit space by the shift of the captures' lower score quartile, `--anchor-quantile`). Pure numpy, scalar references, for a direct port to the phone.

@@ -733,12 +733,67 @@ the calibration-size sweep (N = 4 … 512, threshold from the same N captures);
 finished seed-0 and seed-3 checkpoints, 10 draws per N). Not yet on the phone:
 `app/RetinaReachKit` still applies the shipped threshold.
 
-### 10.8 Next run (lab box)
+### 10.8 Redesign round 1 on real data (3 October; seeds 0 and 3, referable DR)
+
+`redesign_calibration.py` (experiments A, B1, B2, B3-EM; the anchor and
+experiment C were added after this run).
+
+**The mechanism is prevalence.** On the tabletop camera, where only the
+calibration pool's prevalence changes, sensitivity at the shipped threshold
+falls 0.91 → 0.85 → 0.46 as pool prevalence goes 0 → 0.057 → 0.35, with AUROC
+flat (0.980–0.986). The phone (0.72 → 0.66 → 0.53 → 0.38, pool prevalence 0 →
+0.35) and ODIR (0.51 → 0.31) do the same. AdaBN cannot tell a new camera from a
+clinic with more disease.
+
+**Most of §10.6's AUROC gain is not camera adaptation.** Re-estimating BN
+statistics on clean tabletop images (no target image at all) already lifts the
+other cameras; the target camera's own statistics add little on top:
+
+| AUROC | as trained | tabletop statistics | AdaBN on the camera |
+|---|---|---|---|
+| phone, seed 0 · 3 | 0.894 · 0.906 | 0.906 · 0.923 | 0.935 · 0.923 |
+| ODIR, seed 0 · 3 | 0.794 · 0.831 | 0.830 · 0.849 | 0.830 · 0.851 |
+
+The training-time running statistics come from augmented batches and compress
+the logits (tabletop mean logit of positives 2.1 / 5.2 as trained vs 10.1 /
+12.1 re-estimated). Camera-specific gain: +0.029 / 0.000 on the phone,
+0.000 / +0.002 on ODIR. The capability table's `trained` protocol is therefore
+a weak baseline; the fair comparison for camera calibration is tabletop
+statistics.
+
+**Shallow-only recalibration keeps the gain and drops the cost.** Recalibrating
+the first 23–34 of 46 BN layers gives AUROC at or above full AdaBN (phone
+0.925–0.933 vs 0.929; ODIR 0.854–0.858 vs 0.841) with sensitivity back near
+the unadapted level (phone 0.68–0.69 vs 0.53 full AdaBN, 0.68 unadapted; ODIR
+0.51–0.55 vs 0.38). It does not reach the floor on its own (seed 3: 0.62–0.63).
+
+**The in-forward prior now interpolates** (phone sensitivity 0.55 / 0.59 /
+0.64 at alpha 0.25 / 0.5 / 0.75, between 0.53 and 0.68) but adds no AUROC:
+shallow-only dominates it.
+
+**EM works only on unadapted scores**, as the simulation predicted. Tabletop
+statistics + EM threshold: phone sensitivity 0.72 / 0.83 (estimated prevalence
+0.12 / 0.17 vs 0.18 in the pool), ODIR 0.71 / 0.62. After full AdaBN, EM
+reads the shifted scores as low prevalence (0.07) and sensitivity stays at
+0.55 / 0.53.
+
+**Resulting design.** Recalibrate the shallow layers for the camera; re-set the
+threshold label-free for the clinic's prevalence. The shallow depth (half the
+BN layers, `--shallow-frac 0.5`) is fixed now from seeds 0 and 3; seeds 1, 2
+and 4 are the confirmation. Still to measure: shallow + anchor/EM, and how many
+captures the threshold needs (`redesign_calibration.py` B3 and C on all five
+checkpoints). Mean logits suggest the anchor fits the phone's shift (seed 0:
+negatives −1.3, positives −1.1 under AdaBN) but would under-correct at very high
+prevalence, where positives fall about twice as far as negatives (tabletop,
+prevalence 0 → 0.35).
+
+### 10.9 Next run (lab box)
 
 ```bash
-# minutes per checkpoint, no retraining: mechanism (A), the fixes (B1-B3), capture count (C)
+# minutes per checkpoint, no retraining: mechanism (A), the fixes (B1-B3), capture count (C);
+# rerun on every checkpoint as seeds 1, 2, 4 finish
 python redesign_calibration.py --ckpt ck_retinareach/seed0.pt ck_retinareach/seed3.pt \
-    --out exp_retinareach/redesign
+    --out exp_retinareach/redesign_v2
 B=<BRSET root> M=<mBRSET root> U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 \
   PERTARGET="hypertension insulin" CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
 # (a preflight runs first and stops the sweep if anything is wrong; figures at the end

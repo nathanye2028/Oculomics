@@ -809,7 +809,10 @@ def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
     # C: N captures give both the statistics and the threshold, every method on both bases
     c = df[df["experiment"] == "C_small_n"]
     assert set(c["method"]) == {"shipped", "em", "anchor"}
-    assert set(c["base"]) == {"tabletop statistics", "AdaBN"} and set(c["n_captures"]) == {4}
+    shallow_base = [b for b in c["base"].unique() if b.startswith("shallow ")]
+    assert len(shallow_base) == 1 and set(c["n_captures"]) == {4}
+    assert set(c["base"]) == {"tabletop statistics", "AdaBN", shallow_base[0]}
+    assert any(b.startswith("shallow ") for b in b3["base"].unique())
     assert c["meets_floor"].isin([True, False]).all() and (c["repeat"] < 2).all()
     shipped = c[(c["method"] == "shipped") & (c["base"] == "tabletop statistics")]
     # no captures read: identical on every draw

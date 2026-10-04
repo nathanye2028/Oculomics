@@ -47,9 +47,11 @@ B3 Re-estimated threshold: the clinic's prevalence estimated from the model's ow
 C  Deployment-sized calibration sets. The phone has N captures, not a pool of
    thousands, and one draw gives it both the BN statistics and the threshold. N
    random captures at the camera's natural prevalence (``--small-n`` x
-   ``--small-n-repeats``), each threshold method on tabletop statistics and on
-   AdaBN from those same N: mean and SD of sensitivity, and how often a single
-   clinic's draw reaches the sensitivity floor.
+   ``--small-n-repeats``), each threshold method on three bases from those same
+   N -- tabletop statistics, full AdaBN, and shallow-only AdaBN (the first
+   ``--shallow-frac`` of the BN layers; B3 runs the same three on the full pool):
+   mean and SD of sensitivity, and how often a single clinic's draw reaches the
+   sensitivity floor.
 
 Outputs: ``<out>/redesign.csv`` (one row per checkpoint x experiment x camera x
 setting x repeat x target) and a printed summary.
@@ -259,15 +261,22 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
                                  **{kk: (v[k] if isinstance(v, np.ndarray) else v)
                                     for kk, v in extra.items()}})
 
+    # The camera/prevalence split: recalibrate only the first K BN layers (the
+    # camera), re-set the threshold label-free (the clinic's prevalence).
+    k_sh = int(round(a.shallow_frac * len(names)))
+    shallow = f"shallow {k_sh}/{len(names)}"
+
     # B3: label-free thresholds from the full natural pool
     for dname in others:
         pool = devs[dname]["pool"]
         full, _ = calibrate_blended(tab_model, calib_loader(pool, seed), dev)
+        part, _ = calibrate_blended(tab_model, calib_loader(pool, seed), dev, adapt=names[:k_sh])
         prev = _prevalence(devs[dname]["pool_y"])
-        for base_name, model in (("tabletop statistics", tab_model), ("AdaBN (full pool)", full)):
+        for base_name, model in (("tabletop statistics", tab_model), ("AdaBN (full pool)", full),
+                                 (shallow + " (full pool)", part)):
             threshold_rows("B3_threshold", dname, base_name, predict(model, plain(pool), dev),
                            predict(model, loaders[dname], dev), ("em", "anchor"), pool_prev=prev)
-        del full
+        del full, part
 
     # C: deployment-sized calibration sets -- one draw of N captures gives both the
     #    BN statistics and the threshold, as on the device
@@ -281,14 +290,16 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
                 idx = rng.choice(len(pool), size=n, replace=False)
                 sub = Subset(pool, idx)
                 cal, info = calibrate_blended(tab_model, calib_loader(sub, seed + 5000 + r), dev)
+                part, _ = calibrate_blended(tab_model, calib_loader(sub, seed + 5000 + r), dev,
+                                            adapt=names[:k_sh])
                 prev = _prevalence(y_pool[idx])
                 for base_name, model, q_te in (("tabletop statistics", tab_model, q_te_tab),
-                                               ("AdaBN", cal, None)):
+                                               ("AdaBN", cal, None), (shallow, part, None)):
                     q_te = predict(model, loaders[dname], dev) if q_te is None else q_te
                     threshold_rows("C_small_n", dname, base_name, predict(model, plain(sub), dev),
                                    q_te, THRESHOLD_METHODS, n_captures=n, repeat=r,
                                    n_images=info.n_images, pool_prev=prev)
-                del cal
+                del cal, part
     return rows
 
 
@@ -332,6 +343,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--small-n", type=int, nargs="+", default=[8, 16, 32, 64, 128, 512],
                    help="C: capture counts the device calibrates and re-thresholds from")
     p.add_argument("--small-n-repeats", type=int, default=10)
+    p.add_argument("--shallow-frac", type=float, default=0.5,
+                   help="B3/C: fraction of BN layers (from the input) the shallow base "
+                        "recalibrates; fixed on seeds 0 and 3, confirm on fresh seeds")
     p.add_argument("--anchor-q", type=float, default=0.25,
                    help="score quantile the anchored threshold tracks (low = disease-free eyes)")
     p.add_argument("--target-sens", type=float, default=None,
