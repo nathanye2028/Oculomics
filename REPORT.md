@@ -787,6 +787,39 @@ negatives −1.3, positives −1.1 under AdaBN) but would under-correct at very 
 prevalence, where positives fall about twice as far as negatives (tabletop,
 prevalence 0 → 0.35).
 
+**Round 2: the label-free thresholds on real data** (`redesign_v2`, same two
+checkpoints, before the shallow base existed). Sensitivity, seed 0 · 3:
+
+| threshold, full pool | phone, tabletop statistics | phone, AdaBN | ODIR, tabletop statistics |
+|---|---|---|---|
+| shipped | 0.66 · 0.70 | 0.57 · 0.49 | 0.59 · 0.45 |
+| anchor | 0.63 · 0.52 | 0.65 · 0.49 | 0.41 · 0.34 |
+| EM | **0.72 · 0.83** | 0.55 · 0.53 | **0.71 · 0.62** |
+
+*The anchor fails on real data.* It assumed a new camera moves every score
+together. Real cameras compress the scores instead: under tabletop statistics
+the phone's healthy eyes score higher than the tabletop's (mean logit +0.2 /
++2.9) and its referable eyes lower (−2.8 / −1.9); ODIR the same (+2.0 / +2.5,
+−3.6 / −4.3). The lower quartile rises, so the anchor raises the threshold
+while the positives fell: worse than shipping the threshold unchanged. The
+simulation's uniform-shift model was wrong, and only the real cameras showed it.
+
+*EM on unadapted scores is the best label-free threshold so far*, at a
+specificity cost (phone flags 15–23 % vs 13.5 % shipped; specificity
+0.95 / 0.88). It converges from few captures: seed 0's phone sensitivity is
+at its full-pool value from 8 captures, seed 3's climbs to it by 32–64
+(0.70 → 0.82). What remains is bias, not noise: EM underestimates prevalence (0.12 / 0.17 vs 0.18; the tabletop Platt
+map overstates confidence on compressed scores). Share of N-capture draws
+reaching the floor on the phone: 0.55–0.85 across N = 8 … 512 (seed 3 mostly
+above, seed 0 mostly just below); on ODIR it falls from 0.30 at N = 8 to 0 at
+N ≥ 64 — a consistent threshold that is consistently too high. After full
+AdaBN no threshold method reaches the floor on either camera.
+
+Not yet measured: EM on shallow-recalibrated scores (B3/C shallow base). If it
+too stays below the floor, the label-free design reaches its limit, and the
+honest outcome is a device that reports THRESHOLD_DRIFT on a new camera until a
+small labelled check is done there.
+
 ### 10.9 Next run (lab box)
 
 ```bash
