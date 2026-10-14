@@ -130,6 +130,19 @@ TASK_REQUIREMENTS: Dict[str, str] = {
     "artifacts": "final_artifacts",
     "sex": "sex",
     "age": "age",
+    # Systemic (oculomics) targets: mBRSET-only metadata. BRSET has a free-text
+    # ``comorbidities`` column instead, so --inspect reports these as unavailable
+    # on a BRSET CSV; they are trained in-domain on mBRSET (run_systemic.sh).
+    "hypertension": "systemic_hypertension",
+    "nephropathy": "nephropathy",
+    "neuropathy": "neuropathy",
+    "myocardial_infarction": "acute_myocardial_infarction",
+    "vascular_disease": "vascular_disease",
+    "diabetic_foot": "diabetic_foot",
+    "obesity": "obesity",
+    "smoking": "smoking",
+    "alcohol": "alcohol_consumption",
+    "insulin": "insulin",
 }
 
 
@@ -273,6 +286,13 @@ def load_brset(
     return out
 
 
+# Every dataset a trainer / scorer can name: the two Brazilian sets plus the public
+# sets adapted in public_fundus.py (ODIR-5K is the retinal-age clock's auxiliary
+# training set; the glaucoma / AMD branch scores on the others).
+from public_fundus import PUBLIC_DATASETS, load_public          # noqa: E402
+DATASETS = ("mbrset", "brset") + PUBLIC_DATASETS
+
+
 # Label CSV names per dataset. The name varies by release (PhysioNet 1.0.1 ships
 # labels_brset.csv, the Kaggle BRSET mirror labels.csv), and PhysioNet downloads
 # drop a version directory (mBRSET/1.0/labels_mbrset.csv), so a root is resolved
@@ -314,13 +334,16 @@ def resolve_root(root: str, dataset: str, max_depth: int = 5) -> str:
         f"the label CSV and the images/ folder (e.g. the PhysioNet version dir mBRSET/1.0).")
 
 
-def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]:
-    """Resolve ``root`` to a (DataFrame, images_dir) pair for either dataset.
+def load_any(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str, str]:
+    """Resolve ``root`` to a (DataFrame, images_dir) pair for any dataset in DATASETS.
 
-    Lets a trainer accept ``--dataset {mbrset,brset}`` without branching on the
-    schema everywhere. Returns a dict so the caller can log what it resolved.
-    ``root`` may be a parent of the real dataset directory (see resolve_root).
+    Lets a trainer accept ``--dataset {mbrset,brset,airogs,refuge,papila,odir}``
+    without branching on the schema everywhere. Returns a dict so the caller can
+    log what it resolved. ``**kw`` reaches the public adapters (``papila_suspect``).
+    For mbrset/brset, ``root`` may be a parent of the real directory (see resolve_root).
     """
+    if dataset in PUBLIC_DATASETS:
+        return load_public(root, dataset, image_ext=image_ext, **kw)
     if dataset == "mbrset":
         root = resolve_root(root, dataset)
         csv_path = next(os.path.join(root, n) for n in LABEL_CSV_NAMES["mbrset"]
@@ -339,7 +362,7 @@ def load_any(root: str, dataset: str, image_ext: str = ".jpg") -> Dict[str, str]
                         if os.path.isdir(os.path.join(root, c))), os.path.join(root, "fundus_photos"))
         return {"df": load_brset(csv_path, image_ext=image_ext), "images_dir": img_dir,
                 "csv": csv_path, "source": "brset"}
-    raise ValueError(f"unknown dataset {dataset!r}; expected 'mbrset' or 'brset'")
+    raise ValueError(f"unknown dataset {dataset!r}; expected one of {DATASETS}")
 
 
 # --------------------------------------------------------------------------- #
