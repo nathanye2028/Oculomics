@@ -2,6 +2,11 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-15 Systemic oculomics: BRSET comorbidities  (branch `disease/systemic-oculomics`)
+
+- `brset_comorbidities.py`: BRSET's free-text `comorbidities` column parsed into per-patient flags — `atom_<condition>` (41 conditions; vocabulary written against the real CSV's strings, misspellings included) and `cm_<target>` groups (hypertension, diabetes, dyslipidemia, heart disease, MI, stroke, cardiovascular event, kidney, neurodegenerative, Alzheimer's, autoimmune, antimalarial use, thyroid). `na` is missing (NaN), never negative; `0` is recorded-none; unmapped items are listed, not dropped. Audit: coverage, who has a recorded history (by camera, age band, sex, diabetes, worst DR grade) with an adjusted camera odds ratio, free text vs BRSET's own `diabetes` column, and per target the size, age gap, prevalence by camera and an age/sex/diabetes-adjusted camera odds ratio (flagged when its CI excludes 1). numpy-only logistic regression (no statsmodels). Outputs `brset_comorbidity_flags.csv`, `comorbidity_audit.md`, `comorbidity_audit.json`.
+- `tests/test_brset_comorbidities.py` (35): vocabulary on the real strings, missing vs none, patient consolidation, BOM header, odds-ratio recovery, a planted camera confound flagged and an age-only signal not flagged, cross-check orientation, CLI outputs.
+
 ## [Unreleased] — 2026-10-04 RetinaReach: DR-proxy check  (branch `retinareach`)
 
 - `dr_proxy_check.py`: on a finished sweep's saved predictions (no GPU), per systemic probe on the handheld test split — the probe's AUROC, the AUROC of the model's own referable-DR output and of the grader's ICDR grade as predictors of the same condition, the probe's AUROC among ICDR-0 eyes, and its within-grade AUROC (pairs of eyes with the same ICDR grade; patient-bootstrap CI). `dr_proxy.csv`. Answers whether a probe reads the systemic condition or DR as a stand-in for it.
