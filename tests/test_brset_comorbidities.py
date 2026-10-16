@@ -31,6 +31,26 @@ from brset_comorbidities import (GROUPS, audit, logit_or, main, parse_comorbidit
     ("tabagism", {"smoking"}),
     ("ocular hypertension", {"ocular_hypertension"}),
     ("glaucoma", {"ocular_condition"}),
+    # first real audit's unmapped list (2026-10-15)
+    ("parkison", {"parkinson"}),
+    ("hipoitireoidismo", {"hypothyroidism"}),
+    ("intracranial hypertension", {"intracranial_hypertension"}),
+    ("meningioma", {"brain_tumor"}),
+    ("prolactinoma", {"pituitary_adenoma"}),
+    ("leucemia", {"cancer"}),
+    ("devic", {"neuromyelitis_optica"}),
+    ("herpetic encephalitis", {"encephalitis"}),
+    ("hepatic transplant", {"liver_disease"}),
+    ("hepatitis c", {"chronic_infection"}),
+    ("deep vascular thrombosis", {"thrombosis"}),
+    ("thrombocytopenia", {"blood_disorder"}),
+    ("catheterism", {"cardiopathy"}),
+    ("dpoc", {"asthma_copd"}),
+    ("chronic obstructive pulmonary disease", {"asthma_copd"}),
+    ("hipocolesterolemia", {"dyslipidemia"}),
+    ("muscular dystrophy", {"genetic_syndrome"}),
+    ("cone dystrophy", {"ocular_condition"}),
+    ("neurofibromatosis", {"genetic_syndrome"}),
 ])
 def test_vocabulary_on_real_strings(text, expect):
     atoms, unmapped = parse_comorbidities(text)
@@ -156,6 +176,40 @@ def test_diabetes_crosscheck_orientation():
     report = render(audit(pf, unmapped, stats), "x.csv")
     assert "| text lists diabetes | 3 | 1 |" in report
     assert "lists diabetes for 60%" in report           # 3 of the 5 column-diabetics
+
+
+def test_brain_any_groups_brain_conditions_but_not_migraine():
+    raw = pd.DataFrame(
+        _rows(1, "Canon CR", 80, 1, "No", ["parkison"])
+        + _rows(2, "Canon CR", 70, 2, "No", ["encephalic vascular accident"])
+        + _rows(3, "Canon CR", 40, 2, "No", ["migraine"]))
+    pf = patient_flags(raw)[0].set_index("patient_id")
+    assert list(pf["cm_brain_any"]) == [1, 1, 0]
+    assert list(pf["cm_neurodegenerative"]) == [1, 0, 0]
+
+
+def test_perfect_diabetes_agreement_is_not_called_a_completeness_check():
+    raw = pd.DataFrame(
+        sum([_rows(f"a{i}", "Canon CR", 60, 1, "yes", ["diabetes"]) for i in range(3)], [])
+        + sum([_rows(f"d{i}", "Canon CR", 60, 1, "No", ["0"]) for i in range(4)], []))
+    pf, unmapped, stats = patient_flags(raw)
+    report = render(audit(pf, unmapped, stats), "x.csv")
+    assert "NOT an independent check" in report
+    assert "false negatives" not in report
+
+
+def test_one_camera_target_is_unstable_without_overflow_warnings():
+    """A condition seen on only one camera separates perfectly: the fit must be
+    marked unstable, never flagged, and must not emit overflow warnings."""
+    raw = _synthetic_brset(n=1500)
+    stroke_rows = raw.index[(raw["camera"] == "Canon CR") & (raw["comorbidities"] == "0")][:40]
+    raw.loc[stroke_rows, "comorbidities"] = "stroke"
+    pf, unmapped, stats = patient_flags(raw)
+    with np.errstate(over="raise", invalid="raise"):
+        res = audit(pf, unmapped, stats)
+    stroke = res["targets"]["stroke"]
+    assert stroke["camera_or"]["stable"] is False and stroke["camera_flag"] is False
+    assert "n/a (no cases on one camera)" in render(res, "x.csv")
 
 
 def test_main_writes_outputs(tmp_path):

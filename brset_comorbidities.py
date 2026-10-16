@@ -73,8 +73,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # --------------------------------------------------------------------------- #
 # (atom, include pattern, exclude pattern). Matched per list item, after the
 # string is lower-cased and split on , ; / + and the words "and" / "e". Written
-# against the token counts seen on the real CSV (2026-10-15), misspellings
-# included ("hydroxichloroquine", "chron disease", "tabagism").
+# against the items seen on the real CSV (lab box, 2026-10-15 and the first
+# audit's unmapped list), misspellings and Portuguese spellings included
+# ("hydroxichloroquine", "chron disease", "parkison", "hipoitireoidismo",
+# "leucemia", "dpoc").
 ATOMS: List[Tuple[str, str, Optional[str]]] = [
     # -- cardiovascular / metabolic
     ("hypertension", r"hypertens|\bsah\b|high blood pressure|\bhtn\b",
@@ -82,27 +84,37 @@ ATOMS: List[Tuple[str, str, Optional[str]]] = [
     ("ocular_hypertension", r"(?:ocular|intraocular) hypertens", None),
     ("diabetes", r"diabet|\bdm\b|\bdm ?[12]\b", r"insipidus"),
     ("diabetes_type1", r"diabetes ?(?:type ?)?1\b|\bdm ?1\b|type ?1 diab", None),
-    ("dyslipidemia", r"cholesterol|lipid|triglycerid", None),
+    ("dyslipidemia", r"cholesterol|colesterol|lipid|triglycerid", None),
     ("myocardial_infarction", r"myocard|infarct|heart attack", r"cerebr|encephal|brain|retin"),
     ("heart_failure", r"cardiac insufficien|heart failure|cardiac failure|heart insufficien", None),
     ("arrhythmia", r"arr?h?ythm|atrial fibrillation|pacemaker", None),
     ("valve_disease", r"valv", None),
-    ("cardiopathy", r"cardiopath|cardiomyopath|heart disease|coronar|angina|ischemic heart", None),
+    # "catheterism" = cateterismo, a cardiac catheterisation in Brazilian charts
+    ("cardiopathy", r"cardiopath|cardiomyopath|heart disease|coronar|angina|ischemic heart"
+                    r"|catheteri|cateteris", None),
     ("stroke", r"stroke|vascular accident|\bcva\b|\bavc\b|cerebrovascular"
                r"|cerebral (?:infarct|isch|hemorr)", None),
+    ("thrombosis", r"thromb|trombos|embolism", r"thrombocyt"),
+    ("aneurysm", r"aneurys|aneuris", None),
     ("obesity", r"obes", None),
     ("smoking", r"tabag|smok", None),
-    # -- kidney
+    # -- kidney / liver
     ("kidney_disease", r"kidney|renal|nephr|dialysis", r"transplant"),
     ("kidney_transplant", r"(?:kidney|renal).*transplant|transplant.*(?:kidney|renal)", None),
+    ("liver_disease", r"hepatic|liver|cirrho", None),
     # -- brain / nervous system
     ("alzheimer", r"alzheimer|dementia", None),
-    ("parkinson", r"parkinson", None),
+    ("parkinson", r"park[a-z]*son", None),
     ("multiple_sclerosis", r"multiple sclerosis|sclerosis multiple", None),
+    ("neuromyelitis_optica", r"devic|neuromyelit", None),
     ("epilepsy", r"epilep|seizure|convuls", None),
-    ("migraine", r"migraine", None),
+    ("encephalitis", r"encephalit|meningit", None),
+    ("hydrocephalus", r"hydroceph|hidroce", None),
+    ("intracranial_hypertension", r"intracranial hypertens|pseudotumor", None),
+    ("brain_tumor", r"meningioma|glioma|astrocytoma|brain tumo", None),
+    ("pituitary_adenoma", r"hypophys|pituitar|prolactinoma", None),
     ("cerebral_palsy", r"cerebral palsy", None),
-    ("pituitary_adenoma", r"hypophys|pituitar", None),
+    ("migraine", r"migraine", None),
     # -- immune / drugs with retinal effects
     ("lupus", r"lupus|\bsle\b", None),
     ("rheumatoid_arthritis", r"rheumatoid", None),
@@ -110,24 +122,30 @@ ATOMS: List[Tuple[str, str, Optional[str]]] = [
     ("psoriasis", r"psoria", None),
     ("vasculitis", r"vasculit|arteritis|beh.?et", None),
     ("crohn", r"cro?hn|chron disease|colitis", None),
+    ("autoimmune_other", r"sarcoid|spondyl|vitiligo|myasthen|scleroderm|dermatomyosit", None),
     ("antimalarial_use", r"chloroqui|hydroxi?chloroq|plaquenil", None),
     # -- other
-    ("hypothyroidism", r"hypothyr", None),
+    ("hypothyroidism", r"hypothyr|hipoi?tireo|hashimoto", None),
     ("hyperthyroidism", r"hyperthyr|graves", None),
+    ("thyroid_other", r"thyroidit|goiter|thyr\w* nodul", None),
     ("sickle_cell", r"sickle|falciform", None),
     ("anemia", r"anemi|anaemi", r"sickle"),
+    ("blood_disorder", r"thalass|talass|polic[iy]tem|polycythem|hemophil|thrombocyt", None),
     ("hiv", r"immunodeficiency virus|\bhiv\b|\baids\b", None),
-    ("cancer", r"cancer|carcinom|lymphom|leukemi|leukaemi|melanom|neoplas|tumou?r|metasta",
-     r"hypophys|pituitar"),
-    ("asthma_copd", r"asthma|copd|bronch|emphysem", None),
-    ("osteoarticular", r"arthros|osteopor|osteoarth|gout|(?<!rheumatoid )arthritis", None),
+    ("chronic_infection", r"chagas|syphil|hepatitis|tubercul|toxoplasm|hansen|lepros", None),
+    ("cancer", r"cancer|carcinom|lymphom|leukemi|leukaemi|leucemi|melanom|neoplas|tumou?r|metasta",
+     r"hypophys|pituitar|prolactinoma|meningioma|glioma|astrocytoma|brain tumo"),
+    ("asthma_copd", r"asthma|copd|\bdpoc\b|obstructive pulmonary|bronch|emphysem", None),
+    ("osteoarticular", r"arthros|osteopor|osteoarth|gout|fibromi?y?alg|(?<!rheumatoid )arthritis",
+     None),
     ("prostate", r"prosta", None),
     ("psychiatric", r"depress|anxiet|bipolar|schizo|psych", None),
     ("rhinitis_allergy", r"rhinit|allerg", None),
+    ("genetic_syndrome", r"down syndrome|trisom|mccune|muscular dystroph|marfan|turner|neurofibromat", None),
     # eye conditions listed as "comorbidities": kept out of the unmapped list,
     # never used as a systemic target
-    ("ocular_condition", r"glaucom|catarac|uveit|keratocon|myop|retin|macul|amblyop|strabism|blind",
-     None),
+    ("ocular_condition", r"glaucom|catarac|uveit|keratocon|myop|retin|macul|amblyop|strabism|blind"
+                         r"|cone dystroph|rod dystroph|albinis|stargardt|nystagm", None),
 ]
 _COMPILED = [(name, re.compile(inc), re.compile(exc) if exc else None) for name, inc, exc in ATOMS]
 ATOM_NAMES = [a[0] for a in ATOMS]
@@ -145,11 +163,17 @@ GROUPS: Dict[str, Tuple[str, ...]] = {
     "cardiovascular_event": ("myocardial_infarction", "heart_failure", "arrhythmia",
                              "valve_disease", "cardiopathy", "stroke"),
     "kidney": ("kidney_disease", "kidney_transplant"),
-    "neurodegenerative": ("alzheimer", "parkinson", "multiple_sclerosis"),
+    # neurodegenerative + demyelinating (MS, neuromyelitis optica)
+    "neurodegenerative": ("alzheimer", "parkinson", "multiple_sclerosis", "neuromyelitis_optica"),
     "alzheimer": ("alzheimer",),
-    "autoimmune": ("lupus", "rheumatoid_arthritis", "sjogren", "psoriasis", "vasculitis", "crohn"),
+    # any structural / vascular / degenerative brain condition; migraine excluded
+    "brain_any": ("alzheimer", "parkinson", "multiple_sclerosis", "neuromyelitis_optica", "stroke",
+                  "epilepsy", "encephalitis", "hydrocephalus", "intracranial_hypertension",
+                  "brain_tumor", "pituitary_adenoma", "cerebral_palsy"),
+    "autoimmune": ("lupus", "rheumatoid_arthritis", "sjogren", "psoriasis", "vasculitis", "crohn",
+                   "autoimmune_other"),
     "antimalarial_use": ("antimalarial_use",),
-    "thyroid": ("hypothyroidism", "hyperthyroidism"),
+    "thyroid": ("hypothyroidism", "hyperthyroidism", "thyroid_other"),
 }
 
 MISSING_TOKENS = {"", "na", "n/a", "nan", "none recorded", "not informed", "-"}
@@ -307,9 +331,10 @@ def logit_or(y: np.ndarray, X: np.ndarray, names: Sequence[str],
     se = np.sqrt(np.diag(cov))
     stable = converged and bool(np.all(np.abs(b) < 15))
     out = {}
-    for i, n in enumerate(names, start=1):
-        out[n] = {"or": float(np.exp(b[i])), "lo": float(np.exp(b[i] - 1.96 * se[i])),
-                  "hi": float(np.exp(b[i] + 1.96 * se[i])), "stable": stable}
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):   # unstable fits: exp(+-huge)
+        for i, n in enumerate(names, start=1):
+            out[n] = {"or": float(np.exp(b[i])), "lo": float(np.exp(b[i] - 1.96 * se[i])),
+                      "hi": float(np.exp(b[i] + 1.96 * se[i])), "stable": stable}
     return out
 
 
@@ -354,7 +379,7 @@ def _rate_table(pf: pd.DataFrame, by: pd.Series, value: str) -> List[Dict[str, o
 # Audit
 # --------------------------------------------------------------------------- #
 def audit(pf: pd.DataFrame, unmapped: Counter, stats: Dict[str, int],
-          top_unmapped: int = 40) -> Dict[str, object]:
+          top_unmapped: int = 100) -> Dict[str, object]:
     """Every number the report prints, as a JSON-able dict."""
     rec = pf[pf["recorded"] == 1]
     none_listed = int((rec[[f"atom_{a}" for a in ATOM_NAMES]].sum(axis=1) == 0).sum())
@@ -447,6 +472,9 @@ def render(res: Dict[str, object], csv_path: str) -> str:
     L += ["", "## Who has a recorded history", ""]
     for k, rows in res["missingness"].items():
         L.append(f"- by {k}: {_fmt_rates(rows)}")
+    L.append("- recorded patients per camera (what every camera contrast below rests on): "
+             + ", ".join(f"{r['level']} {round(r['n'] * r['rate'])}"
+                         for r in res["missingness"]["camera"]))
     adj = res.get("missingness_adjusted")
     if adj:
         o = adj["or"]["cam_other"]
@@ -463,7 +491,10 @@ def render(res: Dict[str, object], csv_path: str) -> str:
               f"| text lists diabetes | {dc['text_yes_col_yes']} | {dc['text_yes_col_no']} |",
               f"| text does not | {dc['text_no_col_yes']} | {dc['text_no_col_no']} |", ""]
         col_yes = dc["text_yes_col_yes"] + dc["text_no_col_yes"]
-        if col_yes:
+        if col_yes and dc["text_yes_col_no"] == 0 and dc["text_no_col_yes"] == 0:
+            L.append("Perfect agreement. The column was most likely derived from this same "
+                     "field, so this is NOT an independent check of how complete the lists are.")
+        elif col_yes:
             L.append(f"Of patients the column calls diabetic, the free text lists diabetes for "
                      f"{100 * dc['text_yes_col_yes'] / col_yes:.0f}%. The rest are the free "
                      f"text's false negatives -- a rough estimate of how incomplete a list is.")
@@ -474,7 +505,7 @@ def render(res: Dict[str, object], csv_path: str) -> str:
         cam = t.get("camera_or")
         cam_s = f"{cam['or']:.2f} [{cam['lo']:.2f}, {cam['hi']:.2f}]" if cam else "--"
         if cam and not cam["stable"]:
-            cam_s += " unstable"
+            cam_s = "n/a (no cases on one camera)"
         notes = []
         if t["underpowered"]:
             notes.append("underpowered: CV / association only")
@@ -508,7 +539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Parse BRSET comorbidities and audit them.")
     p.add_argument("--root", required=True, help="BRSET root (or the label CSV itself)")
     p.add_argument("--out", default="exp_comorbid", help="output directory")
-    p.add_argument("--top-unmapped", type=int, default=40)
+    p.add_argument("--top-unmapped", type=int, default=100)
     args = p.parse_args(argv)
 
     csv_path = find_csv(args.root)
