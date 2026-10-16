@@ -12,6 +12,10 @@ Two paired questions per task, both paired by seed (same patient split):
    logistic baseline recorded in the same run (``covariate_baseline``). A CI
    that excludes 0 on the positive side is the claim; a CI that includes 0 means
    the model may have learned the patient's age from the retina.
+   With ``incremental`` in the runs (``--covariate-baseline`` on a binary task),
+   the sharper version: covariates + image score vs covariates alone, both fit
+   on the val patients and scored on the test patients, overall and per subset
+   (e.g. non-diabetic DR-grade-0), paired by seed.
 2. **Does DR pre-training transfer?** ``--treatment`` minus ``--control`` on test
    AUROC (default drinit vs ctrl). Optional -- with ``--control`` alone the
    script only answers question 1.
@@ -75,10 +79,24 @@ def _fmt_stats(st, label):
             f"{st['n_positive']}/{st['n']} seeds+  {verdict}")
 
 
+def incremental_by_seed(by_seed: Dict[int, dict]) -> Dict[str, dict]:
+    """{block: paired_stats(covariates+image, covariates)} over seeds, for the
+    ``test`` block and every subset recorded in the runs' ``incremental``."""
+    blocks: Dict[str, Dict[str, Dict[int, float]]] = {}
+    for s, r in by_seed.items():
+        inc = r.get("incremental") or {}
+        named = [("all", inc.get("test"))] + list((inc.get("subsets") or {}).items())
+        for name, b in named:
+            if b and "delta" in b:
+                d = blocks.setdefault(name, {"comb": {}, "cov": {}})
+                d["comb"][s], d["cov"][s] = b["auroc_combined"], b["auroc_covariates"]
+    return {name: _ci(paired_stats(d["comb"], d["cov"])) for name, d in blocks.items()}
+
+
 def summarize(root: str, tasks: Optional[List[str]], control: str,
               treatment: Optional[str] = None) -> dict:
     tasks = tasks or discover_tasks(root)
-    L = [f"\n{'='*78}", f"SYSTEMIC (OCULOMICS) TARGETS ON mBRSET  --  {root}",
+    L = [f"\n{'='*78}", f"SYSTEMIC (OCULOMICS) TARGETS  --  {root}",
          f"  control={control}" + (f"  treatment={treatment}" if treatment else "") +
          f"  tasks={tasks}", f"{'='*78}"]
     report: Dict[str, dict] = {}
@@ -93,7 +111,7 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
             L.append(f"\n[{task}] no {treatment!r} runs; reporting {control!r} only")
         seeds = sorted(set.intersection(*(set(runs[c]) for c in conds)))
         rec = {"seeds": seeds, "conditions": {}, "paired_image_minus_covariate": {},
-               "paired_treatment_minus_control": None}
+               "paired_incremental": {}, "paired_treatment_minus_control": None}
         L += ["", f"--- {task} ---  paired seeds={seeds}",
               f"  {'condition':<10}{'image AUROC':<20}{'covariate AUROC':<20}{'image-covariate':<18}"
               f"{'prev':>7}{'n_test':>8}"]
@@ -123,6 +141,11 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
                          + "   <- retinal signal beyond age?")
             else:
                 L.append(f"  {c}: no covariate baseline recorded (run with --covariate-baseline)")
+            inc = incremental_by_seed({s: runs[c][s] for s in seeds})
+            rec["paired_incremental"][c] = inc
+            for name, st in inc.items():
+                L.append(_fmt_stats(st, f"{c}: +image vs {feats[c]} [{name}]")
+                         + "   <- does the photo add?")
         if treatment in conds:
             st = paired_stats(rec["conditions"][treatment]["test_auroc"],
                               rec["conditions"][control]["test_auroc"])
@@ -143,9 +166,9 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
     for task, c, im, cm, prev in overview:
         L.append(f"  {task:<24}{c:<10}{im:>12.4f}{(f'{cm:.4f}' if cm == cm else '-'):>10}"
                  f"{(f'{prev:.1%}' if prev is not None else '-'):>8}")
-    L += ["", "NB: in-domain, patient-grouped, smartphone-only. Self-reported / chart",
-          "    comorbidities in a diabetic cohort; AUROC is rank-based, so the prevalence",
-          "    column is context, not a correction. Quote image AND covariate AUROC together."]
+    L += ["", "NB: in-domain, patient-grouped. Self-reported / chart comorbidities; AUROC is",
+          "    rank-based, so the prevalence column is context, not a correction. Quote image",
+          "    AND covariate AUROC together; '+image vs covariates' is the oculomics claim."]
     out = "\n".join(L)
     print(out)
     with open(os.path.join(root, "summary.md"), "w") as f:

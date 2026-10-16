@@ -304,12 +304,12 @@ def patient_flags(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Counter, Dict[str, i
 
 
 # mBRSET's structured yes/no columns that mean the same as a BRSET target, so a
-# model fit on BRSET can be scored on mBRSET's clean labels. Kidney ~ diabetic
-# nephropathy is the loosest match; every mBRSET patient is diabetic.
+# model fit on BRSET can be scored on mBRSET's clean labels. Hypertension only:
+# the first metadata run (lab box, 2026-10-16) scored BRSET-fit kidney models at
+# 0.38-0.43 on mBRSET nephropathy (BRSET's kidney patients are young transplant /
+# CKD cases, not diabetic nephropathy) and MI at 0.44-0.56 from 24 BRSET cases.
 MBRSET_EQUIVALENTS: Dict[str, str] = {
     "cm_hypertension": "systemic_hypertension",
-    "cm_myocardial_infarction": "acute_myocardial_infarction",
-    "cm_kidney": "nephropathy",
 }
 
 

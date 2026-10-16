@@ -119,6 +119,110 @@ def covariate_baseline(train_df: pd.DataFrame, test_df: pd.DataFrame, task: str,
     return out
 
 
+def _logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=np.float64), 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def incremental_value(val_df: pd.DataFrame, val_prob: np.ndarray,
+                      test_df: pd.DataFrame, test_prob: np.ndarray, task: str,
+                      features: Sequence[str] = DEFAULT_FEATURES,
+                      subsets: Optional[Dict[str, np.ndarray]] = None,
+                      n_boot: int = 2000, seed: int = 0) -> Dict[str, object]:
+    """Does the photo add to the covariates? The standard oculomics test.
+
+    Two logistic regressions are fit on the VALIDATION rows -- covariates alone,
+    and covariates + the image model's logit -- and both are scored on the TEST
+    rows. ``delta`` = AUROC(covariates + image) - AUROC(covariates), with a
+    patient-cluster bootstrap 95% CI and the share of resamples where the image
+    adds nothing (``p_no_gain``, one-sided). Fitting both on the same rows with
+    the same method makes the comparison like-for-like; neither model sees a
+    test label. (The image model was checkpoint-selected on these val rows, so
+    its val scores are mildly optimistic: that can only overweight the image
+    term, which the test score would then penalise, not reward.)
+
+    ``*_prob`` are the image model's P(class 1) in the same row order as the
+    frames. ``subsets`` maps a name to a boolean mask over ``test_df`` rows
+    (e.g. non-diabetic DR-grade-0 patients); the same two fitted models are
+    re-scored inside each.
+    """
+    out: Dict[str, object] = {"features": list(features), "reason": None}
+    spec = LABEL_REGISTRY.get(task)
+    if spec is None or spec.num_classes != 2:
+        out["reason"] = f"task {task!r} is not binary"
+        return out
+    missing = [f for f in features if f not in val_df.columns or f not in test_df.columns]
+    if missing:
+        out["reason"] = f"covariate column(s) missing: {missing}"
+        return out
+    if "patient" not in test_df.columns:
+        out["reason"] = "no patient column for the cluster bootstrap"
+        return out
+
+    both = pd.concat([val_df, test_df], axis=0, ignore_index=True)
+    X_all = _feature_matrix(both, features)
+    y_all = _labels(both, task)
+    z_all = _logit(np.concatenate([val_prob, test_prob]))
+    n_v = len(val_df)
+    ok = ~(_isnan_vector(y_all) | np.isnan(X_all).any(1) | np.isnan(z_all))
+    v, t = ok[:n_v], ok[n_v:]
+    Xv, yv, zv = X_all[:n_v][v], y_all[:n_v][v].astype(int), z_all[:n_v][v]
+    Xt, yt, zt = X_all[n_v:][t], y_all[n_v:][t].astype(int), z_all[n_v:][t]
+    groups = test_df["patient"].astype(str).to_numpy()[t]
+    out.update(n_val=int(len(yv)), n_test=int(len(yt)), test_pos=int(yt.sum()),
+               test_pos_patients=int(len(np.unique(groups[yt == 1]))))
+    if len(np.unique(yv)) < 2 or len(np.unique(yt)) < 2:
+        out["reason"] = "single-class val or test rows"
+        return out
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    def fit(X, y):
+        return make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)).fit(X, y)
+
+    cov = fit(Xv, yv)
+    comb = fit(np.column_stack([Xv, zv]), yv)
+    p_cov = cov.predict_proba(Xt)[:, 1]
+    p_comb = comb.predict_proba(np.column_stack([Xt, zt]))[:, 1]
+    out["image_coef_std"] = float(comb[-1].coef_.ravel()[-1])    # per SD of the image logit
+
+    def block(mask: np.ndarray) -> Dict[str, object]:
+        y, g = yt[mask], groups[mask]
+        res: Dict[str, object] = {"n": int(mask.sum()), "pos": int(y.sum()),
+                                  "pos_patients": int(len(np.unique(g[y == 1])))}
+        if len(np.unique(y)) < 2:
+            res["reason"] = "single-class"
+            return res
+        a_cov = float(roc_auc_score(y, p_cov[mask]))
+        a_comb = float(roc_auc_score(y, p_comb[mask]))
+        res.update(auroc_covariates=a_cov, auroc_combined=a_comb,
+                   auroc_image=float(roc_auc_score(y, zt[mask])), delta=a_comb - a_cov)
+        # Patient-cluster bootstrap of the paired delta (both eyes move together).
+        rng = np.random.default_rng(seed)
+        uniq, inv = np.unique(g, return_inverse=True)
+        members = [np.flatnonzero(inv == i) for i in range(len(uniq))]
+        pc, pb = p_cov[mask], p_comb[mask]
+        deltas = []
+        for _ in range(n_boot):
+            idx = np.concatenate([members[i] for i in rng.integers(0, len(uniq), len(uniq))])
+            if len(np.unique(y[idx])) < 2:
+                continue
+            deltas.append(roc_auc_score(y[idx], pb[idx]) - roc_auc_score(y[idx], pc[idx]))
+        if deltas:
+            res["delta_ci"] = [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
+            res["p_no_gain"] = float(np.mean(np.asarray(deltas) <= 0))
+        return res
+
+    out["test"] = block(np.ones(len(yt), dtype=bool))
+    out["subsets"] = {}
+    for name, m in (subsets or {}).items():
+        out["subsets"][name] = block(np.asarray(m, dtype=bool)[t])
+    return out
+
+
 def image_minus_covariate(image_auroc: Optional[float], cb: Dict[str, object]) -> Optional[float]:
     """Paired within-run delta (image model minus covariate baseline); None if
     either side is missing/NaN so summarisers skip it instead of averaging NaN."""

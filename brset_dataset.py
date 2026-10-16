@@ -341,6 +341,43 @@ def resolve_root(root: str, dataset: str, max_depth: int = 5) -> str:
         f"the label CSV and the images/ folder (e.g. the PhysioNet version dir mBRSET/1.0).")
 
 
+# BRSET clinical columns load_brset drops (it keeps only the mBRSET-schema ones)
+# but that are metadata, not image labels.
+BRSET_EXTRA_METADATA = ("diabetes", "nationality")
+
+
+def add_brset_extras(df: pd.DataFrame, csv_path: str, comorbidities: bool = True) -> pd.DataFrame:
+    """BRSET's extra clinical columns (:data:`BRSET_EXTRA_METADATA`) and, with
+    ``comorbidities``, the parsed ``cm_<target>`` labels (brset_comorbidities.py),
+    added to a load_brset table. Shared by metadata_model.py and train_mbrset.py so
+    both read the same targets and covariates."""
+    raw = pd.read_csv(csv_path)
+    out = df.copy()
+    for c in BRSET_EXTRA_METADATA:
+        if c in raw.columns and c not in out.columns and len(raw) == len(out):
+            out[c] = raw[c].to_numpy()
+    if comorbidities:
+        from brset_comorbidities import attach_flags
+        out = attach_flags(out, csv_path)
+    return out
+
+
+def filter_camera(df: pd.DataFrame, camera: Optional[str]) -> pd.DataFrame:
+    """Keep one camera's rows. The BRSET comorbidity audit found histories on 75%
+    of Canon CR patients but 3% of Nikon NF5050 ones, so the systemic cohort is
+    run on one camera and the camera cannot stand in for the label. The metadata
+    model and the image run take the same ``--camera``."""
+    if not camera:
+        return df
+    if "camera" not in df.columns:
+        raise ValueError("--camera given but the table has no camera column")
+    keep = df["camera"].astype(str).str.strip() == camera
+    if not keep.any():
+        raise ValueError(f"--camera {camera!r} matches no rows; cameras present: "
+                         f"{sorted(df['camera'].dropna().astype(str).unique())}")
+    return df.loc[keep].reset_index(drop=True)
+
+
 def load_any(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str, str]:
     """Resolve ``root`` to a (DataFrame, images_dir) pair for any dataset in DATASETS.
 

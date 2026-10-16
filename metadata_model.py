@@ -24,8 +24,8 @@ run so the test splits pair:
         --tasks cm_hypertension cm_heart_disease cm_cardiovascular_event \\
         --out exp_metadata/brset_cm --external-root <mBRSET root> --external-dataset mbrset
 
-``cm_hypertension`` / ``cm_myocardial_infarction`` / ``cm_kidney`` are also scored
-on mBRSET's structured columns (brset_comorbidities.MBRSET_EQUIVALENTS).
+``cm_hypertension`` is also scored on mBRSET's structured hypertension column
+(brset_comorbidities.MBRSET_EQUIVALENTS).
 
 Feature sets (nested, so the table reads left to right as "more chart"):
 
@@ -83,6 +83,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset import (COMORBIDITY_TASKS, LABEL_REGISTRY, SYSTEMIC_TASKS, _binary_flag,  # noqa: E402
                      _isnan_vector, stratified_split)
 from brset_comorbidities import GROUPS as CM_GROUPS, MBRSET_EQUIVALENTS  # noqa: E402
+from brset_dataset import BRSET_EXTRA_METADATA, filter_camera  # noqa: E402,F401  (re-exported)
 
 # --------------------------------------------------------------------------- #
 # Features and targets
@@ -115,41 +116,15 @@ OCULAR_TARGETS = ("dr_referable", "dr_binary", "edema")
 COMORBIDITY_TARGETS = tuple(t for t in COMORBIDITY_TASKS if t != "cm_diabetes")
 DEFAULT_TARGETS = OCULAR_TARGETS + tuple(SYSTEMIC_TASKS) + COMORBIDITY_TARGETS
 
-# BRSET columns load_brset drops (it keeps only the mBRSET-schema ones) but that
-# are clinical metadata, not image labels.
-BRSET_EXTRA_METADATA = ("diabetes", "nationality")
-
-
 def load_table(root: str, dataset: str) -> Tuple[pd.DataFrame, str]:
     """Label CSV in the mBRSET schema, plus BRSET's extra clinical columns and its
-    parsed comorbidity targets (``cm_*``, brset_comorbidities.attach_flags)."""
-    from brset_comorbidities import attach_flags
-    from brset_dataset import load_any
+    parsed comorbidity targets (``cm_*``; brset_dataset.add_brset_extras)."""
+    from brset_dataset import add_brset_extras, load_any
     src = load_any(root, dataset)
     df = src["df"]
     if dataset == "brset":
-        raw = pd.read_csv(src["csv"])
-        for c in BRSET_EXTRA_METADATA:
-            if c in raw.columns and c not in df.columns and len(raw) == len(df):
-                df[c] = raw[c].to_numpy()
-        df = attach_flags(df, src["csv"])
+        df = add_brset_extras(df, src["csv"])
     return df, src["csv"]
-
-
-def filter_camera(df: pd.DataFrame, camera: Optional[str]) -> pd.DataFrame:
-    """Keep one camera's rows. The BRSET comorbidity audit found histories on 75%
-    of Canon CR patients but 3% of Nikon NF5050 ones, so the systemic cohort is
-    run on one camera and the camera cannot stand in for the label. Apply the SAME
-    filter to the image run, or the two test splits are not paired."""
-    if not camera:
-        return df
-    if "camera" not in df.columns:
-        raise ValueError("--camera given but the table has no camera column")
-    keep = df["camera"].astype(str).str.strip() == camera
-    if not keep.any():
-        raise ValueError(f"--camera {camera!r} matches no rows; cameras present: "
-                         f"{sorted(df['camera'].dropna().astype(str).unique())}")
-    return df.loc[keep].reset_index(drop=True)
 
 
 def target_vector(df: pd.DataFrame, task: str) -> np.ndarray:

@@ -2,6 +2,16 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-16 Systemic oculomics: Canon-only image runs and "does the photo add to age+sex?"  (branch `disease/systemic-oculomics`)
+
+- `covariate_baseline.incremental_value`: covariates vs covariates + the image model's logit, both logistic regressions fit on the validation rows and scored on the test rows; AUROC of each, the image alone, the paired delta with a patient-cluster bootstrap CI and `p_no_gain`; re-scored inside named subsets.
+- `train_mbrset.py`: `--camera` (filters `--root` before the split); BRSET runs carry `diabetes`/`nationality` and, for a `cm_*` task, the parsed comorbidity labels (`brset_dataset.add_brset_extras`); `cm_hypertension` is scored on mBRSET's hypertension column as the external test; with `--covariate-baseline` on a binary task the run adds `incremental` (overall and `no_diabetes_dr0`: non-diabetic patients whose worst eye is grade 0). `evaluate(..., return_probs=True)`, `rows_for`, `nodm_dr0_mask`.
+- `brset_dataset.filter_camera` / `add_brset_extras` / `BRSET_EXTRA_METADATA` (moved from metadata_model.py, which re-exports them). `brset_comorbidities.MBRSET_EQUIVALENTS` keeps hypertension only: the metadata run scored BRSET-fit kidney models 0.38–0.43 and MI 0.44–0.56 on mBRSET.
+- `summarize_systemic.py`: per condition, "+image vs covariates" paired by seed for every `incremental` block; title and footnote no longer assume mBRSET.
+- `run_brset_cm.sh`: BRSET `cm_*` targets on one camera (default `cm_hypertension`, `Canon CR`, MobileNetV4-Medium @ 512, 30 epochs, batch 16, EMA 0.999); pre-flight counts positive patients per task on the filtered table and refuses < 50; `PY=` for running from a worktree; `GPU=` per invocation.
+- Measured on the lab box (2026-10-16, `metadata_model.py --camera "Canon CR"`): metadata bars for the cm targets — hypertension 0.742 (age+sex 0.73), heart disease 0.726, cardiovascular event 0.697, thyroid 0.684, dyslipidemia 0.658; the rest have ≤ 7 test-positive patients.
+- `tests/test_incremental.py` (7): a planted image signal is found and a useless one is not, subsets and refusals, row alignment and the no-DM/DR-0 mask, a one-epoch Canon-only `cm_hypertension` run end to end with the mBRSET external test, the summariser's pairing.
+
 ## [Unreleased] — 2026-10-16 Fix: sex coded 1 = male in every dataset  (branch `disease/systemic-oculomics`)
 
 - `brset_dataset._normalise_sex`: BRSET 1/2 -> 1/0 (1 = male), was `- 1` (1 = female). Verified on the real CSV: all 9 "prostatic hyperplasia" patients are BRSET 1 and all 6 "breast cancer" patients 2; mBRSET's code 1 drinks 2.3x and has 1.7x the MI rate, so mBRSET 1 = male. The old rule reversed sex between BRSET and mBRSET.

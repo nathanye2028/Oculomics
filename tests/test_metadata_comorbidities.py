@@ -130,7 +130,7 @@ def test_filter_camera():
 def test_mbrset_equivalents_copy_structured_columns():
     ext = mbrset_equivalents(_mbrset_like(n_patients=20))
     assert (ext["cm_hypertension"] == ext["systemic_hypertension"]).all()
-    assert (ext["cm_kidney"] == ext["nephropathy"]).all()
+    assert "cm_kidney" not in ext.columns            # not equivalent; dropped after the 2026-10-16 run
 
 
 def test_cli_canon_only_comorbidity_baseline_with_mbrset_external(tmp_path):

@@ -58,6 +58,18 @@ them and cost nothing on the DR tasks:
   (``drinit`` vs ``ctrl``) so "does DR pre-training transfer to systemic
   targets" gets the same paired-seed treatment as everything else here.
 
+BRSET comorbidity targets (``cm_*``)
+------------------------------------
+``--dataset brset --task cm_hypertension`` trains on BRSET's free-text history
+(brset_comorbidities.py; patients with no recorded history drop out). Pass
+``--camera "Canon CR"``: histories exist for 75% of Canon CR and 3% of Nikon
+patients, so a two-camera run could learn the camera. With
+``--covariate-baseline`` the run also answers the oculomics question directly
+(``incremental`` in the JSON): age+sex vs age+sex+image score, both fit on the
+validation patients and scored on the test patients, overall and within
+non-diabetic DR-grade-0 patients. ``cm_hypertension`` is scored on mBRSET's own
+hypertension column when ``--external-test-root`` is mBRSET.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -85,6 +97,7 @@ import datetime
 import json
 import os
 import sys
+from typing import Optional
 
 import warnings
 
@@ -102,7 +115,7 @@ from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
-from covariate_baseline import covariate_baseline, image_minus_covariate  # noqa: E402
+from covariate_baseline import covariate_baseline, image_minus_covariate, incremental_value  # noqa: E402
 
 
 class ModelEMA:
@@ -331,8 +344,9 @@ def pick_device() -> torch.device:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes):
-    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader."""
+def evaluate(model, loader, device, num_classes, return_probs: bool = False):
+    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader; with
+    ``return_probs`` also P(class 1) per row, in loader (= dataset) order."""
     model.eval()
     logits_all, y_all = [], []
     for batch in loader:
@@ -354,13 +368,35 @@ def evaluate(model, loader, device, num_classes):
                                    for c in present]))
     except Exception:              # single-class split
         auroc = float("nan")
-    return {
+    metrics = {
         "auroc": auroc,
         "acc": float((pred == y).mean()),
         "f1": float(f1_score(y, pred, average="macro", zero_division=0)),
         "kappa": quadratic_weighted_kappa(pred, y, num_classes),
         "n": int(len(y)),
     }
+    if return_probs:
+        return metrics, (prob[:, 1] if prob.shape[1] == 2 else prob)
+    return metrics
+
+
+def rows_for(ds, df: pd.DataFrame) -> pd.DataFrame:
+    """The label rows behind a dataset, in its order (it drops rows with missing
+    labels / files and keeps only ``ds.files``)."""
+    t = df.assign(file=df["file"].astype(str)).drop_duplicates("file").set_index("file")
+    return t.loc[list(ds.files)].reset_index()
+
+
+def nodm_dr0_mask(rows: pd.DataFrame) -> Optional[np.ndarray]:
+    """Rows of non-diabetic patients whose worst eye is DR grade 0 (both eyes of a
+    patient share a split), or None when the table cannot say. The image cannot
+    be reading diabetic retinopathy inside this group."""
+    if not {"diabetes", "final_icdr", "patient"} <= set(rows.columns):
+        return None
+    from dataset import _binary_flag
+    dm = rows["diabetes"].map(_binary_flag)
+    worst = pd.to_numeric(rows["final_icdr"], errors="coerce").groupby(rows["patient"]).transform("max")
+    return ((dm == 0) & (worst == 0)).to_numpy()
 
 
 def main() -> int:
@@ -452,6 +488,9 @@ def main() -> int:
                    help="CSV (file, split) fixing the train/val/test partition instead of the "
                         "seed-derived one, e.g. <retinareach run>/split_handheld.csv: the per-target "
                         "model is then paired row for row with the RetinaReach probe")
+    p.add_argument("--camera", default=None,
+                   help='Keep only this camera\'s rows of --root before splitting (e.g. "Canon CR" '
+                        'for the BRSET comorbidity targets). The external set is not filtered.')
     p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
                    help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
                         "for the stricter chart-knowledge baseline).")
@@ -482,9 +521,21 @@ def main() -> int:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt = os.path.join(args.ckpt_dir, f"{run_name}.pt")
 
-    from brset_dataset import load_any                      # noqa: E402
+    from brset_dataset import add_brset_extras, filter_camera, load_any   # noqa: E402
+    from dataset import COMORBIDITY_TASKS                                # noqa: E402
     src = load_any(args.root, args.dataset, image_ext=args.image_ext)
     img_dir = src["images_dir"]
+    if args.dataset == "brset":
+        # diabetes / nationality (covariates, the no-DM subset) and, for a cm_* task,
+        # the parsed free-text comorbidity labels.
+        src["df"] = add_brset_extras(src["df"], src["csv"],
+                                     comorbidities=args.task in COMORBIDITY_TASKS)
+    elif args.task in COMORBIDITY_TASKS:
+        raise SystemExit(f"[fatal] {args.task} is a BRSET free-text target; train it with --dataset brset")
+    if args.camera:
+        n0 = len(src["df"])
+        src["df"] = filter_camera(src["df"], args.camera)
+        print(f"[info] camera : {args.camera!r} -- {len(src['df'])} of {n0} rows kept")
 
     # Patient-grouped, label-stratified 70/10/20 split (no patient leakage) --
     # or a fixed partition from --split-file, e.g. RetinaReach's split_handheld.csv,
@@ -510,6 +561,12 @@ def main() -> int:
     if args.external_test_root:
         ext = load_any(args.external_test_root, args.external_test_dataset,
                        image_ext=args.image_ext)
+        if args.task in COMORBIDITY_TASKS:
+            from brset_comorbidities import MBRSET_EQUIVALENTS, mbrset_equivalents
+            if args.external_test_dataset != "mbrset" or args.task not in MBRSET_EQUIVALENTS:
+                raise SystemExit(f"[fatal] {args.task} has no equivalent column on "
+                                 f"{args.external_test_dataset} (brset_comorbidities.MBRSET_EQUIVALENTS)")
+            ext["df"] = mbrset_equivalents(ext["df"])
         ext_ds = mk(ext["df"], "val", ext["images_dir"])
         if ext_ds.num_classes != C:
             raise SystemExit(
@@ -707,7 +764,7 @@ def main() -> int:
           + ("  (AUROC was NaN; accuracy fallback)" if sel_metric == "acc" else ""))
 
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
-    tm = evaluate(model, test_loader, device, C)
+    tm, test_prob = evaluate(model, test_loader, device, C, return_probs=True)
     print(f"\n=== TEST (held-out, best checkpoint @ epoch {best_epoch}) ===")
     print(f"  AUROC={tm['auroc']:.4f}  acc={tm['acc']:.4f}  macroF1={tm['f1']:.4f}  "
           f"kappa={tm['kappa']:.4f}  n={tm['n']}")
@@ -747,6 +804,32 @@ def main() -> int:
                 print(f"  external ({args.external_test_dataset}): covariate AUROC="
                       f"{cb_ext['auroc']:.4f}  image={em['auroc']:.4f}")
 
+    # Does the photo ADD to the covariates? Both models fit on the val patients,
+    # scored on the test patients (covariate_baseline.incremental_value).
+    inc = None
+    if args.covariate_baseline and C == 2:
+        _, val_prob = evaluate(model, val_loader, device, C, return_probs=True)
+        val_rows, test_rows = rows_for(val_ds, splits["val"]), rows_for(test_ds, splits["test"])
+        subsets = {}
+        m = nodm_dr0_mask(test_rows)
+        if m is not None:
+            subsets["no_diabetes_dr0"] = m
+        inc = incremental_value(val_rows, val_prob, test_rows, test_prob, args.task,
+                                features=tuple(args.covariate_features), subsets=subsets,
+                                seed=args.seed)
+        feats = "+".join(args.covariate_features)
+        print(f"\n=== DOES THE PHOTO ADD TO {feats.upper()}? (fit on val, scored on test) ===")
+        if inc["reason"]:
+            print(f"  not computed: {inc['reason']}")
+        for name, b in [("all test patients", inc.get("test"))] + \
+                       [(k, v) for k, v in (inc.get("subsets") or {}).items()]:
+            if not b or "delta" not in b:
+                continue
+            lo, hi = b.get("delta_ci", [float("nan")] * 2)
+            print(f"  {name:<22} {feats}={b['auroc_covariates']:.4f}  +image={b['auroc_combined']:.4f}  "
+                  f"delta={b['delta']:+.4f} [{lo:+.4f}, {hi:+.4f}]  image alone={b['auroc_image']:.4f}  "
+                  f"({b['pos_patients']} positive patients)")
+
     # Positive-class counts (binary tasks) so a summariser can derive the two
     # prevalences from the run itself instead of hardcoding them.
     def _pos(ds):
@@ -769,6 +852,8 @@ def main() -> int:
               "split_file": os.path.abspath(args.split_file) if args.split_file else None,
               "covariate_baseline": cb,
               "covariate_baseline_external": cb_ext,
+              "incremental": inc,
+              "camera": args.camera,
               "image_minus_covariate_auroc": image_minus_covariate(tm["auroc"], cb) if cb else None,
               "backbone": args.backbone, "teacher": args.teacher,
               "teacher_ckpt": os.path.abspath(args.teacher) if args.teacher else None,
