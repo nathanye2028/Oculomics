@@ -303,6 +303,52 @@ def patient_flags(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Counter, Dict[str, i
     return pd.DataFrame(rows), unmapped, stats
 
 
+# mBRSET's structured yes/no columns that mean the same as a BRSET target, so a
+# model fit on BRSET can be scored on mBRSET's clean labels. Kidney ~ diabetic
+# nephropathy is the loosest match; every mBRSET patient is diabetic.
+MBRSET_EQUIVALENTS: Dict[str, str] = {
+    "cm_hypertension": "systemic_hypertension",
+    "cm_myocardial_infarction": "acute_myocardial_infarction",
+    "cm_kidney": "nephropathy",
+}
+
+
+def attach_flags(df: pd.DataFrame, csv_path: str) -> pd.DataFrame:
+    """Add the patient-level ``cm_<target>`` columns to an image-level BRSET table
+    in the mBRSET schema (``brset_dataset.load_brset``: ``patient`` column).
+
+    Joined on the patient id as text (load_brset reads it as int, the parser as
+    str). A join that matches fewer than 99% of rows raises instead of filling
+    the rest with NaN, which would look exactly like "history not recorded".
+    """
+    raw = read_brset_csv(csv_path)
+    if "comorbidities" not in raw.columns:
+        print(f"[warn] {csv_path} has no comorbidities column; no cm_* targets", file=sys.stderr)
+        return df
+    pf, _, _ = patient_flags(raw)
+    cols = [f"cm_{g}" for g in GROUPS]
+    lut = pf.set_index(pf["patient_id"].astype(str))[cols]
+    key = df["patient"].astype(str)
+    matched = float(key.isin(lut.index).mean()) if len(key) else 1.0
+    if matched < 0.99:
+        raise ValueError(f"comorbidity join matched only {matched:.1%} of BRSET rows on patient id; "
+                         f"e.g. table {list(key.head(3))} vs parser {list(lut.index[:3])}")
+    out = df.copy()
+    joined = lut.reindex(key.to_numpy())
+    for c in cols:
+        out[c] = joined[c].to_numpy()
+    return out
+
+
+def mbrset_equivalents(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy mBRSET's structured columns under the BRSET target names."""
+    out = df.copy()
+    for cm, col in MBRSET_EQUIVALENTS.items():
+        if col in out.columns:
+            out[cm] = out[col]
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Statistics
 # --------------------------------------------------------------------------- #

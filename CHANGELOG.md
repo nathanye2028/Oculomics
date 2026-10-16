@@ -2,6 +2,13 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-16 Systemic oculomics: metadata baselines for the BRSET comorbidity targets  (branch `disease/systemic-oculomics`)
+
+- `dataset.py`: `COMORBIDITY_TASKS` — every `brset_comorbidities.GROUPS` target registered as `cm_<target>` (0/1, NaN when no history was recorded), so the metadata model and the image trainer read the same labels.
+- `brset_comorbidities.attach_flags` joins the patient-level flags onto the image-level BRSET table (patient id as text; refuses a join matching < 99% of rows); `MBRSET_EQUIVALENTS` / `mbrset_equivalents` map `cm_hypertension`, `cm_myocardial_infarction`, `cm_kidney` to mBRSET's structured columns.
+- `metadata_model.py`: BRSET tables carry the `cm_*` targets (default target list, `cm_diabetes` excluded); `--camera` keeps one camera's rows of the primary table (the audit found histories for 75% of Canon CR vs 3% of Nikon NF5050 patients); `cm_diabetes` bans the diabetes / treatment columns as proxies; the `full` set of a comorbidity target adds the other `cm_*` flags except any group sharing a condition with it; comorbidity targets with an mBRSET equivalent are scored on mBRSET.
+- `tests/test_metadata_comorbidities.py` (7): registration, the join, feature rules, the camera filter, and a Canon-only end-to-end run scored on an mBRSET-like table.
+
 ## [Unreleased] — 2026-10-15 Systemic oculomics: BRSET comorbidities  (branch `disease/systemic-oculomics`)
 
 - `brset_comorbidities.py`: BRSET's free-text `comorbidities` column parsed into per-patient flags — `atom_<condition>` (54 conditions; vocabulary written against the real CSV's strings and the first lab-box audit's unmapped list, misspellings and Portuguese spellings included) and `cm_<target>` groups (hypertension, diabetes, dyslipidemia, heart disease, MI, stroke, cardiovascular event, kidney, neurodegenerative, Alzheimer's, brain_any, autoimmune, antimalarial use, thyroid). `na` is missing (NaN), never negative; `0` is recorded-none; unmapped items are listed, not dropped. Audit: coverage, who has a recorded history (by camera, age band, sex, diabetes, worst DR grade) with an adjusted camera odds ratio, free text vs BRSET's own `diabetes` column, and per target the size, age gap, prevalence by camera and an age/sex/diabetes-adjusted camera odds ratio (flagged when its CI excludes 1). numpy-only logistic regression (no statsmodels). Outputs `brset_comorbidity_flags.csv`, `comorbidity_audit.md`, `comorbidity_audit.json`.

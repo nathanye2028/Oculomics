@@ -14,6 +14,19 @@ one, per target, before any GPU time is spent:
     python metadata_model.py --dataset brset  --root <BRSET root>  --out exp_metadata/brset \\
         --external-root <mBRSET root> --external-dataset mbrset
 
+BRSET's free-text comorbidities are targets too (``cm_hypertension``,
+``cm_heart_disease``, ... from brset_comorbidities.py; NaN where no history was
+taken). Histories were recorded for 75% of Canon CR patients and 3% of Nikon
+ones, so run them on one camera -- and pass the same ``--camera`` to the image
+run so the test splits pair:
+
+    python metadata_model.py --dataset brset --root <BRSET root> --camera "Canon CR" \\
+        --tasks cm_hypertension cm_heart_disease cm_cardiovascular_event \\
+        --out exp_metadata/brset_cm --external-root <mBRSET root> --external-dataset mbrset
+
+``cm_hypertension`` / ``cm_myocardial_infarction`` / ``cm_kidney`` are also scored
+on mBRSET's structured columns (brset_comorbidities.MBRSET_EQUIVALENTS).
+
 Feature sets (nested, so the table reads left to right as "more chart"):
 
     age_sex    age, sex                                   -- what the photo itself encodes
@@ -67,7 +80,9 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import LABEL_REGISTRY, SYSTEMIC_TASKS, _binary_flag, _isnan_vector, stratified_split  # noqa: E402
+from dataset import (COMORBIDITY_TASKS, LABEL_REGISTRY, SYSTEMIC_TASKS, _binary_flag,  # noqa: E402
+                     _isnan_vector, stratified_split)
+from brset_comorbidities import GROUPS as CM_GROUPS, MBRSET_EQUIVALENTS  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Features and targets
@@ -89,10 +104,16 @@ FEATURE_SETS: Dict[str, Tuple[str, ...]] = {
 # (The target's own source column is always excluded; these are the proxies.)
 PROXIES: Dict[str, Tuple[str, ...]] = {
     "insulin": ("insulin_time",),
+    # BRSET's diabetes column is derived from the same free text (audit 2026-10-15:
+    # 1,346/1,346 agreement), and the treatment fields only exist for diabetics.
+    "cm_diabetes": ("diabetes", "dm_time", "insulin", "insulin_time", "oraltreatment_dm"),
 }
 
 OCULAR_TARGETS = ("dr_referable", "dr_binary", "edema")
-DEFAULT_TARGETS = OCULAR_TARGETS + tuple(SYSTEMIC_TASKS)
+# BRSET comorbidity targets (brset_comorbidities.py). cm_diabetes is left out of the
+# default list: from metadata it is the diabetes column restated.
+COMORBIDITY_TARGETS = tuple(t for t in COMORBIDITY_TASKS if t != "cm_diabetes")
+DEFAULT_TARGETS = OCULAR_TARGETS + tuple(SYSTEMIC_TASKS) + COMORBIDITY_TARGETS
 
 # BRSET columns load_brset drops (it keeps only the mBRSET-schema ones) but that
 # are clinical metadata, not image labels.
@@ -100,7 +121,9 @@ BRSET_EXTRA_METADATA = ("diabetes", "nationality")
 
 
 def load_table(root: str, dataset: str) -> Tuple[pd.DataFrame, str]:
-    """Label CSV in the mBRSET schema, plus BRSET's extra clinical columns."""
+    """Label CSV in the mBRSET schema, plus BRSET's extra clinical columns and its
+    parsed comorbidity targets (``cm_*``, brset_comorbidities.attach_flags)."""
+    from brset_comorbidities import attach_flags
     from brset_dataset import load_any
     src = load_any(root, dataset)
     df = src["df"]
@@ -109,7 +132,24 @@ def load_table(root: str, dataset: str) -> Tuple[pd.DataFrame, str]:
         for c in BRSET_EXTRA_METADATA:
             if c in raw.columns and c not in df.columns and len(raw) == len(df):
                 df[c] = raw[c].to_numpy()
+        df = attach_flags(df, src["csv"])
     return df, src["csv"]
+
+
+def filter_camera(df: pd.DataFrame, camera: Optional[str]) -> pd.DataFrame:
+    """Keep one camera's rows. The BRSET comorbidity audit found histories on 75%
+    of Canon CR patients but 3% of Nikon NF5050 ones, so the systemic cohort is
+    run on one camera and the camera cannot stand in for the label. Apply the SAME
+    filter to the image run, or the two test splits are not paired."""
+    if not camera:
+        return df
+    if "camera" not in df.columns:
+        raise ValueError("--camera given but the table has no camera column")
+    keep = df["camera"].astype(str).str.strip() == camera
+    if not keep.any():
+        raise ValueError(f"--camera {camera!r} matches no rows; cameras present: "
+                         f"{sorted(df['camera'].dropna().astype(str).unique())}")
+    return df.loc[keep].reset_index(drop=True)
 
 
 def target_vector(df: pd.DataFrame, task: str) -> np.ndarray:
@@ -120,10 +160,27 @@ def target_vector(df: pd.DataFrame, task: str) -> np.ndarray:
                      for row in df[list(spec.source_cols)].to_numpy()], dtype=np.float64)
 
 
+def _comorbidity_extras(task: str, columns: Sequence[str]) -> List[str]:
+    """For a BRSET comorbidity target, the other ``cm_*`` flags as "rest of the
+    chart" features -- except any group sharing a condition with the target
+    (cm_heart_disease never sees cm_cardiovascular_event or cm_myocardial_infarction)
+    and cm_diabetes (the diabetes column again)."""
+    if task not in COMORBIDITY_TASKS:
+        return []
+    mine = set(CM_GROUPS[task[3:]])
+    return [c for c in columns
+            if c.startswith("cm_") and c != task and c != "cm_diabetes"
+            and c[3:] in CM_GROUPS and not (set(CM_GROUPS[c[3:]]) & mine)]
+
+
 def features_for(task: str, feature_set: str, columns: Sequence[str]) -> List[str]:
-    """Columns of ``feature_set`` present in ``columns``, minus the target and its proxies."""
+    """Columns of ``feature_set`` present in ``columns``, minus the target and its proxies.
+    The ``full`` set of a BRSET comorbidity target adds the non-overlapping ``cm_*`` flags."""
     banned = set(LABEL_REGISTRY[task].source_cols) | set(PROXIES.get(task, ()))
-    return [c for c in FEATURE_SETS[feature_set] if c in columns and c not in banned]
+    feats = [c for c in FEATURE_SETS[feature_set] if c in columns and c not in banned]
+    if feature_set == "full":
+        feats += [c for c in _comorbidity_extras(task, columns) if c not in banned]
+    return feats
 
 
 def _column_kind(s: pd.Series) -> str:
@@ -455,14 +512,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--n-shuffle", type=int, default=20, help="label permutations for the negative control")
     p.add_argument("--external-root", default=None)
     p.add_argument("--external-dataset", choices=["mbrset", "brset"], default=None)
+    p.add_argument("--camera", default=None,
+                   help='keep only this camera\'s rows of the primary table (e.g. "Canon CR"); '
+                        'use the same filter for the paired image run')
     a = p.parse_args(argv)
 
     df, csv = load_table(a.root, a.dataset)
+    n_before = len(df)
+    df = filter_camera(df, a.camera)
+    if a.camera:
+        print(f"camera filter {a.camera!r}: {len(df)} of {n_before} rows kept")
     ext = None
     if a.external_root:
         if not a.external_dataset:
             p.error("--external-root needs --external-dataset")
         ext, _ = load_table(a.external_root, a.external_dataset)
+        if a.external_dataset == "mbrset":
+            from brset_comorbidities import mbrset_equivalents
+            ext = mbrset_equivalents(ext)
     tasks = a.tasks or [t for t in DEFAULT_TARGETS
                         if all(c in df.columns for c in LABEL_REGISTRY[t].source_cols)]
     print(f"{a.dataset}: {csv}  ({len(df)} rows, {df['patient'].nunique()} patients)")
@@ -480,7 +547,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     cv_repeats=a.cv_repeats,
                                     min_test_pos_patients=a.min_test_pos_patients,
                                     n_shuffle=a.n_shuffle,
-                                    external=ext if task in OCULAR_TARGETS else None)
+                                    external=ext if (task in OCULAR_TARGETS
+                                                     or task in MBRSET_EQUIVALENTS) else None)
                 results.append(r)
                 t = r.get("test") or {}
                 print(f"  {task:<22} {fs:<9} {mk:<6} test AUROC "

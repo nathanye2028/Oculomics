@@ -253,6 +253,21 @@ for _task, (_col, _desc) in SYSTEMIC_TASKS.items():
     LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
 
 
+# BRSET's systemic targets, parsed from its free-text ``comorbidities`` field by
+# brset_comorbidities.py and joined per patient (brset_comorbidities.attach_flags):
+# 0/1, NaN when no history was recorded -- so drop_missing_labels keeps only the
+# recorded patients. ``cm_hypertension`` is NOT the mBRSET ``hypertension`` task:
+# different source, different cohort (see brset_comorbidities.MBRSET_EQUIVALENTS).
+from brset_comorbidities import GROUPS as _CM_GROUPS          # noqa: E402
+
+COMORBIDITY_TASKS: Dict[str, Tuple[str, str]] = {
+    f"cm_{g}": (f"cm_{g}", f"BRSET comorbidity, free text: {g.replace('_', ' ')} (yes/no).")
+    for g in _CM_GROUPS
+}
+for _task, (_col, _desc) in COMORBIDITY_TASKS.items():
+    LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
+
+
 # ----------------------------------------------------------------------------- #
 # Transform factory
 # ----------------------------------------------------------------------------- #
