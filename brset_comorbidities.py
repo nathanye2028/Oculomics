@@ -232,12 +232,12 @@ def _yes_no(v) -> float:
 
 
 def _sex01(sex: Optional[pd.Series]) -> float:
-    """BRSET codes sex 1/2; brset_dataset re-codes to 0/1 by subtracting 1. Same
-    rule here, applied only to 1/2 so an already-0/1 release passes through."""
+    """BRSET sex 1 = male / 2 = female -> 1 / 0, the rule brset_dataset uses
+    (1 = male in every dataset). Applied only to 1/2, so 0/1 passes through."""
     if sex is None or not sex.notna().any():
         return np.nan
     v = float(sex.dropna().iloc[0])
-    return v - 1 if v in (1.0, 2.0) else v
+    return {1.0: 1.0, 2.0: 0.0}.get(v, v)
 
 
 def read_brset_csv(path: str) -> pd.DataFrame:

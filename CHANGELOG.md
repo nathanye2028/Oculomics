@@ -2,6 +2,13 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-16 Fix: sex coded 1 = male in every dataset  (branch `disease/systemic-oculomics`)
+
+- `brset_dataset._normalise_sex`: BRSET 1/2 -> 1/0 (1 = male), was `- 1` (1 = female). Verified on the real CSV: all 9 "prostatic hyperplasia" patients are BRSET 1 and all 6 "breast cancer" patients 2; mBRSET's code 1 drinks 2.3x and has 1.7x the MI rate, so mBRSET 1 = male. The old rule reversed sex between BRSET and mBRSET.
+- `public_fundus.load_odir`: Male -> 1, Female -> 0 (was the reverse). PAPILA's Gender is still passed through raw and is marked unverified.
+- `brset_comorbidities._sex01` follows the same rule. Test `test_sex_is_one_for_male_in_every_adapter` pins it.
+- Affected: only models with a sex input fit on one dataset and scored on another (`metadata_model.py` external rows, `train_mbrset.py --covariate-baseline` external line). None of the reported runs did that — the systemic, RetinaReach and age-gap analyses fit and score sex within one dataset. Other branches still carry the old rule.
+
 ## [Unreleased] — 2026-10-16 Systemic oculomics: metadata baselines for the BRSET comorbidity targets  (branch `disease/systemic-oculomics`)
 
 - `dataset.py`: `COMORBIDITY_TASKS` — every `brset_comorbidities.GROUPS` target registered as `cm_<target>` (0/1, NaN when no history was recorded), so the metadata model and the image trainer read the same labels.

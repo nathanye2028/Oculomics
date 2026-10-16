@@ -275,6 +275,8 @@ def load_papila(root: str, image_ext: str = ".jpg", papila_suspect: str = "exclu
             lab = {0: 0.0, 1: 1.0}.get(int(d) if d == d else -1, np.nan)
             if d == 2:
                 lab = {"exclude": np.nan, "positive": 1.0, "negative": 0.0}[papila_suspect]
+            # Gender passed through raw: NOT checked against the 1 = male convention
+            # the other adapters use. Verify before using sex across datasets.
             rows.append({"file": file, "patient": digits, "laterality": lat, "glaucoma": lab,
                          "age": r[ac] if ac else np.nan, "sex": r[gc] if gc else np.nan,
                          "papila_diagnosis": d})
@@ -361,7 +363,7 @@ def load_odir(root: str, image_ext: str = ".jpg") -> Dict[str, object]:
     lkw, rkw = _col(t, "Left-Diagnostic Keywords"), _col(t, "Right-Diagnostic Keywords")
     if lkw is None or rkw is None:
         raise KeyError(f"ODIR-5K {csv}: need Left-/Right-Diagnostic Keywords; found {list(t.columns)}")
-    sex_map = {"male": 0.0, "female": 1.0, "m": 0.0, "f": 1.0}
+    sex_map = {"male": 1.0, "female": 0.0, "m": 1.0, "f": 0.0}    # 1 = male, as mBRSET / BRSET
     rows = []
     fnc = _col(t, "filename")
     for _, r in t.iterrows():

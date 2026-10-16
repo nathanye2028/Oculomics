@@ -100,7 +100,7 @@ def test_patient_consolidation_keeps_unrecorded_nan():
     assert pf.loc["3", "cm_hypertension"] == 0 and pf.loc["3", "recorded"] == 1
     assert pf.loc["4", "cm_hypertension"] == 1 and pf.loc["4", "cm_diabetes"] == 1
     assert stats["inconsistent_history"] == 1          # patient 4 only; "na" is not a history
-    assert pf.loc["1", "sex"] == 0 and pf.loc["2", "sex"] == 1
+    assert pf.loc["1", "sex"] == 1 and pf.loc["2", "sex"] == 0     # BRSET 1 = male -> 1
     assert pf.loc["4", "diabetes_col"] == 1 and pf.loc["1", "diabetes_col"] == 0
     assert not unmapped
 

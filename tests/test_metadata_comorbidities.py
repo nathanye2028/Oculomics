@@ -52,6 +52,25 @@ def _write_brset(tmp_path, **kw):
     return tmp_path / "BRSET", d / "labels_brset.csv"
 
 
+def test_sex_is_one_for_male_in_every_adapter(tmp_path):
+    """mBRSET's raw 1 = male is the convention; BRSET (1 = male, 2 = female per the
+    real CSV's prostate / breast-cancer patients) and ODIR ("Male"/"Female") must
+    be recoded to match, or a sex coefficient fit on one dataset reverses on another."""
+    from brset_comorbidities import _sex01
+    from brset_dataset import _normalise_sex, load_any
+    assert _normalise_sex(pd.Series([1, 2], dtype=float)).tolist() == [1.0, 0.0]
+    assert _sex01(pd.Series([1.0])) == 1.0 and _sex01(pd.Series([2.0])) == 0.0
+    (tmp_path / "preprocessed_images").mkdir()
+    pd.DataFrame({"ID": [1, 1, 2, 2], "Patient Age": [60, 60, 50, 50],
+                  "Patient Sex": ["Male", "Male", "Female", "Female"],
+                  "Left-Diagnostic Keywords": ["normal fundus"] * 4,
+                  "Right-Diagnostic Keywords": ["normal fundus"] * 4,
+                  "filename": ["1_left.jpg", "1_right.jpg", "2_left.jpg", "2_right.jpg"]}
+                 ).to_csv(tmp_path / "full_df.csv", index=False)
+    odir = load_any(str(tmp_path), "odir")["df"].set_index("file")
+    assert odir.loc["1_left.jpg", "sex"] == 1.0 and odir.loc["2_left.jpg", "sex"] == 0.0
+
+
 def test_comorbidity_tasks_registered_nan_safe():
     spec = LABEL_REGISTRY["cm_hypertension"]
     assert spec.source_cols == ("cm_hypertension",)
