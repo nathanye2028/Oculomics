@@ -146,18 +146,38 @@ def incremental_value(val_df: pd.DataFrame, val_prob: np.ndarray,
     (e.g. non-diabetic DR-grade-0 patients); the same two fitted models are
     re-scored inside each.
     """
+    out, fit = _fit_incremental(val_df, val_prob, test_df, test_prob, task, features)
+    if fit is None:
+        return out
+    n = len(fit["y"])
+    out["test"] = incremental_block(fit["y"], fit["groups"], fit["p_cov"], fit["p_comb"], fit["z"],
+                                    np.ones(n, dtype=bool), n_boot=n_boot, seed=seed)
+    out["subsets"] = {}
+    for name, m in (subsets or {}).items():
+        out["subsets"][name] = incremental_block(fit["y"], fit["groups"], fit["p_cov"], fit["p_comb"],
+                                                 fit["z"], np.asarray(m, dtype=bool)[fit["keep"]],
+                                                 n_boot=n_boot, seed=seed)
+    return out
+
+
+def _fit_incremental(val_df: pd.DataFrame, val_prob: np.ndarray, test_df: pd.DataFrame,
+                     test_prob: np.ndarray, task: str, features: Sequence[str]):
+    """The two logistic models of :func:`incremental_value`, fit on the val rows
+    and scored on the test rows. Returns ``(out, fit)``: ``out`` holds the counts
+    (or a ``reason``); ``fit`` the kept test rows' arrays, or None when the
+    comparison cannot be made."""
     out: Dict[str, object] = {"features": list(features), "reason": None}
     spec = LABEL_REGISTRY.get(task)
     if spec is None or spec.num_classes != 2:
         out["reason"] = f"task {task!r} is not binary"
-        return out
+        return out, None
     missing = [f for f in features if f not in val_df.columns or f not in test_df.columns]
     if missing:
         out["reason"] = f"covariate column(s) missing: {missing}"
-        return out
+        return out, None
     if "patient" not in test_df.columns:
         out["reason"] = "no patient column for the cluster bootstrap"
-        return out
+        return out, None
 
     both = pd.concat([val_df, test_df], axis=0, ignore_index=True)
     X_all = _feature_matrix(both, features)
@@ -173,10 +193,9 @@ def incremental_value(val_df: pd.DataFrame, val_prob: np.ndarray,
                test_pos_patients=int(len(np.unique(groups[yt == 1]))))
     if len(np.unique(yv)) < 2 or len(np.unique(yt)) < 2:
         out["reason"] = "single-class val or test rows"
-        return out
+        return out, None
 
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -185,41 +204,60 @@ def incremental_value(val_df: pd.DataFrame, val_prob: np.ndarray,
 
     cov = fit(Xv, yv)
     comb = fit(np.column_stack([Xv, zv]), yv)
-    p_cov = cov.predict_proba(Xt)[:, 1]
-    p_comb = comb.predict_proba(np.column_stack([Xt, zt]))[:, 1]
     out["image_coef_std"] = float(comb[-1].coef_.ravel()[-1])    # per SD of the image logit
+    return out, {"keep": t, "y": yt, "z": zt, "groups": groups,
+                 "p_cov": cov.predict_proba(Xt)[:, 1],
+                 "p_comb": comb.predict_proba(np.column_stack([Xt, zt]))[:, 1]}
 
-    def block(mask: np.ndarray) -> Dict[str, object]:
-        y, g = yt[mask], groups[mask]
-        res: Dict[str, object] = {"n": int(mask.sum()), "pos": int(y.sum()),
-                                  "pos_patients": int(len(np.unique(g[y == 1])))}
-        if len(np.unique(y)) < 2:
-            res["reason"] = "single-class"
-            return res
-        a_cov = float(roc_auc_score(y, p_cov[mask]))
-        a_comb = float(roc_auc_score(y, p_comb[mask]))
-        res.update(auroc_covariates=a_cov, auroc_combined=a_comb,
-                   auroc_image=float(roc_auc_score(y, zt[mask])), delta=a_comb - a_cov)
-        # Patient-cluster bootstrap of the paired delta (both eyes move together).
-        rng = np.random.default_rng(seed)
-        uniq, inv = np.unique(g, return_inverse=True)
-        members = [np.flatnonzero(inv == i) for i in range(len(uniq))]
-        pc, pb = p_cov[mask], p_comb[mask]
-        deltas = []
-        for _ in range(n_boot):
-            idx = np.concatenate([members[i] for i in rng.integers(0, len(uniq), len(uniq))])
-            if len(np.unique(y[idx])) < 2:
-                continue
-            deltas.append(roc_auc_score(y[idx], pb[idx]) - roc_auc_score(y[idx], pc[idx]))
-        if deltas:
-            res["delta_ci"] = [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
-            res["p_no_gain"] = float(np.mean(np.asarray(deltas) <= 0))
+
+def incremental_block(y: np.ndarray, groups: np.ndarray, p_cov: np.ndarray, p_comb: np.ndarray,
+                      z: np.ndarray, mask: np.ndarray, n_boot: int = 2000,
+                      seed: int = 0) -> Dict[str, object]:
+    """AUROC of covariates alone, covariates + image and the image score alone on
+    the ``mask`` rows; ``delta`` (combined minus covariates) with a patient-cluster
+    bootstrap 95 % CI (both eyes move together) and ``p_no_gain``. Shared by one
+    run's test split and by folds pooled out of fold (summarize_systemic.py)."""
+    from sklearn.metrics import roc_auc_score
+    mask = np.asarray(mask, dtype=bool)
+    yy, g = np.asarray(y)[mask].astype(int), np.asarray(groups).astype(str)[mask]
+    res: Dict[str, object] = {"n": int(mask.sum()), "pos": int(yy.sum()),
+                              "pos_patients": int(len(np.unique(g[yy == 1])))}
+    if len(np.unique(yy)) < 2:
+        res["reason"] = "single-class"
         return res
+    pc, pb = np.asarray(p_cov)[mask], np.asarray(p_comb)[mask]
+    a_cov = float(roc_auc_score(yy, pc))
+    a_comb = float(roc_auc_score(yy, pb))
+    res.update(auroc_covariates=a_cov, auroc_combined=a_comb,
+               auroc_image=float(roc_auc_score(yy, np.asarray(z)[mask])), delta=a_comb - a_cov)
+    rng = np.random.default_rng(seed)
+    uniq, inv = np.unique(g, return_inverse=True)
+    members = [np.flatnonzero(inv == i) for i in range(len(uniq))]
+    deltas = []
+    for _ in range(n_boot):
+        idx = np.concatenate([members[i] for i in rng.integers(0, len(uniq), len(uniq))])
+        if len(np.unique(yy[idx])) < 2:
+            continue
+        deltas.append(roc_auc_score(yy[idx], pb[idx]) - roc_auc_score(yy[idx], pc[idx]))
+    if deltas:
+        res["delta_ci"] = [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
+        res["p_no_gain"] = float(np.mean(np.asarray(deltas) <= 0))
+    return res
 
-    out["test"] = block(np.ones(len(yt), dtype=bool))
-    out["subsets"] = {}
-    for name, m in (subsets or {}).items():
-        out["subsets"][name] = block(np.asarray(m, dtype=bool)[t])
+
+def incremental_rows(val_df: pd.DataFrame, val_prob: np.ndarray, test_df: pd.DataFrame,
+                     test_prob: np.ndarray, task: str,
+                     features: Sequence[str] = DEFAULT_FEATURES) -> pd.DataFrame:
+    """Per test row, the two fitted models' probabilities (``p_covariates``,
+    ``p_combined``) in ``test_df`` order, NaN where a row has no label or a
+    covariate is missing, or where :func:`incremental_value` would refuse. Written
+    per fold, so folds can be pooled out of fold."""
+    out = pd.DataFrame({"p_covariates": np.nan, "p_combined": np.nan}, index=range(len(test_df)))
+    _, fit = _fit_incremental(val_df, val_prob, test_df, test_prob, task, features)
+    if fit is not None:
+        keep = np.flatnonzero(fit["keep"])
+        out.loc[keep, "p_covariates"] = fit["p_cov"]
+        out.loc[keep, "p_combined"] = fit["p_comb"]
     return out
 
 

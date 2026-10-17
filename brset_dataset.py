@@ -293,6 +293,30 @@ def load_brset(
     return out
 
 
+# BRSET's ophthalmic findings beyond DR and edema (raw CSV names; the retinal-age
+# track's PATHOLOGY_COLS). They travel as ``flag_<name>``: the prefix keeps them out
+# of every LABEL_REGISTRY task and every metadata feature set, so they can only
+# define subsets such as "normal-looking eyes", never become a target or a feature.
+BRSET_EYE_FLAGS = ("hypertensive_retinopathy", "vascular_occlusion", "hemorrhage", "amd",
+                   "drusens", "increased_cup_disc", "myopic_fundus", "retinal_detachment",
+                   "scar", "nevus")
+
+
+def add_brset_eye_flags(df: pd.DataFrame, csv_path: str) -> pd.DataFrame:
+    """The :data:`BRSET_EYE_FLAGS` columns of the raw CSV, as ``flag_<name>``, added
+    to a load_brset table (same rows, same order). A release without a column
+    simply lacks that flag; callers treat a missing flag as unknown, not clear."""
+    raw = pd.read_csv(csv_path)
+    out = df.copy()
+    if len(raw) != len(out):
+        raise ValueError(f"{csv_path}: {len(raw)} rows but the table has {len(out)}; "
+                         f"pass a load_brset table built from this CSV")
+    for c in BRSET_EYE_FLAGS:
+        if c in raw.columns:
+            out[f"flag_{c}"] = raw[c].to_numpy()
+    return out
+
+
 # Every dataset a trainer / scorer can name: the two Brazilian sets plus the public
 # sets adapted in public_fundus.py (ODIR-5K is the retinal-age clock's auxiliary
 # training set; the glaucoma / AMD branch scores on the others).

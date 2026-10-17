@@ -20,6 +20,13 @@ Two paired questions per task, both paired by seed (same patient split):
    AUROC (default drinit vs ctrl). Optional -- with ``--control`` alone the
    script only answers question 1.
 
+Fold runs (``train_mbrset.py --fold K``, ``<cond>_fold<K>_seed<n>.json`` plus their
+``_test.csv`` rows) are pooled OUT OF FOLD instead: once every fold of a seed is
+present, each labelled patient has exactly one score from a model that never saw
+them, and question 1's sharp version is answered on all of them at once, overall
+and per before-lesions subset, with a patient-cluster bootstrap CI. Several
+complete seeds are then paired like any other runs.
+
     python summarize_systemic.py --dir exp_systemic --treatment drinit --control ctrl
     python summarize_systemic.py --dir exp_systemic --tasks hypertension --control ctrl
 """
@@ -29,18 +36,28 @@ import argparse
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 from typing import Dict, List, Optional
 
+import numpy as np
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_experiment import paired_stats          # noqa: E402  (same statistics as every other experiment)
+from covariate_baseline import incremental_block  # noqa: E402
+
+_FOLD_RUN = re.compile(r"^(?P<cond>.+)_fold(?P<fold>\d+)_seed(?P<seed>\d+)\.json$")
 
 
 def load_task(d: str) -> Dict[str, Dict[int, dict]]:
-    """{condition: {seed: record}} from <d>/<cond>_seed<n>.json."""
+    """{condition: {seed: record}} from <d>/<cond>_seed<n>.json (fold runs excluded:
+    see :func:`load_folds`)."""
     out: Dict[str, Dict[int, dict]] = {}
     for p in sorted(glob.glob(os.path.join(d, "*_seed*.json"))):
+        if _FOLD_RUN.match(os.path.basename(p)):
+            continue
         base = os.path.basename(p)[: -len(".json")]
         cond, _, seed = base.rpartition("_seed")
         try:
@@ -50,6 +67,97 @@ def load_task(d: str) -> Dict[str, Dict[int, dict]]:
         with open(p) as f:
             out.setdefault(cond, {})[seed] = json.load(f)
     return out
+
+
+def load_folds(d: str) -> Dict[str, Dict[int, Dict[int, dict]]]:
+    """{condition: {seed: {fold: record}}} from <d>/<cond>_fold<k>_seed<n>.json; each
+    record gains ``_path`` so its test rows can be found next to it."""
+    out: Dict[str, Dict[int, Dict[int, dict]]] = {}
+    for p in sorted(glob.glob(os.path.join(d, "*_fold*_seed*.json"))):
+        m = _FOLD_RUN.match(os.path.basename(p))
+        if not m:
+            continue
+        with open(p) as f:
+            rec = json.load(f)
+        rec["_path"] = p
+        out.setdefault(m["cond"], {}).setdefault(int(m["seed"]), {})[int(m["fold"])] = rec
+    return out
+
+
+def _fold_rows(rec: dict) -> Optional[pd.DataFrame]:
+    """A fold run's test rows: the recorded predictions_csv, else the ``_test.csv``
+    beside its JSON (results copied off the machine that wrote them)."""
+    for p in (rec.get("predictions_csv"), os.path.splitext(rec["_path"])[0] + "_test.csv"):
+        if p and os.path.isfile(p):
+            return pd.read_csv(p)
+    return None
+
+
+def pooled_out_of_fold(by_seed: Dict[int, Dict[int, dict]], n_boot: int = 2000) -> dict:
+    """Per seed whose every fold is present: the test rows of all folds pooled,
+    then covariates vs covariates + image (each fold's two models were fit on that
+    fold's val patients) on every patient at once, overall and per ``in_<subset>``
+    column. With two or more complete seeds, the pooled numbers are also paired
+    across seeds."""
+    seeds, missing = {}, {}
+    for s, folds in sorted(by_seed.items()):
+        n = next(iter(folds.values())).get("n_folds") or len(folds)
+        if sorted(folds) != list(range(n)):
+            missing[s] = sorted(folds)
+            continue
+        frames = [_fold_rows(folds[k]) for k in range(n)]
+        if any(f is None for f in frames):
+            missing[s] = [k for k in range(n) if frames[k] is None]
+            continue
+        rows = pd.concat(frames, ignore_index=True)
+        if not {"p_covariates", "p_combined"} <= set(rows.columns):
+            missing[s] = "no covariate scores in the test rows (run with --covariate-baseline)"
+            continue
+        if rows.groupby(rows["patient"].astype(str))["fold"].nunique().max() > 1:
+            raise SystemExit(f"[fatal] seed {s}: a patient is tested in two folds; "
+                             f"the folds are not one partition")
+        ok = rows[["label", "p_image", "p_covariates", "p_combined"]].notna().all(1).to_numpy()
+        blocks = {"all": ok}
+        for c in sorted(c for c in rows.columns if c.startswith("in_")):
+            blocks[c[3:]] = ok & rows[c].astype(bool).to_numpy()
+        y, g = rows["label"].to_numpy(), rows["patient"].astype(str).to_numpy()
+        seeds[s] = {"n_folds": n, "fold_seed": folds[0].get("fold_seed"),
+                    "patients": int(rows.loc[ok, "patient"].nunique()),
+                    "blocks": {name: incremental_block(np.nan_to_num(y), g,
+                                                       rows["p_covariates"].to_numpy(),
+                                                       rows["p_combined"].to_numpy(),
+                                                       rows["p_image"].to_numpy(), m,
+                                                       n_boot=n_boot, seed=s)
+                               for name, m in blocks.items()}}
+    paired = {}
+    if len(seeds) >= 2:
+        names = set.intersection(*(set(v["blocks"]) for v in seeds.values()))
+        for name in sorted(names):
+            comb = {s: v["blocks"][name].get("auroc_combined") for s, v in seeds.items()}
+            cov = {s: v["blocks"][name].get("auroc_covariates") for s, v in seeds.items()}
+            if all(x is not None for x in list(comb.values()) + list(cov.values())):
+                paired[name] = _ci(paired_stats(comb, cov))
+    return {"seeds": seeds, "incomplete": missing, "paired_over_seeds": paired}
+
+
+def _pooled_lines(cond: str, pooled: dict, feats: str) -> List[str]:
+    L = []
+    for s, v in pooled["seeds"].items():
+        L.append(f"  POOLED OUT OF FOLD  {cond} seed {s}: {v['n_folds']} folds (fold seed "
+                 f"{v['fold_seed']}), {v['patients']} patients, each tested once")
+        for name, b in v["blocks"].items():
+            if "delta" not in b:
+                L.append(f"    [{name}] {b.get('reason', 'not computed')} (n={b['n']})")
+                continue
+            lo, hi = b.get("delta_ci", [float("nan")] * 2)
+            L.append(f"    [{name:<20}] {feats}={b['auroc_covariates']:.4f}  +image={b['auroc_combined']:.4f}  "
+                     f"delta={b['delta']:+.4f} [{lo:+.4f}, {hi:+.4f}]  image alone={b['auroc_image']:.4f}  "
+                     f"({b['pos_patients']} positive patients)")
+    for s, why in pooled["incomplete"].items():
+        L.append(f"  [{cond} seed {s}] not pooled: {why if isinstance(why, str) else f'folds present {why}'}")
+    for name, st in pooled["paired_over_seeds"].items():
+        L.append(_fmt_stats(st, f"{cond}: pooled +image vs {feats} [{name}]") + "   <- over seeds")
+    return L
 
 
 def discover_tasks(root: str) -> List[str]:
@@ -94,7 +202,7 @@ def incremental_by_seed(by_seed: Dict[int, dict]) -> Dict[str, dict]:
 
 
 def summarize(root: str, tasks: Optional[List[str]], control: str,
-              treatment: Optional[str] = None) -> dict:
+              treatment: Optional[str] = None, n_boot: int = 2000) -> dict:
     tasks = tasks or discover_tasks(root)
     L = [f"\n{'='*78}", f"SYSTEMIC (OCULOMICS) TARGETS  --  {root}",
          f"  control={control}" + (f"  treatment={treatment}" if treatment else "") +
@@ -103,15 +211,26 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
     overview = []
     for task in tasks:
         runs = load_task(os.path.join(root, task))
-        if control not in runs:
+        folds = load_folds(os.path.join(root, task))
+        if control not in runs and control not in folds:
             L.append(f"\n[{task}] no {control!r} runs found; skipped")
+            continue
+        pooled = None
+        if control in folds:
+            pooled = pooled_out_of_fold(folds[control], n_boot=n_boot)
+            any_rec = next(iter(next(iter(folds[control].values())).values()))
+            feats = "+".join((any_rec.get("incremental") or {}).get("features") or ["covariates"])
+            L += ["", f"--- {task} ---  fold runs"] + _pooled_lines(control, pooled, feats)
+        if control not in runs:
+            report[task] = {"pooled_out_of_fold": pooled}
             continue
         conds = [control] + ([treatment] if treatment and treatment in runs else [])
         if treatment and treatment not in runs:
             L.append(f"\n[{task}] no {treatment!r} runs; reporting {control!r} only")
         seeds = sorted(set.intersection(*(set(runs[c]) for c in conds)))
         rec = {"seeds": seeds, "conditions": {}, "paired_image_minus_covariate": {},
-               "paired_incremental": {}, "paired_treatment_minus_control": None}
+               "paired_incremental": {}, "paired_treatment_minus_control": None,
+               "pooled_out_of_fold": pooled}
         L += ["", f"--- {task} ---  paired seeds={seeds}",
               f"  {'condition':<10}{'image AUROC':<20}{'covariate AUROC':<20}{'image-covariate':<18}"
               f"{'prev':>7}{'n_test':>8}"]
@@ -159,7 +278,8 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
                          rec["conditions"][best]["prevalence"]))
 
     if not report:
-        raise SystemExit(f"[fatal] no <condition>_seed<n>.json under {root}/<task>/ for {tasks}")
+        raise SystemExit(f"[fatal] no <condition>_seed<n>.json or <condition>_fold<k>_seed<n>.json "
+                         f"under {root}/<task>/ for {tasks}")
 
     L += ["", "-" * 78, "OVERVIEW (best condition per task, mean over seeds):",
           f"  {'task':<24}{'cond':<10}{'image AUROC':>12}{'covariate':>10}{'prev':>8}"]
@@ -186,11 +306,13 @@ def main() -> int:
     p.add_argument("--control", default="ctrl", help="Condition prefix of the control arm.")
     p.add_argument("--treatment", default=None,
                    help="Condition prefix of the treatment arm (e.g. drinit); omit for control-only.")
+    p.add_argument("--n-boot", type=int, default=2000,
+                   help="Patient-cluster bootstrap resamples for the pooled out-of-fold CIs.")
     args = p.parse_args()
     if not os.path.isdir(args.dir):
         print(f"[fatal] {args.dir} is not a directory", file=sys.stderr)
         return 2
-    summarize(args.dir, args.tasks, args.control, args.treatment)
+    summarize(args.dir, args.tasks, args.control, args.treatment, n_boot=args.n_boot)
     return 0
 
 

@@ -15,6 +15,11 @@
 #   * for cm_hypertension, mBRSET's own hypertension column as an external test.
 # summarize_systemic.py then pairs every number by seed.
 #
+# FOLDS=5 runs the 5-fold design instead (ctrl_fold<k>_seed<s>): every recorded
+# patient is tested once, the folds' test rows pool out of fold, and the small
+# before-lesions subsets (normal_looking, normal_looking_no_dm, all_flags_clear)
+# get every eligible patient rather than a fifth of them.
+#
 # Why one camera: the comorbidity audit (2026-10-15) found histories for 75% of
 # Canon CR patients and 3% of Nikon NF5050 ones. Idempotent: a run whose JSON
 # exists is skipped. One job per GPU (the lab box cards are ~11.6 GiB).
@@ -24,7 +29,7 @@ usage() {
   cat <<'USAGE'
 usage: B=<BRSET root> [M=<mBRSET root>] [KNOB=value ...] bash run_brset_cm.sh [seed ...]
 
-Seeds default to 0 1 2. Every knob is an environment variable:
+Seeds default to 0 1 2 (with FOLDS: 0). Every knob is an environment variable:
 
   required
     B              BRSET root (dir holding labels_brset.csv; a parent also works)
@@ -36,8 +41,15 @@ Seeds default to 0 1 2. Every knob is an environment variable:
     COVARIATES     default "age sex"; "age sex diabetes" for the intake-form version
     PY             python (default .venv/bin/python; in a worktree pass ~/Oculomics/.venv/bin/python)
     GPU            CUDA_VISIBLE_DEVICES for this invocation (default: unchanged)
+  cross-validation
+    FOLDS          e.g. 5: patient-grouped K-fold, every recorded patient tested once,
+                   pooled out of fold by summarize_systemic.py      (default "": 70/10/20)
+    FOLD_LIST      the folds THIS invocation runs, to share them across GPUs, e.g. "0 1 2"
+                   on GPU 0 and "3 4" on GPU 1                       (default: all folds)
+    FOLD_SEED      seed of the fold partition, fixed across folds and seeds (default 42)
   outputs
     OUT            results + summary  (default exp_brset_cm)  -> $OUT/<task>/ctrl_seed<s>.json
+                   (with FOLDS: ctrl_fold<k>_seed<s>.json + ctrl_fold<k>_seed<s>_test.csv)
     CK             checkpoints        (default ck_brset_cm)   -> $CK/<task>/
   model / training
     STUDENT        default timm:mobilenetv4_conv_medium.e500_r256_in1k (the retinal-age
@@ -52,6 +64,9 @@ Seeds default to 0 1 2. Every knob is an environment variable:
 example (two GPUs)
     GPU=0 B=... M=... PY=... bash run_brset_cm.sh 0 1 2
     GPU=1 B=... M=... PY=... bash run_brset_cm.sh 3 4
+    # 5-fold, one seed, the folds shared across the two cards
+    GPU=0 FOLDS=5 FOLD_LIST="0 1 2" B=... M=... PY=... bash run_brset_cm.sh 0
+    GPU=1 FOLDS=5 FOLD_LIST="3 4"   B=... M=... PY=... bash run_brset_cm.sh 0
 USAGE
 }
 for a in "$@"; do
@@ -76,9 +91,21 @@ BATCH=${BATCH:-16}
 EMA=${EMA:-0.999}
 WORKERS=${WORKERS:-5}
 EXTRA=${EXTRA:-}
+FOLDS=${FOLDS:-}
+FOLD_SEED=${FOLD_SEED:-42}
 if [ -n "${GPU:-}" ]; then export CUDA_VISIBLE_DEVICES=$GPU; fi
 
-SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
+SEEDS=("$@")
+if [ ${#SEEDS[@]} -eq 0 ]; then
+  if [ -n "$FOLDS" ]; then SEEDS=(0); else SEEDS=(0 1 2); fi
+fi
+if [ -n "$FOLDS" ]; then
+  FOLD_LIST=${FOLD_LIST:-$(seq 0 $((FOLDS - 1)) | tr '\n' ' ')}
+  for k in $FOLD_LIST; do
+    [ "$k" -ge 0 ] && [ "$k" -lt "$FOLDS" ] || { echo "[fatal] fold $k is outside 0..$((FOLDS - 1))"; exit 1; }
+  done
+  echo "[info] $FOLDS-fold design (fold seed $FOLD_SEED): this invocation runs folds $FOLD_LIST"
+fi
 [ -x "$PY" ] || { echo "[fatal] no python at $PY (in a worktree: PY=~/Oculomics/.venv/bin/python)"; exit 1; }
 mkdir -p "$OUT" "$CK"
 
@@ -113,22 +140,33 @@ if m:
 PY
 ) || exit 1
 
+one_run() {  # one_run <task> <seed> <run name> [extra train_mbrset flags...]
+  local t=$1 s=$2 name=$3; shift 3
+  local js="$OUT/$t/$name.json"
+  if [ -f "$js" ]; then echo "[skip] $t $name (exists)"; return 0; fi
+  mkdir -p "$OUT/$t" "$CK/$t"
+  local ext=()
+  if [ -n "$EXT" ] && $PY -c "import sys; from brset_comorbidities import MBRSET_EQUIVALENTS as E; sys.exit(0 if sys.argv[1] in E else 1)" "$t"; then
+    ext=(--external-test-root "$EXT" --external-test-dataset mbrset)
+  fi
+  echo; echo "=== $t $name  camera '$CAMERA'  $(date) ==="
+  # shellcheck disable=SC2086
+  $PY -u train_mbrset.py --dataset brset --root "$B" --camera "$CAMERA" --task "$t" --seed "$s" \
+      --backbone "$STUDENT" --no-gcg --image-size "$SIZE" --epochs "$EPOCHS" \
+      --batch-size "$BATCH" --ema-decay "$EMA" --num-workers "$WORKERS" \
+      --covariate-baseline --covariate-features $COVARIATES ${ext[@]+"${ext[@]}"} \
+      --ckpt-dir "$CK/$t" --run-name "$name" --results-json "$js" "$@" $EXTRA
+}
+
 for t in $TASKS; do
   for s in "${SEEDS[@]}"; do
-    js="$OUT/$t/ctrl_seed$s.json"
-    if [ -f "$js" ]; then echo "[skip] $t seed $s (exists)"; continue; fi
-    mkdir -p "$OUT/$t" "$CK/$t"
-    ext=()
-    if [ -n "$EXT" ] && $PY -c "import sys; from brset_comorbidities import MBRSET_EQUIVALENTS as E; sys.exit(0 if sys.argv[1] in E else 1)" "$t"; then
-      ext=(--external-test-root "$EXT" --external-test-dataset mbrset)
+    if [ -n "$FOLDS" ]; then
+      for k in $FOLD_LIST; do
+        one_run "$t" "$s" "ctrl_fold${k}_seed$s" --fold "$k" --n-folds "$FOLDS" --fold-seed "$FOLD_SEED"
+      done
+    else
+      one_run "$t" "$s" "ctrl_seed$s"
     fi
-    echo; echo "=== $t seed $s  camera '$CAMERA'  $(date) ==="
-    # shellcheck disable=SC2086
-    $PY -u train_mbrset.py --dataset brset --root "$B" --camera "$CAMERA" --task "$t" --seed "$s" \
-        --backbone "$STUDENT" --no-gcg --image-size "$SIZE" --epochs "$EPOCHS" \
-        --batch-size "$BATCH" --ema-decay "$EMA" --num-workers "$WORKERS" \
-        --covariate-baseline --covariate-features $COVARIATES ${ext[@]+"${ext[@]}"} \
-        --ckpt-dir "$CK/$t" --run-name "ctrl_seed$s" --results-json "$js" $EXTRA
   done
 done
 

@@ -70,6 +70,20 @@ validation patients and scored on the test patients, overall and within
 non-diabetic DR-grade-0 patients. ``cm_hypertension`` is scored on mBRSET's own
 hypertension column when ``--external-test-root`` is mBRSET.
 
+The before-lesions subsets (:func:`normal_eye_masks`, per patient, both eyes):
+``normal_looking`` = worst eye DR grade 0, no edema, and no hypertensive
+retinopathy, vessel occlusion or haemorrhage in either eye -- the lesions a
+clinician would name first for blood pressure; ``normal_looking_no_dm`` = the same
+in non-diabetic patients; ``all_flags_clear`` = DR 0, no edema and every BRSET eye
+finding clear. A patient with an unreadable flag is left out, never counted clear.
+
+``--fold K`` (with ``--n-folds``, ``--fold-seed``) replaces the 70/10/20 split by
+fold K of a fixed patient-grouped K-fold partition (``dataset.fold_split``):
+run K = 0..n-1 and every labelled patient is tested once. Each run writes its
+test rows (``--predictions-csv``, default next to ``--results-json``: label,
+image / covariate / combined scores, subset membership) and
+``summarize_systemic.py`` pools the folds out of fold.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -111,11 +125,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
+from dataset import MBRSETDataset, fold_split, stratified_split, DeviceAug  # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
-from covariate_baseline import covariate_baseline, image_minus_covariate, incremental_value  # noqa: E402
+from covariate_baseline import (covariate_baseline, image_minus_covariate,  # noqa: E402
+                                incremental_rows, incremental_value)
 
 
 class ModelEMA:
@@ -399,6 +414,55 @@ def nodm_dr0_mask(rows: pd.DataFrame) -> Optional[np.ndarray]:
     return ((dm == 0) & (worst == 0)).to_numpy()
 
 
+# The findings a clinician names first when a photo is said to show blood pressure.
+VASCULAR_FLAGS = ("hypertensive_retinopathy", "vascular_occlusion", "hemorrhage")
+
+
+def _patient_any(rows: pd.DataFrame, cols) -> pd.Series:
+    """Per row, over every image of its patient: 1 if any of ``cols`` is positive,
+    0 if all are readable and negative, NaN otherwise (unknown is never clear)."""
+    from dataset import _binary_flag
+    vals = np.stack([rows[c].map(_binary_flag).to_numpy(dtype=float) for c in cols], axis=1)
+    per_row = np.where((vals == 1).any(1), 1.0, np.where((vals == 0).all(1), 0.0, np.nan))
+    s = pd.Series(per_row, index=rows.index)
+    g = s.groupby(rows["patient"])
+    pos = g.transform(lambda v: (v == 1).any())
+    clear = g.transform(lambda v: (v == 0).all())
+    return pd.Series(np.where(pos, 1.0, np.where(clear, 0.0, np.nan)), index=rows.index)
+
+
+def normal_eye_masks(rows: pd.DataFrame) -> dict:
+    """Before-lesions subsets, decided per patient (both eyes share a split):
+
+    ``normal_looking``        worst eye DR grade 0, no edema, and none of
+                              :data:`VASCULAR_FLAGS` in either eye
+    ``normal_looking_no_dm``  the same, in non-diabetic patients
+    ``all_flags_clear``       DR grade 0, no edema and every BRSET eye finding
+                              (``flag_*``, brset_dataset.BRSET_EYE_FLAGS) clear
+
+    A subset whose columns the table lacks is omitted; a patient with an
+    unreadable flag is outside the subset, never counted as clear."""
+    from brset_dataset import BRSET_EYE_FLAGS
+    from dataset import _binary_flag
+    out = {}
+    if not {"final_icdr", "patient"} <= set(rows.columns):
+        return out
+    worst = pd.to_numeric(rows["final_icdr"], errors="coerce").groupby(rows["patient"]).transform("max")
+    base = worst == 0
+    if "final_edema" in rows.columns:
+        base &= _patient_any(rows, ["final_edema"]) == 0
+    vascular = [f"flag_{c}" for c in VASCULAR_FLAGS]
+    if all(c in rows.columns for c in vascular):
+        normal = base & (_patient_any(rows, vascular) == 0)
+        out["normal_looking"] = normal.to_numpy()
+        if "diabetes" in rows.columns:
+            out["normal_looking_no_dm"] = (normal & (rows["diabetes"].map(_binary_flag) == 0)).to_numpy()
+    every = [f"flag_{c}" for c in BRSET_EYE_FLAGS]
+    if all(c in rows.columns for c in every):
+        out["all_flags_clear"] = (base & (_patient_any(rows, every) == 0)).to_numpy()
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="mBRSET clinical-label classification.")
     p.add_argument("--root", required=True,
@@ -491,6 +555,16 @@ def main() -> int:
     p.add_argument("--camera", default=None,
                    help='Keep only this camera\'s rows of --root before splitting (e.g. "Canon CR" '
                         'for the BRSET comorbidity targets). The external set is not filtered.')
+    p.add_argument("--fold", type=int, default=None,
+                   help="Test on fold K of a fixed patient-grouped --n-folds partition "
+                        "(dataset.fold_split) instead of the seed-derived 70/10/20 split; "
+                        "run K = 0..n-1 and every labelled patient is tested once")
+    p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--fold-seed", type=int, default=42,
+                   help="Seed of the fold partition, fixed across folds and training seeds")
+    p.add_argument("--predictions-csv", default=None,
+                   help="Write the test rows (label, image / covariate / combined scores, subset "
+                        "membership). Default with --fold: <results-json>_test.csv")
     p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
                    help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
                         "for the stricter chart-knowledge baseline).")
@@ -514,6 +588,13 @@ def main() -> int:
         raise SystemExit(f"[fatal] --root and --external-test-root are the same directory "
                          f"({os.path.realpath(args.root)}): the 'out-of-domain' score would "
                          f"be measured on the training images.")
+    if args.fold is not None:
+        if args.split_file:
+            raise SystemExit("[fatal] --fold and --split-file both fix the partition; pass one")
+        if not 0 <= args.fold < args.n_folds:
+            raise SystemExit(f"[fatal] --fold {args.fold} is outside 0..{args.n_folds - 1}")
+    if args.predictions_csv is None and args.fold is not None and args.results_json:
+        args.predictions_csv = os.path.splitext(args.results_json)[0] + "_test.csv"
 
     seed_everything(args.seed, deterministic=not args.nondeterministic)
     device = pick_device()
@@ -521,13 +602,16 @@ def main() -> int:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt = os.path.join(args.ckpt_dir, f"{run_name}.pt")
 
-    from brset_dataset import add_brset_extras, filter_camera, load_any   # noqa: E402
+    from brset_dataset import (add_brset_eye_flags, add_brset_extras,  # noqa: E402
+                               filter_camera, load_any)
     from dataset import COMORBIDITY_TASKS                                # noqa: E402
     src = load_any(args.root, args.dataset, image_ext=args.image_ext)
     img_dir = src["images_dir"]
     if args.dataset == "brset":
+        # the eye findings (flag_*, only ever used for the before-lesions subsets),
         # diabetes / nationality (covariates, the no-DM subset) and, for a cm_* task,
         # the parsed free-text comorbidity labels.
+        src["df"] = add_brset_eye_flags(src["df"], src["csv"])
         src["df"] = add_brset_extras(src["df"], src["csv"],
                                      comorbidities=args.task in COMORBIDITY_TASKS)
     elif args.task in COMORBIDITY_TASKS:
@@ -542,6 +626,11 @@ def main() -> int:
     # so a per-target model and a RetinaReach probe are scored on the same rows.
     if args.split_file:
         splits = splits_from_file(src["df"], args.split_file)
+    elif args.fold is not None:
+        splits = fold_split(src["df"], task=args.task, fold=args.fold, n_folds=args.n_folds,
+                            val_frac=0.10, group_col="patient", seed=args.fold_seed)
+        print(f"[info] fold   : {args.fold} of {args.n_folds} (fold seed {args.fold_seed}; the "
+              f"training seed {args.seed} varies init and sampling only)")
     else:
         splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
                                   test_frac=0.20, group_col="patient", seed=args.seed)
@@ -814,6 +903,7 @@ def main() -> int:
         m = nodm_dr0_mask(test_rows)
         if m is not None:
             subsets["no_diabetes_dr0"] = m
+        subsets.update(normal_eye_masks(test_rows))
         inc = incremental_value(val_rows, val_prob, test_rows, test_prob, args.task,
                                 features=tuple(args.covariate_features), subsets=subsets,
                                 seed=args.seed)
@@ -829,6 +919,24 @@ def main() -> int:
             print(f"  {name:<22} {feats}={b['auroc_covariates']:.4f}  +image={b['auroc_combined']:.4f}  "
                   f"delta={b['delta']:+.4f} [{lo:+.4f}, {hi:+.4f}]  image alone={b['auroc_image']:.4f}  "
                   f"({b['pos_patients']} positive patients)")
+
+    # The test rows, so folds can be pooled out of fold (summarize_systemic.py).
+    pred_csv = None
+    if args.predictions_csv and C == 2:
+        rows = rows_for(test_ds, splits["test"])
+        lab = test_ds.labels.numpy() if hasattr(test_ds.labels, "numpy") else np.asarray(test_ds.labels)
+        pr = pd.DataFrame({"file": rows["file"].astype(str), "patient": rows["patient"].astype(str),
+                           "label": lab.astype(float), "p_image": np.asarray(test_prob, dtype=float)})
+        if inc is not None and inc.get("reason") is None:
+            pr = pd.concat([pr, incremental_rows(val_rows, val_prob, test_rows, test_prob, args.task,
+                                                 features=tuple(args.covariate_features))], axis=1)
+            for name, m_ in subsets.items():
+                pr[f"in_{name}"] = np.asarray(m_, dtype=bool)
+        pr = pr.assign(task=args.task, fold=args.fold, seed=args.seed)
+        os.makedirs(os.path.dirname(os.path.abspath(args.predictions_csv)), exist_ok=True)
+        pr.to_csv(args.predictions_csv, index=False)
+        pred_csv = os.path.abspath(args.predictions_csv)
+        print(f"[info] wrote {args.predictions_csv} ({len(pr)} test rows)")
 
     # Positive-class counts (binary tasks) so a summariser can derive the two
     # prevalences from the run itself instead of hardcoding them.
@@ -850,6 +958,9 @@ def main() -> int:
               "external_bnadapt": None,
               "init_from": init_info,
               "split_file": os.path.abspath(args.split_file) if args.split_file else None,
+              "fold": args.fold, "n_folds": args.n_folds if args.fold is not None else None,
+              "fold_seed": args.fold_seed if args.fold is not None else None,
+              "predictions_csv": pred_csv,
               "covariate_baseline": cb,
               "covariate_baseline_external": cb_ext,
               "incremental": inc,

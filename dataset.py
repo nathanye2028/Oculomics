@@ -738,6 +738,54 @@ def stratified_split(
     }
 
 
+def fold_split(
+    csv: Union[str, pd.DataFrame],
+    task: str = "dr_referable",
+    fold: int = 0,
+    n_folds: int = 5,
+    val_frac: float = 0.10,
+    group_col: str = "patient",
+    seed: int = 42,
+) -> Dict[str, pd.DataFrame]:
+    """Fold ``fold`` of a patient-grouped, label-stratified ``n_folds``-fold
+    partition, as train / val / test.
+
+    test = that fold's patients; val = ``val_frac`` of all patients (grouped,
+    stratified) drawn from the other folds; train = the rest. ``seed`` fixes the
+    partition, so folds 0 .. n_folds-1 of one seed test every labelled patient
+    exactly once: their test predictions pool into one out-of-fold set, which a
+    single 20 % test split cannot give a small subset or a rare label. The
+    training seed is separate (it varies init and sampling only).
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    if not 0 <= fold < n_folds:
+        raise ValueError(f"fold_split: fold {fold} is outside 0..{n_folds - 1}")
+    df = pd.read_csv(csv) if isinstance(csv, str) else csv.copy()
+    if group_col not in df.columns:
+        raise ValueError(f"fold_split: group_col={group_col!r} is not a column of the CSV; "
+                         f"a patient-grouped partition cannot be downgraded to a per-image one")
+    spec = LABEL_REGISTRY[task]
+    y = np.array([spec.fn(dict(zip(spec.source_cols, row)))
+                  for row in df[list(spec.source_cols)].to_numpy()], dtype=np.float64)
+    keep = ~_isnan_vector(y)
+    df, y = df.loc[keep].reset_index(drop=True), y[keep]
+    groups = df[group_col].to_numpy()
+    folds = list(StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+                 .split(df, y, groups))
+    tv_idx, te_idx = folds[fold]
+    df_tv, y_tv, g_tv = df.iloc[tv_idx], y[tv_idx], groups[tv_idx]
+    rel_val = val_frac / (1.0 - 1.0 / n_folds)
+    n_splits_v = max(2, int(round(1.0 / max(rel_val, 1e-6))))
+    tr_idx, va_idx = next(StratifiedGroupKFold(n_splits=n_splits_v, shuffle=True, random_state=seed)
+                          .split(df_tv, y_tv, g_tv))
+    return {
+        "train": df_tv.iloc[tr_idx].reset_index(drop=True),
+        "val": df_tv.iloc[va_idx].reset_index(drop=True),
+        "test": df.iloc[te_idx].reset_index(drop=True),
+    }
+
+
 # ----------------------------------------------------------------------------- #
 # Smoke test
 # ----------------------------------------------------------------------------- #

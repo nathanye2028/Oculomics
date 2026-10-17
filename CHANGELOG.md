@@ -2,6 +2,15 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-17 Systemic oculomics: 5-fold runs pooled out of fold; normal-looking-eye subsets  (branch `disease/systemic-oculomics`)
+
+- `train_mbrset.py --fold K --n-folds 5 --fold-seed 42` (`dataset.fold_split`): fold K of a fixed patient-grouped, label-stratified partition replaces the 70/10/20 split, so folds 0..4 test every recorded patient once. Each run writes its test rows (`--predictions-csv`, default `<results-json>_test.csv`: label, image / covariate / combined scores, subset membership) and records `fold`, `n_folds`, `fold_seed` in its JSON.
+- `run_brset_cm.sh`: `FOLDS=5` runs `ctrl_fold<k>_seed<s>`; `FOLD_LIST` shares the folds across GPUs; `FOLD_SEED`. Without `FOLDS` nothing changes.
+- `summarize_systemic.py`: fold runs are pooled out of fold once every fold of a seed is present — covariates vs covariates + image on all patients at once, overall and per subset, patient-cluster bootstrap CI (`--n-boot`); several complete seeds are also paired. Incomplete seeds are listed, and a patient tested in two folds stops the summary.
+- Before-lesions subsets (`train_mbrset.normal_eye_masks`, per patient): `normal_looking` = DR grade 0, no edema and no hypertensive retinopathy, vessel occlusion or haemorrhage in either eye; `normal_looking_no_dm`; `all_flags_clear` = every BRSET eye finding clear. An unreadable flag leaves the patient out. `no_diabetes_dr0` is unchanged. The flags come from `brset_dataset.add_brset_eye_flags` as `flag_<name>`, a prefix no task or metadata feature set reads.
+- `covariate_baseline.py`: the fit behind `incremental_value` is shared with `incremental_rows` (per-row scores) and `incremental_block` (the pooled statistics); `incremental_value`'s output is unchanged.
+- Tests: `tests/test_folds.py`.
+
 ## [Unreleased] — 2026-10-16 Systemic oculomics: Canon-only image runs and "does the photo add to age+sex?"  (branch `disease/systemic-oculomics`)
 
 - `covariate_baseline.incremental_value`: covariates vs covariates + the image model's logit, both logistic regressions fit on the validation rows and scored on the test rows; AUROC of each, the image alone, the paired delta with a patient-cluster bootstrap CI and `p_no_gain`; re-scored inside named subsets.
