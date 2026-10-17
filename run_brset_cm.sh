@@ -58,6 +58,8 @@ Seeds default to 0 1 2 (with FOLDS: 0). Every knob is an environment variable:
     EPOCHS         default 30
     BATCH          default 16 (Medium @ 512 on an 11.6 GiB card)
     EMA            default 0.999 (0 = off)
+    ABLATION       vessel ablation at the end of each run: fraction of the field of view
+                   inpainted as vessel, plus the rotated control (default 0.12; 0 = off)
     WORKERS        default 5
     EXTRA          extra train_mbrset.py flags
 
@@ -93,6 +95,7 @@ WORKERS=${WORKERS:-5}
 EXTRA=${EXTRA:-}
 FOLDS=${FOLDS:-}
 FOLD_SEED=${FOLD_SEED:-42}
+ABLATION=${ABLATION:-0.12}
 if [ -n "${GPU:-}" ]; then export CUDA_VISIBLE_DEVICES=$GPU; fi
 
 SEEDS=("$@")
@@ -155,6 +158,7 @@ one_run() {  # one_run <task> <seed> <run name> [extra train_mbrset flags...]
       --backbone "$STUDENT" --no-gcg --image-size "$SIZE" --epochs "$EPOCHS" \
       --batch-size "$BATCH" --ema-decay "$EMA" --num-workers "$WORKERS" \
       --covariate-baseline --covariate-features $COVARIATES ${ext[@]+"${ext[@]}"} \
+      --vessel-ablation "$ABLATION" \
       --ckpt-dir "$CK/$t" --run-name "$name" --results-json "$js" "$@" $EXTRA
 }
 

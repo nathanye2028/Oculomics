@@ -2,6 +2,14 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-10-17 Systemic oculomics: matched pairs and vessel ablation on the hypertension runs  (branch `disease/systemic-oculomics`)
+
+- `covariate_baseline.matched_pair_concordance`: per patient, how often a score ranks the patient with the condition above one who is within a caliper of age (default 2 years) and identical on every other covariate (sex, diabetes status); every such pair counts once, ties 1/2, patient-bootstrap CI. 50 % = nothing beyond what the pairs share. The board version of "beyond age and sex".
+- `train_mbrset.py --vessel-ablation 0.12`: after training, every test image is scored again with 12 % of the field of view inpainted along the vessels and with the same mask rotated 90 degrees (`vessel_ablation.py`, as in RetinaReach). `vessel_ablation` in the JSON (AUROC intact / vessels / control, vessels-minus-control with a patient-bootstrap CI); `p_image_vessels`, `p_image_control` and the covariates (age, sex, the `--covariate-features`) in the test rows. `evaluate()` takes an input `transform`.
+- `summarize_systemic.py`: the pooled out-of-fold section adds, per block, the matched-pair concordance of the photo (matched on the runs' covariates, `--caliper`) and, with ablation columns, AUROC and matched pairs intact / vessels removed / control removed. The matched pairs are the readout to trust here: a photo score also carries age, so plain AUROC can move with age when the vessels go.
+- `run_brset_cm.sh`: `ABLATION` (default 0.12; 0 = off).
+- Tests: `tests/test_folds.py` (matched pairs, the transform hook, pooled ablation, the fold run with ablation).
+
 ## [Unreleased] — 2026-10-17 Systemic oculomics: 5-fold runs pooled out of fold; normal-looking-eye subsets  (branch `disease/systemic-oculomics`)
 
 - `train_mbrset.py --fold K --n-folds 5 --fold-seed 42` (`dataset.fold_split`): fold K of a fixed patient-grouped, label-stratified partition replaces the 70/10/20 split, so folds 0..4 test every recorded patient once. Each run writes its test rows (`--predictions-csv`, default `<results-json>_test.csv`: label, image / covariate / combined scores, subset membership) and records `fold`, `n_folds`, `fold_seed` in its JSON.

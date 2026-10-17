@@ -25,7 +25,12 @@ Fold runs (``train_mbrset.py --fold K``, ``<cond>_fold<K>_seed<n>.json`` plus th
 present, each labelled patient has exactly one score from a model that never saw
 them, and question 1's sharp version is answered on all of them at once, overall
 and per before-lesions subset, with a patient-cluster bootstrap CI. Several
-complete seeds are then paired like any other runs.
+complete seeds are then paired like any other runs. Two more readings of the same
+pooled rows: the **matched-pair concordance** (how often the photo ranks the
+patient with the condition above one of the same sex and diabetes status within
+``--caliper`` years of age; 50 % = nothing beyond them) and, for runs with
+``--vessel-ablation``, the photo's AUROC and matched pairs with the vessels or the
+rotated control inpainted.
 
     python summarize_systemic.py --dir exp_systemic --treatment drinit --control ctrl
     python summarize_systemic.py --dir exp_systemic --tasks hypertension --control ctrl
@@ -46,7 +51,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_experiment import paired_stats          # noqa: E402  (same statistics as every other experiment)
-from covariate_baseline import incremental_block  # noqa: E402
+from covariate_baseline import incremental_block, matched_pair_concordance  # noqa: E402
 
 _FOLD_RUN = re.compile(r"^(?P<cond>.+)_fold(?P<fold>\d+)_seed(?P<seed>\d+)\.json$")
 
@@ -93,12 +98,50 @@ def _fold_rows(rec: dict) -> Optional[pd.DataFrame]:
     return None
 
 
-def pooled_out_of_fold(by_seed: Dict[int, Dict[int, dict]], n_boot: int = 2000) -> dict:
+_SCORES = (("p_image", "intact"), ("p_image_vessels", "vessels removed"),
+           ("p_image_control", "control removed"))
+
+
+def _matched_and_ablation(rows: pd.DataFrame, blocks: Dict[str, np.ndarray], feats: List[str],
+                          caliper: float, n_boot: int, seed: int) -> dict:
+    """Per block: the matched-pair concordance of the photo's score (pairs share
+    every covariate except age, which is matched within ``caliper`` years) and, when
+    the runs had --vessel-ablation, the photo's AUROC intact / vessels removed /
+    control removed with the paired vessels-minus-control delta."""
+    from capability_gate import paired_delta_bootstrap
+    from sklearn.metrics import roc_auc_score
+    out = {"matched_pairs": {}, "vessel_ablation": {}}
+    exact = [c for c in feats if c != "age" and c in rows.columns]
+    scores = [(c, lab) for c, lab in _SCORES if c in rows.columns]
+    y, g = rows["label"].to_numpy(), rows["patient"].astype(str).to_numpy()
+    for name, m in blocks.items():
+        if "age" in rows.columns:
+            out["matched_pairs"][name] = {
+                lab: matched_pair_concordance(y[m], rows[c].to_numpy()[m], g[m], rows["age"].to_numpy()[m],
+                                              exact={k: rows[k].to_numpy()[m] for k in exact},
+                                              caliper=caliper, n_boot=n_boot, seed=seed)
+                for c, lab in scores}
+        if len(scores) == 3:
+            yy = y[m].astype(int)
+            if len(np.unique(yy)) < 2:
+                continue
+            p = {lab: rows[c].to_numpy()[m] for c, lab in scores}
+            vc = paired_delta_bootstrap(yy, p["vessels removed"], p["control removed"], g[m], n_boot, seed)
+            out["vessel_ablation"][name] = {**{f"auroc_{lab.split()[0]}": float(roc_auc_score(yy, v))
+                                               for lab, v in p.items()},
+                                            "vessels_minus_control": vc["delta"],
+                                            "vmc_ci": [vc["delta_lo"], vc["delta_hi"]]}
+    return out
+
+
+def pooled_out_of_fold(by_seed: Dict[int, Dict[int, dict]], n_boot: int = 2000,
+                       caliper: float = 2.0) -> dict:
     """Per seed whose every fold is present: the test rows of all folds pooled,
     then covariates vs covariates + image (each fold's two models were fit on that
     fold's val patients) on every patient at once, overall and per ``in_<subset>``
-    column. With two or more complete seeds, the pooled numbers are also paired
-    across seeds."""
+    column, plus the matched-pair concordance and the vessel ablation when the rows
+    carry them. With two or more complete seeds, the pooled numbers are also
+    paired across seeds."""
     seeds, missing = {}, {}
     for s, folds in sorted(by_seed.items()):
         n = next(iter(folds.values())).get("n_folds") or len(folds)
@@ -129,6 +172,8 @@ def pooled_out_of_fold(by_seed: Dict[int, Dict[int, dict]], n_boot: int = 2000) 
                                                        rows["p_image"].to_numpy(), m,
                                                        n_boot=n_boot, seed=s)
                                for name, m in blocks.items()}}
+        feats = (folds[0].get("incremental") or {}).get("features") or ["age", "sex"]
+        seeds[s].update(_matched_and_ablation(rows, blocks, feats, caliper, n_boot, s))
     paired = {}
     if len(seeds) >= 2:
         names = set.intersection(*(set(v["blocks"]) for v in seeds.values()))
@@ -153,6 +198,23 @@ def _pooled_lines(cond: str, pooled: dict, feats: str) -> List[str]:
             L.append(f"    [{name:<20}] {feats}={b['auroc_covariates']:.4f}  +image={b['auroc_combined']:.4f}  "
                      f"delta={b['delta']:+.4f} [{lo:+.4f}, {hi:+.4f}]  image alone={b['auroc_image']:.4f}  "
                      f"({b['pos_patients']} positive patients)")
+            mp = (v.get("matched_pairs") or {}).get(name, {}).get("intact")
+            if mp and "concordance" in mp:
+                lo, hi = mp.get("ci", [float("nan")] * 2)
+                L.append(f"      matched pairs (same {', '.join(mp['matched_on'][1:]) or 'nothing else'}, "
+                         f"age within {mp['caliper_years']:g} y): the photo picked the right patient "
+                         f"{mp['concordance']:.1%} [{lo:.1%}, {hi:.1%}] of {mp['pairs']:,} pairs "
+                         f"({mp['cases_matched']} of {mp['cases']} cases matched); chance = 50%")
+            ab = (v.get("vessel_ablation") or {}).get(name)
+            if ab:
+                lo, hi = ab["vmc_ci"]
+                pairs = (v.get("matched_pairs") or {}).get(name, {})
+                mp_txt = " / ".join(f"{pairs[k]['concordance']:.1%}" if "concordance" in pairs.get(k, {})
+                                    else "-" for k in ("intact", "vessels removed", "control removed"))
+                L.append(f"      vessel ablation: AUROC intact {ab['auroc_intact']:.4f} / vessels removed "
+                         f"{ab['auroc_vessels']:.4f} / control removed {ab['auroc_control']:.4f}; vessels "
+                         f"minus control {ab['vessels_minus_control']:+.4f} [{lo:+.4f}, {hi:+.4f}]; "
+                         f"matched pairs {mp_txt}")
     for s, why in pooled["incomplete"].items():
         L.append(f"  [{cond} seed {s}] not pooled: {why if isinstance(why, str) else f'folds present {why}'}")
     for name, st in pooled["paired_over_seeds"].items():
@@ -202,7 +264,7 @@ def incremental_by_seed(by_seed: Dict[int, dict]) -> Dict[str, dict]:
 
 
 def summarize(root: str, tasks: Optional[List[str]], control: str,
-              treatment: Optional[str] = None, n_boot: int = 2000) -> dict:
+              treatment: Optional[str] = None, n_boot: int = 2000, caliper: float = 2.0) -> dict:
     tasks = tasks or discover_tasks(root)
     L = [f"\n{'='*78}", f"SYSTEMIC (OCULOMICS) TARGETS  --  {root}",
          f"  control={control}" + (f"  treatment={treatment}" if treatment else "") +
@@ -217,7 +279,7 @@ def summarize(root: str, tasks: Optional[List[str]], control: str,
             continue
         pooled = None
         if control in folds:
-            pooled = pooled_out_of_fold(folds[control], n_boot=n_boot)
+            pooled = pooled_out_of_fold(folds[control], n_boot=n_boot, caliper=caliper)
             any_rec = next(iter(next(iter(folds[control].values())).values()))
             feats = "+".join((any_rec.get("incremental") or {}).get("features") or ["covariates"])
             L += ["", f"--- {task} ---  fold runs"] + _pooled_lines(control, pooled, feats)
@@ -308,11 +370,14 @@ def main() -> int:
                    help="Condition prefix of the treatment arm (e.g. drinit); omit for control-only.")
     p.add_argument("--n-boot", type=int, default=2000,
                    help="Patient-cluster bootstrap resamples for the pooled out-of-fold CIs.")
+    p.add_argument("--caliper", type=float, default=2.0,
+                   help="Matched pairs: largest age difference (years) between the two patients.")
     args = p.parse_args()
     if not os.path.isdir(args.dir):
         print(f"[fatal] {args.dir} is not a directory", file=sys.stderr)
         return 2
-    summarize(args.dir, args.tasks, args.control, args.treatment, n_boot=args.n_boot)
+    summarize(args.dir, args.tasks, args.control, args.treatment, n_boot=args.n_boot,
+              caliper=args.caliper)
     return 0
 
 

@@ -261,6 +261,67 @@ def incremental_rows(val_df: pd.DataFrame, val_prob: np.ndarray, test_df: pd.Dat
     return out
 
 
+def matched_pair_concordance(y: np.ndarray, score: np.ndarray, groups: np.ndarray,
+                             age: np.ndarray, exact: Optional[Dict[str, np.ndarray]] = None,
+                             caliper: float = 2.0, n_boot: int = 2000,
+                             seed: int = 0) -> Dict[str, object]:
+    """How often ``score`` ranks a positive patient above a negative one who is
+    within ``caliper`` years of age and identical on every ``exact`` column (sex,
+    diabetes status, ...). Every such case-control pair counts once (ties count
+    1/2), so what the pairs share cannot carry the result: 0.5 = nothing beyond
+    them. The board version of "beyond age and sex": given two such people, one
+    with the condition, how often did the photo pick the right one?
+
+    Per patient: image scores averaged, label / age / exact columns taken from the
+    patient's rows (constant for patient-level labels). 95 % CI from resampling
+    patients, each pair weighted by how often both of its patients were drawn."""
+    cols = {"g": np.asarray(groups).astype(str), "y": np.asarray(y, dtype=float),
+            "p": np.asarray(score, dtype=float), "age": pd.to_numeric(pd.Series(age), errors="coerce").to_numpy()}
+    names = list(exact or {})
+    for k in names:
+        cols[f"x_{k}"] = pd.Series(np.asarray(exact[k], dtype=object)).astype(str).str.strip().str.lower() \
+            .where(pd.Series(exact[k]).notna(), None).to_numpy()
+    d = pd.DataFrame(cols).dropna()
+    out: Dict[str, object] = {"caliper_years": float(caliper), "matched_on": ["age"] + names}
+    if d.empty:
+        out["reason"] = "no patient with a score, a label, an age and every matching column"
+        return out
+    agg = {"y": ("y", "max"), "p": ("p", "mean"), "age": ("age", "first")}
+    agg.update({f"x_{k}": (f"x_{k}", "first") for k in names})
+    per = d.groupby("g").agg(**agg).reset_index(drop=True)
+    key = per[[f"x_{k}" for k in names]].astype(str).agg("|".join, axis=1) if names else \
+        pd.Series("", index=per.index)
+    ii, jj, val = [], [], []
+    for k in key.unique():
+        a = np.flatnonzero(((per["y"] == 1) & (key == k)).to_numpy())
+        b = np.flatnonzero(((per["y"] == 0) & (key == k)).to_numpy())
+        if not len(a) or not len(b):
+            continue
+        close = np.abs(per["age"].to_numpy()[a][:, None] - per["age"].to_numpy()[b][None, :]) <= caliper
+        ia, ib = np.nonzero(close)
+        pa, pb = per["p"].to_numpy()[a[ia]], per["p"].to_numpy()[b[ib]]
+        ii.append(a[ia]); jj.append(b[ib])
+        val.append(np.where(pa > pb, 1.0, np.where(pa == pb, 0.5, 0.0)))
+    out.update(cases=int((per["y"] == 1).sum()), controls=int((per["y"] == 0).sum()))
+    if not ii:
+        out["reason"] = "no case-control pair matches"
+        return out
+    ii, jj, val = np.concatenate(ii), np.concatenate(jj), np.concatenate(val)
+    out.update(pairs=int(len(val)), cases_matched=int(len(np.unique(ii))),
+               controls_matched=int(len(np.unique(jj))), concordance=float(val.mean()))
+    rng = np.random.default_rng(seed)
+    n, boots = len(per), []
+    for _ in range(n_boot):
+        w = np.bincount(rng.integers(0, n, n), minlength=n).astype(float)
+        ww = w[ii] * w[jj]
+        if ww.sum() > 0:
+            boots.append(float((ww * val).sum() / ww.sum()))
+    if boots:
+        out["ci"] = [float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))]
+        out["p_no_signal"] = float(np.mean(np.asarray(boots) <= 0.5))
+    return out
+
+
 def image_minus_covariate(image_auroc: Optional[float], cb: Dict[str, object]) -> Optional[float]:
     """Paired within-run delta (image model minus covariate baseline); None if
     either side is missing/NaN so summarisers skip it instead of averaging NaN."""

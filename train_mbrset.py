@@ -81,8 +81,15 @@ finding clear. A patient with an unreadable flag is left out, never counted clea
 fold K of a fixed patient-grouped K-fold partition (``dataset.fold_split``):
 run K = 0..n-1 and every labelled patient is tested once. Each run writes its
 test rows (``--predictions-csv``, default next to ``--results-json``: label,
-image / covariate / combined scores, subset membership) and
-``summarize_systemic.py`` pools the folds out of fold.
+image / covariate / combined scores, subset membership, the covariates) and
+``summarize_systemic.py`` pools the folds out of fold, including the matched-pair
+concordance (same sex and diabetes status, age within 2 years).
+
+``--vessel-ablation 0.12`` scores every test image twice more: with 12 % of the
+field of view inpainted along the vessels (vessel_ablation.py's line detector) and
+with the same mask rotated 90 degrees (control). ``vessel_ablation`` in the JSON
+and ``p_image_vessels`` / ``p_image_control`` in the test rows; vessels minus
+control below 0 = the score leans on the vasculature more than on other retina.
 
 Training recipe notes (2026-08-20)
 ----------------------------------
@@ -359,13 +366,17 @@ def pick_device() -> torch.device:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes, return_probs: bool = False):
+def evaluate(model, loader, device, num_classes, return_probs: bool = False, transform=None):
     """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader; with
-    ``return_probs`` also P(class 1) per row, in loader (= dataset) order."""
+    ``return_probs`` also P(class 1) per row, in loader (= dataset) order.
+    ``transform`` (normalised batch -> normalised batch) perturbs the inputs first,
+    e.g. a vessel ablation."""
     model.eval()
     logits_all, y_all = [], []
     for batch in loader:
         x, y = batch["image"].to(device), batch["label"].to(device)
+        if transform is not None:
+            x = transform(x)
         logits_all.append(model(x).cpu())
         y_all.append(y.cpu())
     logits = torch.cat(logits_all)
@@ -565,6 +576,10 @@ def main() -> int:
     p.add_argument("--predictions-csv", default=None,
                    help="Write the test rows (label, image / covariate / combined scores, subset "
                         "membership). Default with --fold: <results-json>_test.csv")
+    p.add_argument("--vessel-ablation", type=float, default=0.0, metavar="FRAC",
+                   help="Also score every test image with FRAC of the field of view inpainted as "
+                        "vessel, and with the same mask rotated 90 degrees (control) "
+                        "(vessel_ablation.py; RetinaReach uses 0.12). 0 = off")
     p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
                    help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
                         "for the stricter chart-knowledge baseline).")
@@ -858,6 +873,35 @@ def main() -> int:
     print(f"  AUROC={tm['auroc']:.4f}  acc={tm['acc']:.4f}  macroF1={tm['f1']:.4f}  "
           f"kappa={tm['kappa']:.4f}  n={tm['n']}")
 
+    # Mechanism: the same test images with the vessels inpainted, and with the same
+    # mask rotated 90 degrees (as much thin structure, mostly on other retina).
+    abl, abl_probs = None, {}
+    if args.vessel_ablation > 0 and C == 2:
+        from capability_gate import paired_delta_bootstrap
+        from vessel_ablation import ablate_normalised
+        for kind in ("vessels", "control"):
+            _, abl_probs[kind] = evaluate(
+                model, test_loader, device, C, return_probs=True,
+                transform=lambda x, k=kind: ablate_normalised(x, k, args.vessel_ablation))
+        y_t = (test_ds.labels.numpy() if hasattr(test_ds.labels, "numpy")
+               else np.asarray(test_ds.labels)).astype(int)
+        g_t = rows_for(test_ds, splits["test"])["patient"].astype(str).to_numpy()
+        from sklearn.metrics import roc_auc_score
+        two = len(np.unique(y_t)) == 2
+        auc = lambda p: float(roc_auc_score(y_t, p)) if two else float("nan")
+        vc = paired_delta_bootstrap(y_t, abl_probs["vessels"], abl_probs["control"], g_t,
+                                    1000, args.seed) if two else {}
+        abl = {"frac": args.vessel_ablation, "auroc_intact": auc(test_prob),
+               "auroc_vessels": auc(abl_probs["vessels"]), "auroc_control": auc(abl_probs["control"]),
+               "vessels_minus_control": vc.get("delta"), "vmc_ci": [vc.get("delta_lo"), vc.get("delta_hi")]}
+        print(f"\n=== VESSEL ABLATION ({args.vessel_ablation:.0%} of the field of view; control = the same "
+              f"mask rotated 90 degrees) ===")
+        print(f"  AUROC intact={abl['auroc_intact']:.4f}  vessels removed={abl['auroc_vessels']:.4f}  "
+              f"control removed={abl['auroc_control']:.4f}")
+        if vc:
+            print(f"  vessels minus control={vc['delta']:+.4f} [{vc['delta_lo']:+.4f}, {vc['delta_hi']:+.4f}]"
+                  f"  (below 0 with the CI below 0: the score leans on the vasculature)")
+
     em = None
     if ext_loader is not None:
         em = evaluate(model, ext_loader, device, C)
@@ -927,6 +971,13 @@ def main() -> int:
         lab = test_ds.labels.numpy() if hasattr(test_ds.labels, "numpy") else np.asarray(test_ds.labels)
         pr = pd.DataFrame({"file": rows["file"].astype(str), "patient": rows["patient"].astype(str),
                            "label": lab.astype(float), "p_image": np.asarray(test_prob, dtype=float)})
+        for kind, p_ in abl_probs.items():
+            pr[f"p_image_{kind}"] = np.asarray(p_, dtype=float)
+        # the covariates as recorded, so matched pairs (same sex and diabetes status,
+        # age within a caliper) can be formed from the pooled rows
+        for c in dict.fromkeys(["age", "sex"] + list(args.covariate_features)):
+            if c in rows.columns:
+                pr[c] = rows[c].to_numpy()
         if inc is not None and inc.get("reason") is None:
             pr = pd.concat([pr, incremental_rows(val_rows, val_prob, test_rows, test_prob, args.task,
                                                  features=tuple(args.covariate_features))], axis=1)
@@ -961,6 +1012,7 @@ def main() -> int:
               "fold": args.fold, "n_folds": args.n_folds if args.fold is not None else None,
               "fold_seed": args.fold_seed if args.fold is not None else None,
               "predictions_csv": pred_csv,
+              "vessel_ablation": abl,
               "covariate_baseline": cb,
               "covariate_baseline_external": cb_ext,
               "incremental": inc,
