@@ -51,8 +51,10 @@ cd ~/Oculomics && git fetch && git checkout retinareach && git pull
 - [ ] Systemic code:
 
 ```bash
-cd ~/oculomics-systemic && git pull
+cd ~/oculomics-systemic && git fetch origin && git checkout --detach origin/disease/systemic-oculomics
 ```
+
+  (This folder is a detached worktree, so `git pull` would refuse: "not currently on a branch".)
 
 - [ ] Both folders show the commits you pushed in step 0:
 
