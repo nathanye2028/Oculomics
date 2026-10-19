@@ -14,10 +14,14 @@ Design goals (per project spec):
     compression, occlusion), and the dataset can expose per-image quality /
     artifact flags for sample weighting or curriculum filtering.
 
-The label schema follows ``dataframe_brsetmobile.csv``:
-    file, laterality, sex, age, educational_level, insurance, ...,
+The label schema follows ``dataframe_brsetmobile.csv`` / ``labels_mbrset.csv``:
+    file, patient, laterality, sex, age, educational_level, insurance, ...,
     final_icdr (0-4, NaN for ungradable), final_edema (yes/no),
-    final_quality (yes/no), final_artifacts (yes/no).
+    final_quality (yes/no), final_artifacts (yes/no),
+    and the systemic-comorbidity columns (yes/no): systemic_hypertension,
+    nephropathy, neuropathy, acute_myocardial_infarction, vascular_disease,
+    diabetic_foot, obesity, smoking, alcohol_consumption, insulin.
+The systemic columns are the *oculomics* targets — see :data:`SYSTEMIC_TASKS`.
 
 Typical use
 -----------
@@ -107,6 +111,45 @@ def _yes_no(value, positive: str = "yes") -> float:
     return float(value)
 
 
+_POS_TOKENS = frozenset({"yes", "y", "true", "t", "1", "1.0", "sim", "present", "positive"})
+_NEG_TOKENS = frozenset({"no", "n", "false", "f", "0", "0.0", "nao", "n\u00e3o", "absent", "negative"})
+
+
+def _binary_flag(value) -> float:
+    """Strict yes/no -> 1.0/0.0 for the systemic-comorbidity columns; NaN otherwise.
+
+    :func:`_yes_no` maps every unrecognised string to 0.0. That is acceptable for
+    the curated ophthalmic yes/no columns but not for self-reported / chart-derived
+    systemic fields whose encodings have not been audited on every release: an
+    unknown token ("unknown", "n/a", a 2 from a 1/2 release) must become NaN so
+    ``drop_missing_labels`` removes the row, rather than arriving as a confident
+    negative. If a column is encoded 1/2 the whole task comes out empty and the
+    trainer fails loudly — run ``inspect_mbrset.py`` on the CSV first.
+    """
+    if value is None:
+        return np.nan
+    if isinstance(value, (bool, np.bool_)):
+        return float(value)
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in _POS_TOKENS:
+            return 1.0
+        if t in _NEG_TOKENS:
+            return 0.0
+        return np.nan
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if np.isnan(f):
+        return np.nan
+    if f == 1.0:
+        return 1.0
+    if f == 0.0:
+        return 0.0
+    return np.nan
+
+
 def _icdr_grade(row: Dict[str, object]) -> float:
     v = row["final_icdr"]
     return np.nan if pd.isna(v) else float(int(v))
@@ -176,6 +219,53 @@ LABEL_REGISTRY: Dict[str, LabelSpec] = {
         description="Patient age in years (regression).",
     ),
 }
+
+# Systemic (oculomics) targets ------------------------------------------------ #
+# task name -> (mBRSET column, description). These exist ONLY in mBRSET's metadata
+# (BRSET carries a free-text ``comorbidities`` field), so they are trained and
+# tested in-domain on mBRSET with the patient-grouped split — there is no
+# tabletop->smartphone transfer arm for them. All are yes/no in a diabetic cohort.
+# Every one of them correlates with age and diabetes duration, so an image-model
+# AUROC is only evidence of a retinal signal once it beats the age+sex logistic
+# baseline (``covariate_baseline.py``; ``train_mbrset.py --covariate-baseline``).
+SYSTEMIC_TASKS: Dict[str, Tuple[str, str]] = {
+    "hypertension": ("systemic_hypertension", "Systemic arterial hypertension (yes/no)."),
+    "nephropathy": ("nephropathy", "Diabetic nephropathy (yes/no)."),
+    "neuropathy": ("neuropathy", "Diabetic peripheral neuropathy (yes/no)."),
+    "myocardial_infarction": ("acute_myocardial_infarction",
+                              "History of acute myocardial infarction (yes/no)."),
+    "vascular_disease": ("vascular_disease", "Vascular disease (yes/no)."),
+    "diabetic_foot": ("diabetic_foot", "Diabetic foot (yes/no)."),
+    "obesity": ("obesity", "Obesity (yes/no)."),
+    "smoking": ("smoking", "Smoking (yes/no)."),
+    "alcohol": ("alcohol_consumption", "Alcohol consumption (yes/no)."),
+    "insulin": ("insulin", "On insulin therapy (yes/no)."),
+}
+
+
+def _flag_spec(col: str, description: str) -> LabelSpec:
+    # A factory, not a loop-body lambda: the closure must bind THIS column.
+    return LabelSpec(source_cols=(col,), fn=lambda r: _binary_flag(r[col]),
+                     dtype=torch.long, num_classes=2, description=description)
+
+
+for _task, (_col, _desc) in SYSTEMIC_TASKS.items():
+    LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
+
+
+# BRSET's systemic targets, parsed from its free-text ``comorbidities`` field by
+# brset_comorbidities.py and joined per patient (brset_comorbidities.attach_flags):
+# 0/1, NaN when no history was recorded -- so drop_missing_labels keeps only the
+# recorded patients. ``cm_hypertension`` is NOT the mBRSET ``hypertension`` task:
+# different source, different cohort (see brset_comorbidities.MBRSET_EQUIVALENTS).
+from brset_comorbidities import GROUPS as _CM_GROUPS          # noqa: E402
+
+COMORBIDITY_TASKS: Dict[str, Tuple[str, str]] = {
+    f"cm_{g}": (f"cm_{g}", f"BRSET comorbidity, free text: {g.replace('_', ' ')} (yes/no).")
+    for g in _CM_GROUPS
+}
+for _task, (_col, _desc) in COMORBIDITY_TASKS.items():
+    LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
 
 
 # ----------------------------------------------------------------------------- #
@@ -309,7 +399,8 @@ class MBRSETDataset(Dataset):
     task : str, optional
         Key into :data:`LABEL_REGISTRY` (``dr_grade``, ``dr_referable``,
         ``dr_binary``, ``edema``, ``quality``, ``artifacts``, ``sex``,
-        ``age``). Mutually exclusive with ``label_col``.
+        ``age``, and the systemic targets in :data:`SYSTEMIC_TASKS`:
+        ``hypertension``, ``nephropathy``, ...). Mutually exclusive with ``label_col``.
     label_col : str, optional
         Use a raw CSV column directly as the label, optionally remapped via
         ``label_map``. Overrides ``task``.
@@ -344,7 +435,9 @@ class MBRSETDataset(Dataset):
 
     METADATA_COLS = (
         "patient", "age", "sex", "laterality", "educational_level", "insurance",
-        "dm_time", "insulin", "systemic_hypertension",
+        "dm_time", "insulin", "systemic_hypertension", "nephropathy", "neuropathy",
+        "acute_myocardial_infarction", "vascular_disease", "diabetic_foot", "obesity",
+        "smoking", "alcohol_consumption",
         "final_icdr", "final_edema", "final_quality", "final_artifacts",
     )
 
@@ -642,6 +735,54 @@ def stratified_split(
         "train": df_train.reset_index(drop=True),
         "val": df_val.reset_index(drop=True),
         "test": df_test.reset_index(drop=True),
+    }
+
+
+def fold_split(
+    csv: Union[str, pd.DataFrame],
+    task: str = "dr_referable",
+    fold: int = 0,
+    n_folds: int = 5,
+    val_frac: float = 0.10,
+    group_col: str = "patient",
+    seed: int = 42,
+) -> Dict[str, pd.DataFrame]:
+    """Fold ``fold`` of a patient-grouped, label-stratified ``n_folds``-fold
+    partition, as train / val / test.
+
+    test = that fold's patients; val = ``val_frac`` of all patients (grouped,
+    stratified) drawn from the other folds; train = the rest. ``seed`` fixes the
+    partition, so folds 0 .. n_folds-1 of one seed test every labelled patient
+    exactly once: their test predictions pool into one out-of-fold set, which a
+    single 20 % test split cannot give a small subset or a rare label. The
+    training seed is separate (it varies init and sampling only).
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    if not 0 <= fold < n_folds:
+        raise ValueError(f"fold_split: fold {fold} is outside 0..{n_folds - 1}")
+    df = pd.read_csv(csv) if isinstance(csv, str) else csv.copy()
+    if group_col not in df.columns:
+        raise ValueError(f"fold_split: group_col={group_col!r} is not a column of the CSV; "
+                         f"a patient-grouped partition cannot be downgraded to a per-image one")
+    spec = LABEL_REGISTRY[task]
+    y = np.array([spec.fn(dict(zip(spec.source_cols, row)))
+                  for row in df[list(spec.source_cols)].to_numpy()], dtype=np.float64)
+    keep = ~_isnan_vector(y)
+    df, y = df.loc[keep].reset_index(drop=True), y[keep]
+    groups = df[group_col].to_numpy()
+    folds = list(StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+                 .split(df, y, groups))
+    tv_idx, te_idx = folds[fold]
+    df_tv, y_tv, g_tv = df.iloc[tv_idx], y[tv_idx], groups[tv_idx]
+    rel_val = val_frac / (1.0 - 1.0 / n_folds)
+    n_splits_v = max(2, int(round(1.0 / max(rel_val, 1e-6))))
+    tr_idx, va_idx = next(StratifiedGroupKFold(n_splits=n_splits_v, shuffle=True, random_state=seed)
+                          .split(df_tv, y_tv, g_tv))
+    return {
+        "train": df_tv.iloc[tr_idx].reset_index(drop=True),
+        "val": df_tv.iloc[va_idx].reset_index(drop=True),
+        "test": df.iloc[te_idx].reset_index(drop=True),
     }
 
 

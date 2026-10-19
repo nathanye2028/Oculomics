@@ -41,6 +41,56 @@ attributable to the pixels once prevalence is accounted for.
 Both datasets flow through the same :class:`dataset.MBRSETDataset` — see
 ``brset_dataset.py`` for why a second loader would confound the comparison.
 
+Systemic (oculomics) targets on mBRSET
+--------------------------------------
+``--task hypertension|nephropathy|neuropathy|myocardial_infarction|...`` (see
+``dataset.SYSTEMIC_TASKS``) trains the same image-only model on mBRSET's
+systemic-comorbidity metadata, in-domain, patient-grouped. Two extras exist for
+them and cost nothing on the DR tasks:
+
+* ``--covariate-baseline``: a logistic regression on age+sex fit on the run's
+  own train split and scored on its test split (``covariate_baseline`` in the
+  JSON). Every systemic label is age-confounded and the retina encodes age, so
+  the image AUROC is only evidence of disease signal once it beats this line.
+* ``--init-from <ckpt>``: warm-start every non-head tensor from another
+  train_mbrset.py checkpoint (e.g. the BRSET-trained referable-DR student), the
+  head stays fresh. ``run_systemic.sh`` pairs this against ImageNet init
+  (``drinit`` vs ``ctrl``) so "does DR pre-training transfer to systemic
+  targets" gets the same paired-seed treatment as everything else here.
+
+BRSET comorbidity targets (``cm_*``)
+------------------------------------
+``--dataset brset --task cm_hypertension`` trains on BRSET's free-text history
+(brset_comorbidities.py; patients with no recorded history drop out). Pass
+``--camera "Canon CR"``: histories exist for 75% of Canon CR and 3% of Nikon
+patients, so a two-camera run could learn the camera. With
+``--covariate-baseline`` the run also answers the oculomics question directly
+(``incremental`` in the JSON): age+sex vs age+sex+image score, both fit on the
+validation patients and scored on the test patients, overall and within
+non-diabetic DR-grade-0 patients. ``cm_hypertension`` is scored on mBRSET's own
+hypertension column when ``--external-test-root`` is mBRSET.
+
+The before-lesions subsets (:func:`normal_eye_masks`, per patient, both eyes):
+``normal_looking`` = worst eye DR grade 0, no edema, and no hypertensive
+retinopathy, vessel occlusion or haemorrhage in either eye -- the lesions a
+clinician would name first for blood pressure; ``normal_looking_no_dm`` = the same
+in non-diabetic patients; ``all_flags_clear`` = DR 0, no edema and every BRSET eye
+finding clear. A patient with an unreadable flag is left out, never counted clear.
+
+``--fold K`` (with ``--n-folds``, ``--fold-seed``) replaces the 70/10/20 split by
+fold K of a fixed patient-grouped K-fold partition (``dataset.fold_split``):
+run K = 0..n-1 and every labelled patient is tested once. Each run writes its
+test rows (``--predictions-csv``, default next to ``--results-json``: label,
+image / covariate / combined scores, subset membership, the covariates) and
+``summarize_systemic.py`` pools the folds out of fold, including the matched-pair
+concordance (same sex and diabetes status, age within 2 years).
+
+``--vessel-ablation 0.12`` scores every test image twice more: with 12 % of the
+field of view inpainted along the vessels (vessel_ablation.py's line detector) and
+with the same mask rotated 90 degrees (control). ``vessel_ablation`` in the JSON
+and ``p_image_vessels`` / ``p_image_control`` in the test rows; vessels minus
+control below 0 = the score leans on the vasculature more than on other retina.
+
 Training recipe notes (2026-08-20)
 ----------------------------------
 * Imbalance is corrected ONCE (``--imbalance sampler`` by default). The old
@@ -68,6 +118,7 @@ import datetime
 import json
 import os
 import sys
+from typing import Optional
 
 import warnings
 
@@ -81,10 +132,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dataset import MBRSETDataset, stratified_split, DeviceAug  # noqa: E402
+from dataset import MBRSETDataset, fold_split, stratified_split, DeviceAug  # noqa: E402
 from model import MBRSETClassifier                        # noqa: E402
 from fundus_utils import seed_everything, seed_worker     # noqa: E402
 from metrics import quadratic_weighted_kappa, CSVLogger   # noqa: E402
+from covariate_baseline import (covariate_baseline, image_minus_covariate,  # noqa: E402
+                                incremental_rows, incremental_value)
 
 
 class ModelEMA:
@@ -217,7 +270,9 @@ def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0):
         b.train()
     seen = 0
     for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)
+        # non_blocking only on CUDA: MPS non-blocking copies from pageable memory
+        # are unsafe (they corrupted strided tensors in torch 2.8).
+        x = batch["image"].to(device, non_blocking=device.type == "cuda")
         if x.shape[0] < 2:
             continue
         m(x)
@@ -226,6 +281,80 @@ def adapt_bn(model: nn.Module, loader, device, max_batches: int = 0):
             break
     m.eval()
     return m, len(bns)
+
+
+def load_init_weights(model: nn.Module, path: str, root: str = None,
+                      external_root: str = None, seed: int = None) -> dict:
+    """Warm-start the backbone (every tensor except ``head.*``) from a
+    train_mbrset.py checkpoint trained on ANOTHER task -- e.g. initialise a
+    ``hypertension`` model from the BRSET-trained referable-DR student.
+
+    The head keeps its fresh init because the class semantics differ; every other
+    tensor whose name AND shape match is copied (a GCG gate or a different
+    backbone simply does not match, and is counted, not silently ignored). Always
+    the zero-shot ``model`` weights, never ``model_bnadapt``: those statistics were
+    estimated on mBRSET images, which may be this run's test split.
+
+    Leakage guards mirror :func:`load_teacher`: a checkpoint trained on this
+    run's ``--root`` under a different seed has fitted images that sit in this
+    run's test split (a warning -- the labels differ, but the features do not
+    know that); one trained on the external test root is refused.
+    """
+    ck = torch.load(path, map_location="cpu")
+    if "model" not in ck:
+        raise SystemExit(f"[fatal] --init-from {path}: no 'model' state dict in the checkpoint")
+    a = ck.get("args", {}) or {}
+    if external_root and a.get("root") and \
+            os.path.realpath(a["root"]) == os.path.realpath(external_root):
+        raise SystemExit(f"[fatal] --init-from {path} was trained on {a['root']}, which is this "
+                         f"run's --external-test-root: its features have seen the out-of-domain "
+                         f"test images.")
+    warning = None
+    if root and a.get("root") and os.path.realpath(a["root"]) == os.path.realpath(root) \
+            and seed is not None and int(a.get("seed", seed)) != int(seed):
+        warning = (f"--init-from checkpoint was trained on this run's --root with seed "
+                   f"{a.get('seed')} != {seed}: its train split overlaps this run's test "
+                   f"split. Use the same seed or a checkpoint from another dataset.")
+    src, dst = ck["model"], model.state_dict()
+    loaded, head, mismatch = [], [], []
+    for k, v in src.items():
+        if k.startswith("head."):
+            head.append(k)
+            continue
+        if k in dst and tuple(dst[k].shape) == tuple(v.shape):
+            dst[k] = v
+            loaded.append(k)
+        else:
+            mismatch.append(k)
+    if not loaded:
+        raise SystemExit(f"[fatal] --init-from {path}: no tensor matched this model "
+                         f"(checkpoint backbone {a.get('backbone')!r}); nothing to warm-start from.")
+    model.load_state_dict(dst)
+    missing = [k for k in dst if k not in loaded and not k.startswith("head.")]
+    return {"path": os.path.abspath(path), "init_task": a.get("task"),
+            "init_dataset": a.get("dataset"), "init_root": a.get("root"),
+            "init_backbone": a.get("backbone"), "init_seed": a.get("seed"),
+            "n_loaded": len(loaded), "n_head_skipped": len(head),
+            "n_shape_mismatch": len(mismatch), "n_missing": len(missing),
+            "warning": warning}
+
+
+def splits_from_file(df: pd.DataFrame, path: str) -> dict:
+    """train/val/test DataFrames from a CSV with ``file`` and ``split`` columns
+    (train_retinareach.py writes one per device). Rows the file does not list
+    are excluded; a patient appearing in two splits is refused."""
+    sf = pd.read_csv(path)
+    if not {"file", "split"} <= set(sf.columns):
+        raise SystemExit(f"[fatal] --split-file {path}: needs columns file, split")
+    lab = df["file"].astype(str).map(dict(zip(sf["file"].astype(str), sf["split"])))
+    out = {k: df[(lab == k).to_numpy()].reset_index(drop=True) for k in ("train", "val", "test")}
+    pats = {k: set(v["patient"]) for k, v in out.items()}
+    if pats["train"] & pats["test"] or pats["train"] & pats["val"] or pats["val"] & pats["test"]:
+        raise SystemExit(f"[fatal] --split-file {path}: a patient appears in two splits")
+    n_out = int(lab.isna().sum())
+    if n_out:
+        print(f"[warn] --split-file: {n_out} rows of the label CSV are not in {path}; excluded")
+    return out
 
 
 def pick_device() -> torch.device:
@@ -237,12 +366,17 @@ def pick_device() -> torch.device:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes):
-    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader."""
+def evaluate(model, loader, device, num_classes, return_probs: bool = False, transform=None):
+    """Returns dict with auroc / acc / macro-F1 / kappa on a held-out loader; with
+    ``return_probs`` also P(class 1) per row, in loader (= dataset) order.
+    ``transform`` (normalised batch -> normalised batch) perturbs the inputs first,
+    e.g. a vessel ablation."""
     model.eval()
     logits_all, y_all = [], []
     for batch in loader:
         x, y = batch["image"].to(device), batch["label"].to(device)
+        if transform is not None:
+            x = transform(x)
         logits_all.append(model(x).cpu())
         y_all.append(y.cpu())
     logits = torch.cat(logits_all)
@@ -260,13 +394,84 @@ def evaluate(model, loader, device, num_classes):
                                    for c in present]))
     except Exception:              # single-class split
         auroc = float("nan")
-    return {
+    metrics = {
         "auroc": auroc,
         "acc": float((pred == y).mean()),
         "f1": float(f1_score(y, pred, average="macro", zero_division=0)),
         "kappa": quadratic_weighted_kappa(pred, y, num_classes),
         "n": int(len(y)),
     }
+    if return_probs:
+        return metrics, (prob[:, 1] if prob.shape[1] == 2 else prob)
+    return metrics
+
+
+def rows_for(ds, df: pd.DataFrame) -> pd.DataFrame:
+    """The label rows behind a dataset, in its order (it drops rows with missing
+    labels / files and keeps only ``ds.files``)."""
+    t = df.assign(file=df["file"].astype(str)).drop_duplicates("file").set_index("file")
+    return t.loc[list(ds.files)].reset_index()
+
+
+def nodm_dr0_mask(rows: pd.DataFrame) -> Optional[np.ndarray]:
+    """Rows of non-diabetic patients whose worst eye is DR grade 0 (both eyes of a
+    patient share a split), or None when the table cannot say. The image cannot
+    be reading diabetic retinopathy inside this group."""
+    if not {"diabetes", "final_icdr", "patient"} <= set(rows.columns):
+        return None
+    from dataset import _binary_flag
+    dm = rows["diabetes"].map(_binary_flag)
+    worst = pd.to_numeric(rows["final_icdr"], errors="coerce").groupby(rows["patient"]).transform("max")
+    return ((dm == 0) & (worst == 0)).to_numpy()
+
+
+# The findings a clinician names first when a photo is said to show blood pressure.
+VASCULAR_FLAGS = ("hypertensive_retinopathy", "vascular_occlusion", "hemorrhage")
+
+
+def _patient_any(rows: pd.DataFrame, cols) -> pd.Series:
+    """Per row, over every image of its patient: 1 if any of ``cols`` is positive,
+    0 if all are readable and negative, NaN otherwise (unknown is never clear)."""
+    from dataset import _binary_flag
+    vals = np.stack([rows[c].map(_binary_flag).to_numpy(dtype=float) for c in cols], axis=1)
+    per_row = np.where((vals == 1).any(1), 1.0, np.where((vals == 0).all(1), 0.0, np.nan))
+    s = pd.Series(per_row, index=rows.index)
+    g = s.groupby(rows["patient"])
+    pos = g.transform(lambda v: (v == 1).any())
+    clear = g.transform(lambda v: (v == 0).all())
+    return pd.Series(np.where(pos, 1.0, np.where(clear, 0.0, np.nan)), index=rows.index)
+
+
+def normal_eye_masks(rows: pd.DataFrame) -> dict:
+    """Before-lesions subsets, decided per patient (both eyes share a split):
+
+    ``normal_looking``        worst eye DR grade 0, no edema, and none of
+                              :data:`VASCULAR_FLAGS` in either eye
+    ``normal_looking_no_dm``  the same, in non-diabetic patients
+    ``all_flags_clear``       DR grade 0, no edema and every BRSET eye finding
+                              (``flag_*``, brset_dataset.BRSET_EYE_FLAGS) clear
+
+    A subset whose columns the table lacks is omitted; a patient with an
+    unreadable flag is outside the subset, never counted as clear."""
+    from brset_dataset import BRSET_EYE_FLAGS
+    from dataset import _binary_flag
+    out = {}
+    if not {"final_icdr", "patient"} <= set(rows.columns):
+        return out
+    worst = pd.to_numeric(rows["final_icdr"], errors="coerce").groupby(rows["patient"]).transform("max")
+    base = worst == 0
+    if "final_edema" in rows.columns:
+        base &= _patient_any(rows, ["final_edema"]) == 0
+    vascular = [f"flag_{c}" for c in VASCULAR_FLAGS]
+    if all(c in rows.columns for c in vascular):
+        normal = base & (_patient_any(rows, vascular) == 0)
+        out["normal_looking"] = normal.to_numpy()
+        if "diabetes" in rows.columns:
+            out["normal_looking_no_dm"] = (normal & (rows["diabetes"].map(_binary_flag) == 0)).to_numpy()
+    every = [f"flag_{c}" for c in BRSET_EYE_FLAGS]
+    if all(c in rows.columns for c in every):
+        out["all_flags_clear"] = (base & (_patient_any(rows, every) == 0)).to_numpy()
+    return out
 
 
 def main() -> int:
@@ -284,9 +489,12 @@ def main() -> int:
                    help="Schema of --external-test-root.")
     p.add_argument("--image-ext", default=".jpg",
                    help="Extension appended to BRSET image_id values that lack one.")
+    from dataset import LABEL_REGISTRY                        # noqa: E402
     p.add_argument("--task", default="dr_referable",
-                   choices=["dr_referable", "dr_binary", "dr_grade", "edema",
-                            "quality", "artifacts"])
+                   choices=[t for t, sp in LABEL_REGISTRY.items() if sp.num_classes],
+                   help="Any classification task in dataset.LABEL_REGISTRY: the DR/edema/quality "
+                        "tasks and the systemic targets (hypertension, nephropathy, ...). "
+                        "Regression tasks (age) are not supported by this CE trainer.")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--patience", type=int, default=8)
@@ -342,6 +550,39 @@ def main() -> int:
                         "loader is shuffled with a generator seeded from --seed, so N "
                         "batches is a random sample of the external set, not its first N "
                         "rows in CSV order (which are often one clinic/patient block).")
+    # ---- systemic (oculomics) targets ------------------------------------- #
+    p.add_argument("--init-from", default=None,
+                   help="Warm-start every non-head tensor from another train_mbrset.py "
+                        "checkpoint (e.g. the referable-DR student) -- the head stays fresh. "
+                        "Loads the zero-shot 'model' weights, never 'model_bnadapt'.")
+    p.add_argument("--covariate-baseline", action="store_true",
+                   help="Also fit a logistic regression on --covariate-features (train split) "
+                        "and score it on the test split -> 'covariate_baseline' in the JSON. "
+                        "The floor an image model must clear on an age-confounded target.")
+    p.add_argument("--split-file", default=None,
+                   help="CSV (file, split) fixing the train/val/test partition instead of the "
+                        "seed-derived one, e.g. <retinareach run>/split_handheld.csv: the per-target "
+                        "model is then paired row for row with the RetinaReach probe")
+    p.add_argument("--camera", default=None,
+                   help='Keep only this camera\'s rows of --root before splitting (e.g. "Canon CR" '
+                        'for the BRSET comorbidity targets). The external set is not filtered.')
+    p.add_argument("--fold", type=int, default=None,
+                   help="Test on fold K of a fixed patient-grouped --n-folds partition "
+                        "(dataset.fold_split) instead of the seed-derived 70/10/20 split; "
+                        "run K = 0..n-1 and every labelled patient is tested once")
+    p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--fold-seed", type=int, default=42,
+                   help="Seed of the fold partition, fixed across folds and training seeds")
+    p.add_argument("--predictions-csv", default=None,
+                   help="Write the test rows (label, image / covariate / combined scores, subset "
+                        "membership). Default with --fold: <results-json>_test.csv")
+    p.add_argument("--vessel-ablation", type=float, default=0.0, metavar="FRAC",
+                   help="Also score every test image with FRAC of the field of view inpainted as "
+                        "vessel, and with the same mask rotated 90 degrees (control) "
+                        "(vessel_ablation.py; RetinaReach uses 0.12). 0 = off")
+    p.add_argument("--covariate-features", nargs="+", default=["age", "sex"],
+                   help="CSV columns for --covariate-baseline (default: age sex; add dm_time "
+                        "for the stricter chart-knowledge baseline).")
     p.add_argument("--gpu-aug", dest="gpu_aug", action="store_true", default=None,
                    help="Run the photometric/blur/erasing augmentation on the GPU per batch "
                         "instead of in CPU workers (default: on for CUDA). Same ops and "
@@ -362,6 +603,13 @@ def main() -> int:
         raise SystemExit(f"[fatal] --root and --external-test-root are the same directory "
                          f"({os.path.realpath(args.root)}): the 'out-of-domain' score would "
                          f"be measured on the training images.")
+    if args.fold is not None:
+        if args.split_file:
+            raise SystemExit("[fatal] --fold and --split-file both fix the partition; pass one")
+        if not 0 <= args.fold < args.n_folds:
+            raise SystemExit(f"[fatal] --fold {args.fold} is outside 0..{args.n_folds - 1}")
+    if args.predictions_csv is None and args.fold is not None and args.results_json:
+        args.predictions_csv = os.path.splitext(args.results_json)[0] + "_test.csv"
 
     seed_everything(args.seed, deterministic=not args.nondeterministic)
     device = pick_device()
@@ -369,13 +617,38 @@ def main() -> int:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt = os.path.join(args.ckpt_dir, f"{run_name}.pt")
 
-    from brset_dataset import load_any                      # noqa: E402
+    from brset_dataset import (add_brset_eye_flags, add_brset_extras,  # noqa: E402
+                               filter_camera, load_any)
+    from dataset import COMORBIDITY_TASKS                                # noqa: E402
     src = load_any(args.root, args.dataset, image_ext=args.image_ext)
     img_dir = src["images_dir"]
+    if args.dataset == "brset":
+        # the eye findings (flag_*, only ever used for the before-lesions subsets),
+        # diabetes / nationality (covariates, the no-DM subset) and, for a cm_* task,
+        # the parsed free-text comorbidity labels.
+        src["df"] = add_brset_eye_flags(src["df"], src["csv"])
+        src["df"] = add_brset_extras(src["df"], src["csv"],
+                                     comorbidities=args.task in COMORBIDITY_TASKS)
+    elif args.task in COMORBIDITY_TASKS:
+        raise SystemExit(f"[fatal] {args.task} is a BRSET free-text target; train it with --dataset brset")
+    if args.camera:
+        n0 = len(src["df"])
+        src["df"] = filter_camera(src["df"], args.camera)
+        print(f"[info] camera : {args.camera!r} -- {len(src['df'])} of {n0} rows kept")
 
-    # Patient-grouped, label-stratified 70/10/20 split (no patient leakage).
-    splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
-                              test_frac=0.20, group_col="patient", seed=args.seed)
+    # Patient-grouped, label-stratified 70/10/20 split (no patient leakage) --
+    # or a fixed partition from --split-file, e.g. RetinaReach's split_handheld.csv,
+    # so a per-target model and a RetinaReach probe are scored on the same rows.
+    if args.split_file:
+        splits = splits_from_file(src["df"], args.split_file)
+    elif args.fold is not None:
+        splits = fold_split(src["df"], task=args.task, fold=args.fold, n_folds=args.n_folds,
+                            val_frac=0.10, group_col="patient", seed=args.fold_seed)
+        print(f"[info] fold   : {args.fold} of {args.n_folds} (fold seed {args.fold_seed}; the "
+              f"training seed {args.seed} varies init and sampling only)")
+    else:
+        splits = stratified_split(src["df"], task=args.task, val_frac=0.10,
+                                  test_frac=0.20, group_col="patient", seed=args.seed)
     gpu_aug = args.gpu_aug if args.gpu_aug is not None else (device.type == "cuda")
     mk = lambda df, sp, d=img_dir: MBRSETDataset(csv=df, images_dir=d, task=args.task,
                                                  split=sp, image_size=args.image_size,
@@ -392,6 +665,12 @@ def main() -> int:
     if args.external_test_root:
         ext = load_any(args.external_test_root, args.external_test_dataset,
                        image_ext=args.image_ext)
+        if args.task in COMORBIDITY_TASKS:
+            from brset_comorbidities import MBRSET_EQUIVALENTS, mbrset_equivalents
+            if args.external_test_dataset != "mbrset" or args.task not in MBRSET_EQUIVALENTS:
+                raise SystemExit(f"[fatal] {args.task} has no equivalent column on "
+                                 f"{args.external_test_dataset} (brset_comorbidities.MBRSET_EQUIVALENTS)")
+            ext["df"] = mbrset_equivalents(ext["df"])
         ext_ds = mk(ext["df"], "val", ext["images_dir"])
         if ext_ds.num_classes != C:
             raise SystemExit(
@@ -443,6 +722,17 @@ def main() -> int:
     # records model.use_gcg for the same reason.
     print(f"[info] model  : {args.backbone}, {sum(q.numel() for q in model.parameters())/1e6:.3f}M params  "
           f"gcg={('on:' + args.gcg_variant) if model.use_gcg else 'off'}")
+
+    init_info = None
+    if args.init_from:
+        init_info = load_init_weights(model, args.init_from, root=args.root,
+                                      external_root=args.external_test_root, seed=args.seed)
+        print(f"[info] init   : {init_info['n_loaded']} tensors from {args.init_from} "
+              f"(task {init_info['init_task']!r} on {init_info['init_dataset']!r}); "
+              f"head re-initialised ({init_info['n_head_skipped']} tensors), "
+              f"{init_info['n_shape_mismatch']} shape-mismatched, {init_info['n_missing']} left at init")
+        if init_info["warning"]:
+            print(f"[warn] {init_info['warning']}")
 
     # ---- teacher for distillation ---------------------------------------- #
     teacher, proj, t_args = None, None, {}
@@ -578,10 +868,39 @@ def main() -> int:
           + ("  (AUROC was NaN; accuracy fallback)" if sel_metric == "acc" else ""))
 
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
-    tm = evaluate(model, test_loader, device, C)
+    tm, test_prob = evaluate(model, test_loader, device, C, return_probs=True)
     print(f"\n=== TEST (held-out, best checkpoint @ epoch {best_epoch}) ===")
     print(f"  AUROC={tm['auroc']:.4f}  acc={tm['acc']:.4f}  macroF1={tm['f1']:.4f}  "
           f"kappa={tm['kappa']:.4f}  n={tm['n']}")
+
+    # Mechanism: the same test images with the vessels inpainted, and with the same
+    # mask rotated 90 degrees (as much thin structure, mostly on other retina).
+    abl, abl_probs = None, {}
+    if args.vessel_ablation > 0 and C == 2:
+        from capability_gate import paired_delta_bootstrap
+        from vessel_ablation import ablate_normalised
+        for kind in ("vessels", "control"):
+            _, abl_probs[kind] = evaluate(
+                model, test_loader, device, C, return_probs=True,
+                transform=lambda x, k=kind: ablate_normalised(x, k, args.vessel_ablation))
+        y_t = (test_ds.labels.numpy() if hasattr(test_ds.labels, "numpy")
+               else np.asarray(test_ds.labels)).astype(int)
+        g_t = rows_for(test_ds, splits["test"])["patient"].astype(str).to_numpy()
+        from sklearn.metrics import roc_auc_score
+        two = len(np.unique(y_t)) == 2
+        auc = lambda p: float(roc_auc_score(y_t, p)) if two else float("nan")
+        vc = paired_delta_bootstrap(y_t, abl_probs["vessels"], abl_probs["control"], g_t,
+                                    1000, args.seed) if two else {}
+        abl = {"frac": args.vessel_ablation, "auroc_intact": auc(test_prob),
+               "auroc_vessels": auc(abl_probs["vessels"]), "auroc_control": auc(abl_probs["control"]),
+               "vessels_minus_control": vc.get("delta"), "vmc_ci": [vc.get("delta_lo"), vc.get("delta_hi")]}
+        print(f"\n=== VESSEL ABLATION ({args.vessel_ablation:.0%} of the field of view; control = the same "
+              f"mask rotated 90 degrees) ===")
+        print(f"  AUROC intact={abl['auroc_intact']:.4f}  vessels removed={abl['auroc_vessels']:.4f}  "
+              f"control removed={abl['auroc_control']:.4f}")
+        if vc:
+            print(f"  vessels minus control={vc['delta']:+.4f} [{vc['delta_lo']:+.4f}, {vc['delta_hi']:+.4f}]"
+                  f"  (below 0 with the CI below 0: the score leans on the vasculature)")
 
     em = None
     if ext_loader is not None:
@@ -594,6 +913,81 @@ def main() -> int:
               f"delta={em['auroc'] - tm['auroc']:+.4f}")
         print("    NB: one seed. Run >=3 and report mean+/-std, and check the class")
         print("    prevalence of both sets before attributing this gap to the images.")
+
+    # Age+sex logistic baseline on the SAME split (paired with the image model).
+    cb, cb_ext = None, None
+    if args.covariate_baseline:
+        feats = tuple(args.covariate_features)
+        cb = covariate_baseline(splits["train"], splits["test"], args.task,
+                                features=feats, seed=args.seed)
+        print(f"\n=== COVARIATE BASELINE (logistic regression on {'+'.join(feats)}; "
+              f"same patient-grouped split) ===")
+        if cb["auroc"] == cb["auroc"]:
+            d = image_minus_covariate(tm["auroc"], cb)
+            print(f"  AUROC={cb['auroc']:.4f}  n={cb['n_test']}    image model={tm['auroc']:.4f}"
+                  f"    image-minus-covariate={d:+.4f}")
+            print("  An image model that does not clear this line has learned the patient's")
+            print("  age from the retina, not the disease. Quote both numbers.")
+        else:
+            print(f"  not computed: {cb['reason']}")
+        if ext_ds is not None:
+            cb_ext = covariate_baseline(splits["train"], ext["df"], args.task,
+                                        features=feats, seed=args.seed)
+            if cb_ext["auroc"] == cb_ext["auroc"]:
+                print(f"  external ({args.external_test_dataset}): covariate AUROC="
+                      f"{cb_ext['auroc']:.4f}  image={em['auroc']:.4f}")
+
+    # Does the photo ADD to the covariates? Both models fit on the val patients,
+    # scored on the test patients (covariate_baseline.incremental_value).
+    inc = None
+    if args.covariate_baseline and C == 2:
+        _, val_prob = evaluate(model, val_loader, device, C, return_probs=True)
+        val_rows, test_rows = rows_for(val_ds, splits["val"]), rows_for(test_ds, splits["test"])
+        subsets = {}
+        m = nodm_dr0_mask(test_rows)
+        if m is not None:
+            subsets["no_diabetes_dr0"] = m
+        subsets.update(normal_eye_masks(test_rows))
+        inc = incremental_value(val_rows, val_prob, test_rows, test_prob, args.task,
+                                features=tuple(args.covariate_features), subsets=subsets,
+                                seed=args.seed)
+        feats = "+".join(args.covariate_features)
+        print(f"\n=== DOES THE PHOTO ADD TO {feats.upper()}? (fit on val, scored on test) ===")
+        if inc["reason"]:
+            print(f"  not computed: {inc['reason']}")
+        for name, b in [("all test patients", inc.get("test"))] + \
+                       [(k, v) for k, v in (inc.get("subsets") or {}).items()]:
+            if not b or "delta" not in b:
+                continue
+            lo, hi = b.get("delta_ci", [float("nan")] * 2)
+            print(f"  {name:<22} {feats}={b['auroc_covariates']:.4f}  +image={b['auroc_combined']:.4f}  "
+                  f"delta={b['delta']:+.4f} [{lo:+.4f}, {hi:+.4f}]  image alone={b['auroc_image']:.4f}  "
+                  f"({b['pos_patients']} positive patients)")
+
+    # The test rows, so folds can be pooled out of fold (summarize_systemic.py).
+    pred_csv = None
+    if args.predictions_csv and C == 2:
+        rows = rows_for(test_ds, splits["test"])
+        lab = test_ds.labels.numpy() if hasattr(test_ds.labels, "numpy") else np.asarray(test_ds.labels)
+        pr = pd.DataFrame({"file": rows["file"].astype(str), "patient": rows["patient"].astype(str),
+                           "label": lab.astype(float), "p_image": np.asarray(test_prob, dtype=float)})
+        for kind, p_ in abl_probs.items():
+            pr[f"p_image_{kind}"] = np.asarray(p_, dtype=float)
+        # the covariates as recorded, so matched pairs (same sex and diabetes status,
+        # age within a caliper) can be formed from the pooled rows
+        for c in dict.fromkeys(["age", "sex"] + list(args.covariate_features)):
+            if c in rows.columns:
+                pr[c] = rows[c].to_numpy()
+        if inc is not None and inc.get("reason") is None:
+            pr = pd.concat([pr, incremental_rows(val_rows, val_prob, test_rows, test_prob, args.task,
+                                                 features=tuple(args.covariate_features))], axis=1)
+            for name, m_ in subsets.items():
+                pr[f"in_{name}"] = np.asarray(m_, dtype=bool)
+        pr = pr.assign(task=args.task, fold=args.fold, seed=args.seed)
+        os.makedirs(os.path.dirname(os.path.abspath(args.predictions_csv)), exist_ok=True)
+        pr.to_csv(args.predictions_csv, index=False)
+        pred_csv = os.path.abspath(args.predictions_csv)
+        print(f"[info] wrote {args.predictions_csv} ({len(pr)} test rows)")
 
     # Positive-class counts (binary tasks) so a summariser can derive the two
     # prevalences from the run itself instead of hardcoding them.
@@ -613,6 +1007,17 @@ def main() -> int:
               "external_pos": _pos(ext_ds),
               "domain_gap_auroc": (em["auroc"] - tm["auroc"]) if em else None,
               "external_bnadapt": None,
+              "init_from": init_info,
+              "split_file": os.path.abspath(args.split_file) if args.split_file else None,
+              "fold": args.fold, "n_folds": args.n_folds if args.fold is not None else None,
+              "fold_seed": args.fold_seed if args.fold is not None else None,
+              "predictions_csv": pred_csv,
+              "vessel_ablation": abl,
+              "covariate_baseline": cb,
+              "covariate_baseline_external": cb_ext,
+              "incremental": inc,
+              "camera": args.camera,
+              "image_minus_covariate_auroc": image_minus_covariate(tm["auroc"], cb) if cb else None,
               "backbone": args.backbone, "teacher": args.teacher,
               "teacher_ckpt": os.path.abspath(args.teacher) if args.teacher else None,
               "teacher_dataset": t_args.get("dataset") if args.teacher else None,
@@ -624,6 +1029,7 @@ def main() -> int:
 
     def write_results():
         if args.results_json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
             with open(args.results_json, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"[info] wrote {args.results_json}")
