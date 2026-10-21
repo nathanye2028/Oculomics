@@ -30,6 +30,13 @@ Every knob is an environment variable:
                    reused with kagglehub); unset = no unfamiliar-camera check      (default "")
     U_DATASET      its schema: odir | mbrset | brset | airogs | refuge | papila       (default odir)
     U_NAME         its label in the tables                                         (default $U_DATASET)
+  one source camera, the other held out (the camera ladder's small-change rung)
+    SOURCE_CAMERA  train / validate / calibrate / threshold on this BRSET camera only,
+                   e.g. "Canon CR"                                                  (default "")
+    HOLDOUT_CAMERA score this other BRSET camera exactly like an unfamiliar camera,
+                   e.g. "NIKON NF5050"; needs SOURCE_CAMERA. Patients photographed on
+                   both cameras are dropped from it                                 (default "")
+                   Use a fresh OUT and CK: a seed whose results.json exists is skipped.
   checks
     PREFLIGHT      1 = before any seed, a few-minute dry run (data, encodings, per-target
                    power, one GPU training step, one calibration, disk, time estimate);
@@ -58,6 +65,9 @@ example
     B=/data/BRSET/1.0.1 M=/data/mBRSET/1.0 CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
     # with ODIR-5K as the unfamiliar camera and the shuffled-label control
     B=... M=... U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 bash run_retinareach.sh 0 1 2 3 4
+    # trained on Canon only, Nikon held out as the small-camera-change rung
+    B=... M=... SOURCE_CAMERA="Canon CR" HOLDOUT_CAMERA="NIKON NF5050" OUT=exp_rr_canon CK=ck_rr_canon \
+      bash run_retinareach.sh 0 1 2 3 4
 USAGE
 }
 for a in "$@"; do
@@ -85,6 +95,8 @@ SHUFFLE=${SHUFFLE:-0}
 PREFLIGHT=${PREFLIGHT:-1}
 PERTARGET=${PERTARGET:-}
 PT_EXTRA=${PT_EXTRA:---ema-decay 0.999}
+SOURCE_CAMERA=${SOURCE_CAMERA:-}
+HOLDOUT_CAMERA=${HOLDOUT_CAMERA:-}
 PY=.venv/bin/python
 
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2 3 4)
@@ -104,6 +116,14 @@ if [ -n "$U" ]; then
   echo "[info] unfamiliar camera: $U_NAME ($U_DATASET) @ $U"
   UNF=(--unfamiliar "$U" "$U_DATASET" "$U_NAME")
 fi
+# camera names hold spaces ("Canon CR"), so they travel as array elements, never via EXTRA
+CAM=()
+[ -n "$SOURCE_CAMERA" ] && CAM+=(--source-camera "$SOURCE_CAMERA")
+if [ -n "$HOLDOUT_CAMERA" ]; then
+  [ -n "$SOURCE_CAMERA" ] || { echo "[fatal] HOLDOUT_CAMERA needs SOURCE_CAMERA"; exit 1; }
+  CAM+=(--holdout-camera "$HOLDOUT_CAMERA")
+  echo "[info] trained on $SOURCE_CAMERA only; $HOLDOUT_CAMERA held out as an unfamiliar camera"
+fi
 
 run() {  # run <dir name> <seed> [extra flags...]
   local name=$1 s=$2; shift 2
@@ -112,7 +132,8 @@ run() {  # run <dir name> <seed> [extra flags...]
   # shellcheck disable=SC2086
   $PY -u train_retinareach.py --source-root "$B" --target-root "$M" \
       --backbone "$STUDENT" --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS" \
-      --seed "$s" --out "$OUT/$name" --ckpt "$CK/$name.pt" ${UNF[@]+"${UNF[@]}"} $AMP $EXTRA "$@"
+      --seed "$s" --out "$OUT/$name" --ckpt "$CK/$name.pt" ${UNF[@]+"${UNF[@]}"} \
+      ${CAM[@]+"${CAM[@]}"} $AMP $EXTRA "$@"
 }
 
 if [ "$PREFLIGHT" = 1 ]; then
@@ -121,7 +142,7 @@ if [ "$PREFLIGHT" = 1 ]; then
   $PY -u train_retinareach.py --source-root "$B" --target-root "$M" \
       --backbone "$STUDENT" --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS" \
       --seed "${SEEDS[0]}" --out "$OUT/preflight" --ckpt "$CK/preflight.pt" \
-      ${UNF[@]+"${UNF[@]}"} $AMP $EXTRA --preflight \
+      ${UNF[@]+"${UNF[@]}"} ${CAM[@]+"${CAM[@]}"} $AMP $EXTRA --preflight \
     || { echo "[fatal] preflight failed: fix the items above (PREFLIGHT=0 skips it)"; exit 1; }
 fi
 

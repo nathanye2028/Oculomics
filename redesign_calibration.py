@@ -53,8 +53,18 @@ C  Deployment-sized calibration sets. The phone has N captures, not a pool of
    mean and SD of sensitivity, and how often a single clinic's draw reaches the
    sensitivity floor.
 
+The cameras are the ones the checkpoint's run scored, with that run's own tables:
+a run trained with ``--source-camera`` gets its source camera filtered the same way
+(so the tabletop splits are the trainer's, and no training patient lands in a test
+split), and a run with ``--holdout-camera`` gets the held-out camera as one more
+device, minus the patients it shares with the source -- the camera ladder's
+small-change rung, through every experiment above (``--no-holdout`` skips it).
+
 Outputs: ``<out>/redesign.csv`` (one row per checkpoint x experiment x camera x
-setting x repeat x target) and a printed summary.
+setting x repeat x target), ``<out>/ladder.csv`` (the camera ladder: per camera,
+the primary target's AUROC / sensitivity / specificity at the shipped threshold as
+trained, after AdaBN at the camera's own and at the source's prevalence, after
+shallow recalibration, and with the label-free EM threshold) and a printed summary.
 """
 from __future__ import annotations
 
@@ -70,7 +80,7 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from brset_dataset import load_any  # noqa: E402
+from brset_dataset import filter_camera, load_any  # noqa: E402
 from capability_gate import multitask_split  # noqa: E402
 from fundus_utils import seed_worker  # noqa: E402
 from metadata_model import _auc, load_table  # noqa: E402
@@ -78,7 +88,8 @@ from retinareach import (THRESHOLD_METHODS, bn_layers, build_from_checkpoint,  #
                          calibrate_blended, fit_threshold_reference, label_free_threshold,
                          set_bn_stats, stats_from_lists)
 from train_mbrset import pick_device  # noqa: E402
-from train_retinareach import MultiTargetDataset, parse_unfamiliar, predict  # noqa: E402
+from train_retinareach import (MultiTargetDataset, camera_slug, holdout_camera,  # noqa: E402
+                               parse_unfamiliar, predict)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,9 +139,32 @@ def metrics(y: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
             "threshold": float(thr)}
 
 
+def device_specs(ck: dict, a) -> List[tuple]:
+    """``(name, root, dataset, table or None)`` for every camera the checkpoint's run
+    scored, with that run's own tables: the source camera filtered as the trainer
+    filtered it (``--source-camera``), the held-out source camera minus the patients
+    it shares with the source (``--holdout-camera``, the same rule as the trainer,
+    so its splits are the trainer's too), the target, and each ``--unfamiliar``
+    camera. ``None`` = the dataset's whole label table."""
+    args = ck["args"]
+    s_root, s_ds = a.source_root or args["source_root"], args["source_dataset"]
+    full, src = None, None
+    if args.get("source_camera"):
+        full = load_table(s_root, s_ds)[0]
+        src = filter_camera(full, args["source_camera"].strip())
+    specs = [(args["source_name"], s_root, s_ds, src)]
+    if args.get("holdout_camera") and not getattr(a, "no_holdout", False):
+        name = args.get("holdout_name") or camera_slug(args["holdout_camera"])
+        specs.append((name, s_root, s_ds, holdout_camera(full, src, args["holdout_camera"].strip())[0]))
+    specs.append((args["target_name"], a.target_root or args["target_root"], args["target_dataset"], None))
+    if not a.no_unfamiliar:
+        specs += [(n, r, d, None) for r, d, n in (parse_unfamiliar(u) for u in args.get("unfamiliar") or [])]
+    return specs
+
+
 def load_device(root: str, dataset: str, targets: Sequence[str], strat: str, split_seed: int,
-                image_size: int) -> Dict[str, object]:
-    df, _ = load_table(root, dataset)
+                image_size: int, table: Optional[pd.DataFrame] = None) -> Dict[str, object]:
+    df = load_table(root, dataset)[0] if table is None else table
     split = multitask_split(df, strat, seed=split_seed)
     img = load_any(root, dataset)["images_dir"]
     mk = lambda part: MultiTargetDataset(split[part], img, targets, "val", image_size)
@@ -156,12 +190,8 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
     tab = stats_from_lists(ck["profiles"][S]["bn_stats"])          # tabletop-calibrated statistics
     seed = int(args.get("seed", 0))
     rng = np.random.default_rng(seed)
-    specs = [(S, a.source_root or args["source_root"], args["source_dataset"]),
-             (T, a.target_root or args["target_root"], args["target_dataset"])]
-    if not a.no_unfamiliar:
-        specs += [(n, r, d) for r, d, n in (parse_unfamiliar(u) for u in args.get("unfamiliar") or [])]
-    devs = {n: load_device(r, d, targets, src_targets[0], int(args["split_seed"]), size)
-            for n, r, d in specs}
+    devs = {n: load_device(r, d, targets, src_targets[0], int(args["split_seed"]), size, table=tbl)
+            for n, r, d, tbl in device_specs(ck, a)}
     loaders = {n: DataLoader(v["test"], batch_size=64, num_workers=a.num_workers,
                              worker_init_fn=seed_worker) for n, v in devs.items()}
     print(f"\n=== {path} (seed {seed}): cameras {list(devs)}; threshold dr {thr_cal.get(src_targets[0]):.3f} ===")
@@ -211,7 +241,8 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
                     continue
                 cal, info = calibrate_blended(tab_model, calib_loader(Subset(d["pool"], idx), seed + r), dev)
                 add("A_prevalence", dname, f"pool prevalence {prev:.3f}", score(cal, dname, thr_cal),
-                    pool_prev=prev, repeat=r, n_images=info.n_images)
+                    pool_prev=prev, repeat=r, n_images=info.n_images,
+                    source_prevalence=prev == round(src_prev, 3))
                 del cal
 
     others = [n for n in devs if n != S]
@@ -303,6 +334,50 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
     return rows
 
 
+def _col(d: pd.DataFrame, c: str) -> pd.Series:
+    return d[c] if c in d.columns else pd.Series(np.nan, index=d.index)
+
+
+# (setting, rows of redesign.csv it reads): the camera ladder's columns, all at the
+# shipped threshold unless the threshold is re-set
+LADDER = (
+    ("as trained", lambda d: (d["experiment"] == "baseline") & (d["setting"] == "as trained")),
+    ("AdaBN, own prevalence", lambda d: (d["experiment"] == "baseline")
+     & (d["setting"] == "AdaBN (full pool)")),
+    ("AdaBN, source prevalence", lambda d: (d["experiment"] == "A_prevalence")
+     & (_col(d, "source_prevalence") == True)),                                    # noqa: E712
+    ("shallow, own prevalence", lambda d: (d["experiment"] == "B1_shallow")
+     & np.isclose(_col(d, "depth_fraction").astype(float), d.attrs.get("shallow_frac", 0.5))),
+    ("shallow + EM threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & _col(d, "base").astype(str).str.startswith("shallow") & (_col(d, "method") == "em")),
+    ("AdaBN + EM threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & (_col(d, "base") == "AdaBN (full pool)") & (_col(d, "method") == "em")),
+)
+
+
+def ladder(df: pd.DataFrame, primary: str, devices: Sequence[str], shallow_frac: float) -> pd.DataFrame:
+    """Per camera (in ladder order) and setting: the primary target's AUROC,
+    sensitivity (mean and SD over checkpoints and repeats), specificity and
+    flagged fraction. The source camera has no shallow / EM rows (nothing to
+    recalibrate it to); "AdaBN, source prevalence" on another camera is the camera
+    effect with the disease rate held at the source's."""
+    d = df[df["target"] == primary].copy()
+    d.attrs["shallow_frac"] = shallow_frac
+    rows = []
+    for dev_name in devices:
+        dd = d[d["device"] == dev_name]
+        dd.attrs["shallow_frac"] = shallow_frac
+        for setting, sel in LADDER:
+            e = dd[sel(dd)] if len(dd) else dd
+            if e.empty:
+                continue
+            rows.append({"device": dev_name, "setting": setting, "rows": int(len(e)),
+                         "auroc": e["auroc"].mean(), "sensitivity": e["sensitivity"].mean(),
+                         "sensitivity_sd": e["sensitivity"].std(), "specificity": e["specificity"].mean(),
+                         "flagged": e["flagged"].mean()})
+    return pd.DataFrame(rows)
+
+
 def summarise(df: pd.DataFrame, primary: str) -> str:
     d = df[df["target"] == primary]
     out = []
@@ -335,6 +410,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--source-root", default=None, help="override the checkpoint's recorded roots")
     p.add_argument("--target-root", default=None)
     p.add_argument("--no-unfamiliar", action="store_true")
+    p.add_argument("--no-holdout", action="store_true",
+                   help="skip the held-out source camera of a --holdout-camera run")
     p.add_argument("--pool-size", type=int, default=512)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--depth-fractions", type=float, nargs="+",
@@ -355,20 +432,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = p.parse_args(argv)
     dev = pick_device() if a.device == "auto" else torch.device(a.device)
     os.makedirs(a.out, exist_ok=True)
-    rows = []
+    rows, order = [], []
     for path in a.ckpt:
+        ck0 = torch.load(path, map_location="cpu", weights_only=False)
         if a.target_sens is None:
-            a.target_sens = float(torch.load(path, map_location="cpu",
-                                             weights_only=False)["args"].get("target_sens", 0.85))
+            a.target_sens = float(ck0["args"].get("target_sens", 0.85))
+        order += [n for n, *_ in device_specs(ck0, a) if n not in order]
+        del ck0
         rows += run_checkpoint(path, a, dev)
         pd.DataFrame(rows).to_csv(os.path.join(a.out, "redesign.csv"), index=False)
     df = pd.DataFrame(rows)
     primary = df["target"].iloc[0] if len(df) else "dr_referable"
-    txt = summarise(df, "dr_referable" if (df["target"] == "dr_referable").any() else primary)
+    primary = "dr_referable" if (df["target"] == "dr_referable").any() else primary
+    txt = summarise(df, primary)
+    lad = ladder(df, primary, order, a.shallow_frac)
+    if len(lad):
+        lad.to_csv(os.path.join(a.out, "ladder.csv"), index=False)
+        txt += (f"\n\n--- camera ladder ({primary}; cameras in ladder order; sensitivity at the shipped "
+                f"threshold unless re-set; mean over checkpoints and repeats) ---\n"
+                + lad.pivot_table(index="device", columns="setting", values="sensitivity", sort=False)
+                .reindex(index=[o for o in order if o in set(lad["device"])],
+                         columns=[s for s, _ in LADDER if s in set(lad["setting"])])
+                .to_string(float_format=lambda v: f"{v:.3f}"))
     print(txt)
     with open(os.path.join(a.out, "redesign_summary.txt"), "w") as f:
         f.write(txt + "\n")
-    print(f"\nwrote {a.out}/redesign.csv and redesign_summary.txt")
+    print(f"\nwrote {a.out}/redesign.csv, ladder.csv and redesign_summary.txt")
     return 0
 
 

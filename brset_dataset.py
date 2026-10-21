@@ -46,7 +46,7 @@ error naming the columns that were present instead.
     DR_ICDR      (0-4)    -> final_icdr        same ICDR scale in both datasets
     macular_edema(0/1)    -> final_edema       dataset.py's _yes_no handles 0/1
     patient_age           -> age
-    patient_sex  (1/2)    -> sex     (0/1)     RE-ENCODED, see below
+    patient_sex  (1/2)    -> sex     (1/0)     RE-ENCODED, 1 = male in every dataset
     exam_eye     (1/2)    -> laterality
     quality               -> final_quality     optional; absent in some releases
     artifacts             -> final_artifacts   optional
@@ -58,10 +58,14 @@ something different from their mBRSET counterparts. All three were caught by
 reading an actual CSV, not the spec, and all three fail *silently* or crash far
 from the cause:
 
-``patient_sex``  1/2 -> 0/1
+``patient_sex``  1/2 -> 1/0  (1 = male, mBRSET's convention)
     ``LABEL_REGISTRY["sex"]`` declares ``num_classes=2`` and passes the raw value
     through. A 2 indexes past the end of a 2-logit head and raises inside
-    CrossEntropyLoss with no mention of the CSV.
+    CrossEntropyLoss with no mention of the CSV. The direction matters too: BRSET
+    1 = male / 2 = female (all 9 "prostatic hyperplasia" patients are 1, all 6
+    "breast cancer" patients 2; lab box, 2026-10-16), mBRSET 1 = male (code 1
+    drinks 2.3x and has 1.7x the MI rate). The old ``- 1`` made BRSET 1 = female,
+    reversing sex between the datasets.
 
 ``quality``  Adequate/Inadequate -> 1/0
     mBRSET stores yes/no here, and ``dataset._yes_no`` returns 1.0 only for the
@@ -147,15 +151,18 @@ TASK_REQUIREMENTS: Dict[str, str] = {
 
 
 def _normalise_sex(s: pd.Series) -> pd.Series:
-    """BRSET encodes sex as 1/2; dataset.py's ``sex`` task expects 0/1.
+    """BRSET sex 1 = male / 2 = female -> 1 / 0, mBRSET's convention (1 = male).
 
-    Left as-is this is not a crash you would enjoy debugging: a label of 2 against
-    a 2-logit head raises deep inside CrossEntropyLoss with no mention of the CSV.
+    Two ways to get this wrong, both silent. Passed through raw, a label of 2
+    against a 2-logit head raises deep inside CrossEntropyLoss with no mention of
+    the CSV. Recoded as ``s - 1`` (the old rule), BRSET came out 1 = female --
+    reversed against mBRSET, so any sex coefficient fit on one dataset pointed
+    the wrong way on the other (verified on the real CSV, see the module notes).
     Values already in {0,1} pass through, so re-running on adapted data is safe.
     """
     vals = set(pd.unique(s.dropna()))
     if vals and vals <= {1, 2, 1.0, 2.0}:
-        return s - 1
+        return s.map({1: 1.0, 2: 0.0}).astype(float)
     return s
 
 
@@ -332,6 +339,43 @@ def resolve_root(root: str, dataset: str, max_depth: int = 5) -> str:
         f"{dataset}: none of {names} within {max_depth} levels of {root}. "
         f"CSVs found there: {sorted(csvs)[:12] or 'none'}. Pass the directory that holds "
         f"the label CSV and the images/ folder (e.g. the PhysioNet version dir mBRSET/1.0).")
+
+
+# BRSET clinical columns load_brset drops (it keeps only the mBRSET-schema ones)
+# but that are metadata, not image labels.
+BRSET_EXTRA_METADATA = ("diabetes", "nationality")
+
+
+def add_brset_extras(df: pd.DataFrame, csv_path: str, comorbidities: bool = True) -> pd.DataFrame:
+    """BRSET's extra clinical columns (:data:`BRSET_EXTRA_METADATA`) and, with
+    ``comorbidities``, the parsed ``cm_<target>`` labels (brset_comorbidities.py),
+    added to a load_brset table. Shared by metadata_model.py and train_mbrset.py so
+    both read the same targets and covariates."""
+    raw = pd.read_csv(csv_path)
+    out = df.copy()
+    for c in BRSET_EXTRA_METADATA:
+        if c in raw.columns and c not in out.columns and len(raw) == len(out):
+            out[c] = raw[c].to_numpy()
+    if comorbidities:
+        from brset_comorbidities import attach_flags
+        out = attach_flags(out, csv_path)
+    return out
+
+
+def filter_camera(df: pd.DataFrame, camera: Optional[str]) -> pd.DataFrame:
+    """Keep one camera's rows. The BRSET comorbidity audit found histories on 75%
+    of Canon CR patients but 3% of Nikon NF5050 ones, so the systemic cohort is
+    run on one camera and the camera cannot stand in for the label. The metadata
+    model and the image run take the same ``--camera``."""
+    if not camera:
+        return df
+    if "camera" not in df.columns:
+        raise ValueError("--camera given but the table has no camera column")
+    keep = df["camera"].astype(str).str.strip() == camera
+    if not keep.any():
+        raise ValueError(f"--camera {camera!r} matches no rows; cameras present: "
+                         f"{sorted(df['camera'].dropna().astype(str).unique())}")
+    return df.loc[keep].reset_index(drop=True)
 
 
 def load_any(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str, str]:

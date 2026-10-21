@@ -36,6 +36,17 @@ and ``--inspect`` shows what was actually joined before any GPU time is spent.
                        ``final_icdr`` read from the same keywords (see
                        :func:`odir_age_fields`), plus ``keywords`` and ``camera``;
                        the placeholder age 1 (16 records) becomes NaN.
+    --dataset messidor2  Messidor-2: 874 examinations of two macula-centred photos
+                       each, released WITHOUT grades. The grades in circulation are
+                       the adjudicated ones of Krause et al. 2018 (messidor_data.csv:
+                       image_id, adjudicated_dr_grade 0-4 ICDR, adjudicated_dme,
+                       adjudicated_gradable) or repackagings that rename them
+                       (id_code / diagnosis). -> ``final_icdr``, ``final_edema``,
+                       ``final_quality`` (gradable); an ungradable photo carries no
+                       grade. The examination pairing exists only in the release's
+                       own sheet (two image names per row, messidor-2.csv); without
+                       it every image is its own patient and patient-level referral
+                       cannot be scored. RetinaReach's once-only external test.
 
 Every adapter returns ``{"df", "images_dir", "csv", "source"}`` with columns
 ``file`` (relative to ``images_dir``, may contain sub-directories), ``patient``,
@@ -44,6 +55,7 @@ the task columns ``glaucoma`` / ``amd`` (0/1/NaN), and ``age`` / ``sex`` /
 (in requirements.txt); a CSV export next to the sheet works too.
 
     python public_fundus.py --root <ODIR-5K> --dataset odir --inspect
+    python public_fundus.py --root <Messidor2> --dataset messidor2 --inspect --strict
 """
 from __future__ import annotations
 
@@ -56,7 +68,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-PUBLIC_DATASETS: Tuple[str, ...] = ("airogs", "refuge", "papila", "odir")
+PUBLIC_DATASETS: Tuple[str, ...] = ("airogs", "refuge", "papila", "odir", "messidor2")
 IMG_EXTS = (".jpg", ".jpeg", ".png")
 _SKIP_DIR_TOKENS = ("mask", "annotation", "segmentation", "disc_cup", "cup_disc", "gt", "label")
 
@@ -275,6 +287,8 @@ def load_papila(root: str, image_ext: str = ".jpg", papila_suspect: str = "exclu
             lab = {0: 0.0, 1: 1.0}.get(int(d) if d == d else -1, np.nan)
             if d == 2:
                 lab = {"exclude": np.nan, "positive": 1.0, "negative": 0.0}[papila_suspect]
+            # Gender passed through raw: NOT checked against the 1 = male convention
+            # the other adapters use. Verify before using sex across datasets.
             rows.append({"file": file, "patient": digits, "laterality": lat, "glaucoma": lab,
                          "age": r[ac] if ac else np.nan, "sex": r[gc] if gc else np.nan,
                          "papila_diagnosis": d})
@@ -361,7 +375,7 @@ def load_odir(root: str, image_ext: str = ".jpg") -> Dict[str, object]:
     lkw, rkw = _col(t, "Left-Diagnostic Keywords"), _col(t, "Right-Diagnostic Keywords")
     if lkw is None or rkw is None:
         raise KeyError(f"ODIR-5K {csv}: need Left-/Right-Diagnostic Keywords; found {list(t.columns)}")
-    sex_map = {"male": 0.0, "female": 1.0, "m": 0.0, "f": 1.0}
+    sex_map = {"male": 1.0, "female": 0.0, "m": 1.0, "f": 0.0}    # 1 = male, as mBRSET / BRSET
     rows = []
     fnc = _col(t, "filename")
     for _, r in t.iterrows():
@@ -392,9 +406,127 @@ def load_odir(root: str, image_ext: str = ".jpg") -> Dict[str, object]:
 
 
 # --------------------------------------------------------------------------- #
+# Messidor-2
+# --------------------------------------------------------------------------- #
+_M2_IMG_EXTS = IMG_EXTS + (".tif", ".tiff")
+# Filename-like ids before a bare numeric "id" (the AIROGS-v2 lesson).
+_M2_ID = ("image_id", "id_code", "image", "image_name", "filename", "file", "id")
+# ICDR 0-4 grade columns only, in order of preference. Generic names ("Retinopathy
+# grade", "level") are left out on purpose: the original Messidor sheets grade on a
+# 0-3 scale of their own, and reading that as ICDR would shift every grade.
+_M2_GRADE = ("adjudicated_dr_grade", "diagnosis", "dr_grade")
+
+
+def _stem(name) -> str:
+    return os.path.splitext(os.path.basename(str(name).strip()))[0].lower()
+
+
+def _messidor2_images(root: str) -> Dict[str, str]:
+    """{lower-case stem: path relative to root} for every photo under root. When a
+    stem exists twice (a repackaging that ships the originals and a preprocessed
+    copy) the copy outside any 'preprocess' folder wins: the pipeline does its own
+    field-of-view crop and expects the photograph as taken."""
+    idx: Dict[str, str] = {}
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not any(t in d.lower() for t in _SKIP_DIR_TOKENS))
+        for f in sorted(files):
+            if not f.lower().endswith(_M2_IMG_EXTS):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, f), root)
+            old = idx.get(_stem(f))
+            if old is None or ("preprocess" in old.lower() and "preprocess" not in rel.lower()):
+                idx[_stem(f)] = rel
+    return idx
+
+
+def _messidor2_tables(root: str, header) -> List[Tuple[str, pd.DataFrame]]:
+    """Every table within three levels of root; CSV separators are sniffed (the
+    release's own sheet uses ';')."""
+    out = []
+    for dirpath, dirnames, files in os.walk(root):
+        if dirpath[len(root):].count(os.sep) >= 3:
+            dirnames[:] = []
+        for f in sorted(files):
+            p = os.path.join(dirpath, f)
+            try:
+                if f.lower().endswith(".csv"):
+                    out.append((p, pd.read_csv(p, sep=None, engine="python",
+                                               header=(0 if header == "infer" else header))))
+                elif f.lower().endswith((".xlsx", ".xls")):
+                    out.append((p, _read_table(p, header=header)))
+            except Exception:                       # pragma: no cover - unreadable sheet
+                continue
+    return out
+
+
+def _messidor2_pairs(root: str, stems: set) -> Tuple[Dict[str, str], Dict[str, str], Optional[str]]:
+    """Examination id (and laterality, when the header says left/right) per image
+    stem, from the first sheet whose rows each name exactly two known images.
+    ``({}, {}, None)`` when the release's pairing sheet is not there."""
+    for path, raw in _messidor2_tables(root, header=None):
+        exam: Dict[str, str] = {}
+        lat: Dict[str, str] = {}
+        head = [str(c).strip().lower() for c in raw.iloc[0].tolist()] if len(raw) else []
+        side = {j: ("L" if h in ("left", "l", "os", "oe") else "R" if h in ("right", "r", "od") else None)
+                for j, h in enumerate(head)}
+        for i, row in enumerate(raw.itertuples(index=False)):
+            hits = [(j, _stem(v)) for j, v in enumerate(row) if v == v and _stem(v) in stems]
+            if len(hits) != 2:
+                continue
+            for j, s in hits:
+                exam[s] = f"exam{i:04d}"
+                if side.get(j):
+                    lat[s] = side[j]
+        if len(exam) >= 2:
+            return exam, lat, path
+    return {}, {}, None
+
+
+def load_messidor2(root: str, image_ext: str = ".png") -> Dict[str, object]:
+    idx = _messidor2_images(root)
+    if not idx:
+        raise FileNotFoundError(f"Messidor-2: no images ({'/'.join(_M2_IMG_EXTS)}) under {root}")
+    tables = _messidor2_tables(root, header="infer")
+    found = next(((p, t, _col(t, g)) for g in _M2_GRADE for p, t in tables
+                  if _col(t, *_M2_ID) and _col(t, g)), None)
+    if found is None:
+        raise FileNotFoundError(
+            f"Messidor-2: no grades table under {root} (an image-id column and an ICDR grade "
+            f"column {list(_M2_GRADE)}, e.g. messidor_data.csv: image_id, adjudicated_dr_grade); "
+            f"tables seen: {[(os.path.relpath(p, root), list(t.columns)[:6]) for p, t in tables] or 'none'}")
+    csv, t, gc = found
+    idc = _col(t, *_M2_ID)
+    dmec = _col(t, "adjudicated_dme", "dme", "macular_edema")
+    qc = _col(t, "adjudicated_gradable", "gradable")
+    pc = _col(t, "patient_id", "patient", "exam_id", "exam", "examination")
+    stems = [_stem(v) for v in t[idc]]
+    gradable = (pd.to_numeric(t[qc], errors="coerce") if qc else pd.Series(np.nan, index=t.index))
+    # an ungradable photo has no grade, whatever a repackaging left in the column
+    grade = pd.to_numeric(t[gc], errors="coerce").where(gradable != 0)
+    grade = grade.where(grade.isin([0, 1, 2, 3, 4]))
+    dme = (pd.to_numeric(t[dmec], errors="coerce").where(gradable != 0) if dmec
+           else pd.Series(np.nan, index=t.index))
+    exam, lat, pairs_sheet = ({}, {}, None) if pc else _messidor2_pairs(root, set(stems))
+    df = pd.DataFrame({
+        "file": [idx.get(s, str(v).strip()) for s, v in zip(stems, t[idc])],
+        "patient": (t[pc].astype(str).str.strip().to_numpy() if pc
+                    else [exam.get(s, s) for s in stems]),
+        "laterality": [lat.get(s, np.nan) for s in stems],
+        "final_icdr": grade.to_numpy(dtype=float), "final_edema": dme.to_numpy(dtype=float),
+        "final_quality": gradable.to_numpy(dtype=float), "camera": "messidor2"})
+    out = _finalise(df, root, "messidor2", csv)
+    out.update(grade_column=gc, pairs_sheet=pairs_sheet,
+               paired_images=int(len(exam)) if not pc else int(len(df)),
+               missing_images=int(sum(s not in idx for s in stems)),
+               preprocessed=int(df["file"].str.lower().str.contains("preprocess").sum()))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch + inspector
 # --------------------------------------------------------------------------- #
-_LOADERS = {"airogs": load_airogs, "refuge": load_refuge, "papila": load_papila, "odir": load_odir}
+_LOADERS = {"airogs": load_airogs, "refuge": load_refuge, "papila": load_papila, "odir": load_odir,
+            "messidor2": load_messidor2}
 
 
 def load_public(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str, object]:
@@ -403,7 +535,7 @@ def load_public(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[
     return _LOADERS[dataset](root, image_ext=image_ext, **kw)
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Inspect a public fundus dataset against the mBRSET schema.")
     p.add_argument("--root", required=True)
     p.add_argument("--dataset", required=True, choices=PUBLIC_DATASETS)
@@ -415,7 +547,7 @@ def main() -> int:
     p.add_argument("--inspect", action="store_true", help="(default behaviour)")
     p.add_argument("--strict", action="store_true",
                    help="Exit 1 if the task column is missing/single-class or no image is on disk.")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     kw = {"papila_suspect": args.papila_suspect} if args.dataset == "papila" else {}
     if args.dataset == "airogs" and args.airogs_release:
@@ -451,6 +583,26 @@ def main() -> int:
                   f"(informational -- the trainer makes its own patient-grouped split)")
         print("  NB: AIROGS publishes no patient id; the patient-grouped split treats every image")
         print("      as its own subject. Say so when reporting an in-domain AIROGS number.")
+    if args.dataset == "messidor2":
+        g, q = df["final_icdr"], df["final_quality"]
+        graded = g.notna()
+        print(f"  DR grade (ICDR, from column {src['grade_column']!r}): "
+              f"{g.value_counts(dropna=False).sort_index().to_dict()}")
+        print(f"  referable (ICDR >= 2): {int((g >= 2).sum())}/{int(graded.sum())} "
+              f"= {(g[graded] >= 2).mean() if graded.any() else float('nan'):.1%}   "
+              f"DME: {int((df['final_edema'] == 1).sum())}/{int(df['final_edema'].notna().sum())}   "
+              f"ungradable: {int((q == 0).sum())}   gradable column: {'yes' if q.notna().any() else 'NO'}")
+        print(f"  grade ids with no image on disk: {src['missing_images']}"
+              + (f"   ({src['preprocessed']} images read from a 'preprocess' folder: confirm they are "
+                 f"the photographs as taken)" if src["preprocessed"] else ""))
+        if src["pairs_sheet"]:
+            print(f"  examinations from {src['pairs_sheet']}: {src['paired_images']} of {len(df)} images paired")
+        else:
+            print("  NB: no examination sheet (two image names per row) found: every image is its own")
+            print("      patient, so referral is per image and the CIs ignore fellow eyes. Copy the")
+            print("      release's messidor-2.csv / .xls next to the grades to score per patient.")
+        print("  Once-only external test: this inspection reads the grades, never a model's scores.")
+        failed |= not (0 < int((g >= 2).sum()) < int(graded.sum()))
     print(f"{'='*74}\n")
     return 1 if (args.strict and failed) else 0
 

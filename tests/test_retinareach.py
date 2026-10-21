@@ -407,6 +407,11 @@ def test_odir_adapter_dispatches_through_load_any(tmp_path):
     assert df.loc["1_left.jpg", "final_icdr"] == 2.0 and df.loc["1_right.jpg", "final_icdr"] == 0.0
     assert np.isnan(df.loc["2_left.jpg", "age"])            # placeholder age 1 -> unknown
     assert encoding_audit(df.reset_index(), "dr_referable")["ok"]
+    # sex is 1 = male in every adapter (mBRSET's raw convention); the old rules made
+    # ODIR and BRSET 1 = female, reversing any sex coefficient across datasets
+    assert df.loc["1_left.jpg", "sex"] == 1.0 and df.loc["2_left.jpg", "sex"] == 0.0
+    from brset_dataset import _normalise_sex
+    assert _normalise_sex(pd.Series([1, 2], dtype=float)).tolist() == [1.0, 0.0]
 
 
 def test_fit_probe_folds_into_raw_units():
@@ -439,19 +444,34 @@ def _fundus(path, lesion, cast, dark, rng):
     img.save(path, quality=95)
 
 
-def _make_brset(root, n_pat, rng):
+def _make_brset(root, n_pat, rng, camera_of=None, shared=()):
+    """``camera_of(pid)`` adds BRSET's camera column; every patient in ``shared``
+    also gets one photo on the other camera (a held-out camera must drop them)."""
     (root / "fundus_photos").mkdir(parents=True)
     rows = []
+
+    def row(f, pid, eye, ref):
+        r = {"image_id": f, "patient_id": pid, "DR_ICDR": 2 if ref else 0,
+             "macular_edema": int(ref and eye == 1), "patient_age": 40 + pid % 30,
+             "patient_sex": 1 + pid % 2, "exam_eye": eye, "quality": "Adequate",
+             "diabetes_time_y": pid % 20, "insuline": pid % 2,
+             "diabetes": "yes", "nationality": "Brazil"}
+        if camera_of is not None:
+            r["camera"] = camera_of(pid)
+        return r
+
     for pid in range(n_pat):
         ref = pid % 3 == 0
         for eye in (1, 2):
             f = f"img{pid:03d}{eye}"
             _fundus(root / "fundus_photos" / f"{f}.jpg", ref, (1, 1, 1), False, rng)
-            rows.append({"image_id": f, "patient_id": pid, "DR_ICDR": 2 if ref else 0,
-                         "macular_edema": int(ref and eye == 1), "patient_age": 40 + pid % 30,
-                         "patient_sex": 1 + pid % 2, "exam_eye": eye, "quality": "Adequate",
-                         "diabetes_time_y": pid % 20, "insuline": pid % 2,
-                         "diabetes": "yes", "nationality": "Brazil"})
+            rows.append(row(f, pid, eye, ref))
+    cams = sorted({camera_of(p) for p in range(n_pat)}) if camera_of is not None else []
+    for pid in shared:
+        f = f"img{pid:03d}9"
+        _fundus(root / "fundus_photos" / f"{f}.jpg", pid % 3 == 0, (1, 1, 1), False, rng)
+        rows.append(dict(row(f, pid, 1, pid % 3 == 0),
+                         camera=next(c for c in cams if c != camera_of(pid))))
     pd.DataFrame(rows).to_csv(root / "labels.csv", index=False)
 
 
@@ -617,6 +637,115 @@ def test_end_to_end_synthetic(tmp_path):
                                   "mechanism", "unfamiliar"), 1):
             assert (exp / "figures" / f"fig{i}_{name}.png").exists()
             assert (exp / "figures" / f"fig{i}_{name}.csv").exists()
+
+
+def test_one_source_camera_with_the_other_held_out(tmp_path):
+    """--source-camera / --holdout-camera: the model trains on one BRSET camera and
+    the other is scored as an unfamiliar camera; a patient photographed on both is
+    dropped from the held-out camera, so no held-out patient was in training."""
+    from train_retinareach import camera_slug, main
+    rng = np.random.default_rng(1)
+    cam = lambda pid: "Canon CR" if pid % 2 == 0 else "NIKON NF5050"
+    _make_brset(tmp_path / "brset", 60, rng, camera_of=cam, shared=(0,))
+    _make_mbrset(tmp_path / "mbrset", 30, rng)
+    out = tmp_path / "out"
+    rc = main(["--source-root", str(tmp_path / "brset"), "--target-root", str(tmp_path / "mbrset"),
+               "--source-camera", "Canon CR", "--holdout-camera", "NIKON NF5050",
+               "--probe-targets", "hypertension",
+               "--backbone", BACKBONE, "--no-pretrained", "--image-size", "64",
+               "--epochs", "1", "--batch-size", "8", "--num-workers", "0", "--device", "cpu",
+               "--calib-batch", "4", "--calib-sizes", "4", "--calib-repeats", "1",
+               "--prior-strengths", "0", "--min-probe-pos", "2", "--n-boot", "10",
+               "--envelope-repeats", "2", "--demo-n", "8", "--n-shuffle", "2",
+               "--ablation-frac", "0", "--cv-repeats", "1", "--min-test-pos-patients", "2",
+               "--out", str(out), "--ckpt", str(tmp_path / "ck.pt")])
+    assert rc == 0
+    name = camera_slug("NIKON NF5050")
+    assert name == "nikon_nf5050"
+    src = pd.read_csv(out / "split_tabletop.csv")
+    hold = pd.read_csv(out / f"split_{name}.csv")
+    labels = pd.read_csv(tmp_path / "brset" / "labels.csv").set_index("image_id")
+    assert (labels.loc[src["file"].str.replace(".jpg", "", regex=False), "camera"] == "Canon CR").all()
+    assert (labels.loc[hold["file"].str.replace(".jpg", "", regex=False), "camera"] == "NIKON NF5050").all()
+    assert not set(src["patient"]) & set(hold["patient"])          # patient 0's Nikon photo dropped
+    res = json.loads((out / "results.json").read_text())
+    assert res["holdout_camera"]["dropped_patients"] == 1 and res["holdout_camera"]["name"] == name
+    assert res["holdout_camera"]["kept_patients"] == 30
+    unf = pd.read_csv(out / "capability_unfamiliar.csv")
+    assert set(unf["device"]) == {name}
+    for proto in ("trained", "calibrated"):
+        pr = pd.read_csv(out / f"predictions_{name}_{proto}.csv")
+        assert set(pr["file"]) <= set(hold.loc[hold["split"] == "test", "file"]) and len(pr)
+    # per-1,000 referral outcomes on every rung of the camera ladder, from the saved files
+    from referral_outcomes import main as referral
+    assert referral(["--dir", str(out), "--n-boot", "10"]) == 0
+    ro = pd.read_csv(out / "referral_outcomes.csv")
+    assert set(ro["device"]) == {"tabletop", "handheld", name}
+    assert set(ro["rule"]) == {"dr_referable", "dr_or_edema"}
+    assert set(ro["protocol"]) == {"trained", "calibrated"}
+    every = ["per1000_correct_referrals", "per1000_missed", "per1000_unnecessary",
+             "per1000_correct_clear", "per1000_retakes"]
+    assert np.allclose(ro[every].sum(1), 1000.0)
+    assert {"per1000_missed_at_0.055", "per1000_unnecessary_at_0.156"} <= set(ro.columns)
+
+    # redesign_calibration rebuilds the run's own cameras: Canon filtered, Nikon held
+    # out, with the trainer's exact splits -- so no training patient is a test patient
+    import argparse
+    from capability_gate import multitask_split
+    from redesign_calibration import device_specs, main as redesign
+    ckd = torch.load(tmp_path / "ck.pt", map_location="cpu", weights_only=False)
+    specs = device_specs(ckd, argparse.Namespace(source_root=None, target_root=None,
+                                                 no_unfamiliar=False, no_holdout=False))
+    assert [s[0] for s in specs] == ["tabletop", name, "handheld"]
+    for dev_name, _, _, table in specs[:2]:
+        test = multitask_split(table, "dr_referable", seed=42)["test"]
+        trainer = pd.read_csv(out / f"split_{dev_name}.csv")
+        assert set(test["file"]) == set(trainer.loc[trainer["split"] == "test", "file"])
+    rd = tmp_path / "redesign"
+    assert redesign(["--ckpt", str(tmp_path / "ck.pt"), "--out", str(rd), "--pool-size", "8",
+                     "--repeats", "1", "--depth-fractions", "0", "0.5", "1", "--alphas", "0.5",
+                     "--small-n", "4", "--small-n-repeats", "1", "--num-workers", "0",
+                     "--device", "cpu"]) == 0
+    df = pd.read_csv(rd / "redesign.csv")
+    assert {"tabletop", name, "handheld"} <= set(df["device"])
+    a_rows = df[(df["experiment"] == "A_prevalence") & (df["device"] == name)]
+    assert a_rows["source_prevalence"].any()                   # Nikon at Canon's disease rate
+    assert ((df["experiment"] == "B1_shallow") & (df["device"] == name)).any()
+    lad = pd.read_csv(rd / "ladder.csv")
+    nik = set(lad.loc[lad["device"] == name, "setting"])
+    assert {"as trained", "AdaBN, own prevalence", "AdaBN, source prevalence",
+            "shallow, own prevalence", "shallow + EM threshold"} <= nik
+    assert list(dict.fromkeys(lad["device"])) == ["tabletop", name, "handheld"]   # ladder order
+    assert "camera ladder" in (rd / "redesign_summary.txt").read_text()
+
+
+def test_referral_outcomes_count_per_patient():
+    """Refer if any gradable eye fires; no gradable eye = retake; truth = any eye."""
+    from referral_outcomes import patient_outcomes
+    eyes = pd.DataFrame({
+        "patient": ["1", "1", "2", "2", "3", "3", "4", "4"],
+        "gradable": [True, True, True, True, False, False, True, False],
+        "flag": [True, False, False, False, True, False, True, False],     # 3's flag is on an ungradable eye
+        "truth": [1, 0, 0, 0, 1, 0, 0, np.nan]})
+    o = patient_outcomes(eyes, n_boot=20, prevalences=[0.1])
+    assert (o["tp"], o["fn"], o["fp"], o["tn"], o["retakes"]) == (1, 0, 1, 1, 1)
+    assert o["referable_in_retakes"] == 1 and o["patients"] == 4
+    assert o["per1000_retakes"] == 250 and o["per1000_unnecessary"] == 250 and o["per1000_missed"] == 0
+    assert o["sensitivity"] == 1.0 and o["specificity"] == 0.5
+    assert o["per1000_unnecessary_at_0.1"] == pytest.approx(1000 * 0.9 * 0.5)
+
+
+def test_camera_and_once_only_guards(tmp_path):
+    from train_retinareach import main
+    base = ["--source-root", str(tmp_path / "a"), "--target-root", str(tmp_path / "b"),
+            "--out", str(tmp_path / "o"), "--ckpt", str(tmp_path / "c.pt")]
+    with pytest.raises(SystemExit, match="needs --source-camera"):
+        main(base + ["--holdout-camera", "NIKON NF5050"])
+    with pytest.raises(SystemExit, match="is the --source-camera"):
+        main(base + ["--source-camera", "Canon CR", "--holdout-camera", "Canon CR"])
+    with pytest.raises(SystemExit, match="once-only external test"):
+        main(base + ["--unfamiliar", str(tmp_path / "m2"), "messidor2"])
+    assert not (tmp_path / "o").exists()                 # refused before anything was written
 
 
 def _vessel_image(size=192, seed=0):

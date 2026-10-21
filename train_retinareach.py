@@ -74,11 +74,21 @@ Pipeline (one seed)
    labels only score. The full gate on it (what a validation study would find)
    is compared with what the phone would SHOW after N unlabelled captures:
    ``unsafe_rate`` (shown but not supported) and ``missed_rate``.
+12. **One source camera, the other held out** (``--source-camera 'Canon CR'
+   --holdout-camera 'NIKON NF5050'``): train, validate, calibrate and threshold on
+   one BRSET camera only, then score the other BRSET camera exactly like an
+   unfamiliar camera -- same clinic and grading, a camera the model never saw.
+   That is the small-camera-change rung between the home camera and the phone.
+   Patients photographed on both cameras are dropped from the held-out camera,
+   so no held-out patient was ever in training. Messidor-2 is refused as
+   ``--unfamiliar``: it is the once-only external test, scored by the frozen
+   checkpoint after the analysis freeze, never inside a training run.
 
 Outputs (``--out``): ``results.json``, ``capability.csv``,
 ``calibration_sweep.csv``, ``operating_point.csv``, ``quality_strata.csv``,
-``capability_unfamiliar.csv`` + ``unfamiliar_lookup.csv`` (with --unfamiliar),
-``predictions_<device>_<protocol>.csv``, ``split_<device>.csv``,
+``capability_unfamiliar.csv`` + ``unfamiliar_lookup.csv`` (with --unfamiliar
+or --holdout-camera), ``predictions_<device>_<protocol>.csv`` and
+``split_<device>.csv`` for every device including the unfamiliar ones,
 ``profiles.json`` (what ``export_retinareach.py`` ships). ``--ckpt`` holds the weights (as-trained statistics + probes) with the
 config, thresholds, profiles and capability rows.
 
@@ -93,6 +103,7 @@ import copy
 import datetime
 import json
 import os
+import re
 import sys
 import time
 from typing import Dict, List, Sequence
@@ -262,14 +273,15 @@ def sensitivity_ci(y: np.ndarray, p: np.ndarray, groups: np.ndarray, thr: float,
 
 
 def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict], audits,
-                  targets: Sequence[str], nS: int) -> int:
+                  targets: Sequence[str], nS: int, holdout=None) -> int:
     """Minutes, not hours: everything the full run depends on, checked before the
     GPU time is spent. Data (roots, encodings, images on disk, test-split power
-    per target and device, unfamiliar cameras), the device (one training step:
-    finite, plausible loss; one calibration on the target pool: finite
-    statistics), the pretrained weights (already loaded by the time this runs),
-    disk, and a wall-clock estimate. Returns 0 when nothing blocks the run."""
+    per target and device, unfamiliar cameras incl. a held-out source camera), the
+    device (one training step: finite, plausible loss; one calibration on the target
+    pool: finite statistics), the pretrained weights (already loaded by the time this
+    runs), disk, and a wall-clock estimate. Returns 0 when nothing blocks the run."""
     import shutil
+    from brset_dataset import load_any
     problems, notes = [], []
     print("\n=== PREFLIGHT ===")
     for name, d in datasets.items():
@@ -285,11 +297,9 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
             flag = "  UNDERPOWERED" if pos_pat < a.min_test_pos_patients else ""
             print(f"    {t:<22} test rows {int(ok.sum()):>5}  positives {int(np.nansum(y[ok, k])):>4}  "
                   f"positive patients {pos_pat:>4}{flag}")
-    for spec in a.unfamiliar:
-        root_u, ds_u, name_u = parse_unfamiliar(spec)
+    for name_u, ds_u, root_u, df_pre, csv_pre in unfamiliar_cameras(a, holdout):
         try:
-            df_u, csv_u = load_table(root_u, ds_u)
-            from brset_dataset import load_any
+            df_u, csv_u = (df_pre, csv_pre) if df_pre is not None else load_table(root_u, ds_u)
             dir_u = load_any(root_u, ds_u)["images_dir"]
             n_img = len(MultiTargetDataset(df_u, dir_u, targets, "val", a.image_size))
             ok_t = [t for t in targets if encoding_audit(df_u, t)["ok"]]
@@ -377,10 +387,52 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
     return 0
 
 
+# The once-only external test: scored by the frozen checkpoint after the analysis
+# freeze. A training run that looked at it would spend that one look on every seed.
+ONCE_ONLY_DATASETS = ("messidor2",)
+
+
 def parse_unfamiliar(spec: Sequence[str]) -> tuple:
     if len(spec) not in (2, 3):
         raise SystemExit(f"[fatal] --unfamiliar takes ROOT DATASET [NAME], got {list(spec)}")
+    if spec[1] in ONCE_ONLY_DATASETS:
+        raise SystemExit(f"[fatal] --unfamiliar {spec[1]}: this is the once-only external test, scored "
+                         f"by the frozen checkpoint after the analysis freeze, never inside a "
+                         f"training run")
     return spec[0], spec[1], spec[2] if len(spec) == 3 else spec[1]
+
+
+def camera_slug(camera: str) -> str:
+    """'NIKON NF5050' -> 'nikon_nf5050': a device name that is safe in file names."""
+    return re.sub(r"[^a-z0-9]+", "_", camera.lower()).strip("_") or "holdout"
+
+
+def holdout_camera(full: pd.DataFrame, source: pd.DataFrame, camera: str) -> tuple:
+    """The source dataset's rows from ``camera``, minus every patient who also has a
+    photo in ``source`` (the camera-filtered table the model trains, validates and
+    is tested on). BRSET photographs a patient on one camera as a rule (1.9 photos
+    per patient), but a single shared patient would put a held-out eye's fellow eye
+    into training. Returns ``(table, info)``."""
+    from brset_dataset import filter_camera
+    hold = filter_camera(full, camera)
+    shared = hold["patient"].isin(set(source["patient"]))
+    info = {"camera": camera, "rows": int(len(hold)), "patients": int(hold["patient"].nunique()),
+            "dropped_rows": int(shared.sum()),
+            "dropped_patients": int(hold.loc[shared, "patient"].nunique())}
+    return hold.loc[~shared].reset_index(drop=True), info
+
+
+def unfamiliar_cameras(a, holdout=None) -> List[tuple]:
+    """``(name, dataset, root, table or None, csv or None)`` per unfamiliar camera:
+    every ``--unfamiliar`` spec (loaded from its root later) and the held-out source
+    camera (already loaded and patient-checked)."""
+    out = [(n, ds, root, None, None) for root, ds, n in map(parse_unfamiliar, a.unfamiliar)]
+    if holdout is not None:
+        out.append(holdout)
+    names = [u[0] for u in out]
+    if len(set(names)) != len(names):
+        raise SystemExit(f"[fatal] two unfamiliar cameras share a name: {names}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -394,6 +446,17 @@ def main(argv: Sequence[str] = None) -> int:
     p.add_argument("--target-dataset", default="mbrset", choices=["brset", "mbrset"])
     p.add_argument("--source-name", default="tabletop")
     p.add_argument("--target-name", default="handheld")
+    p.add_argument("--source-camera", default=None,
+                   help="train, validate, calibrate and threshold on this camera of the source "
+                        "dataset only (BRSET: 'Canon CR'); its other cameras leave the run unless "
+                        "--holdout-camera scores one")
+    p.add_argument("--holdout-camera", default=None,
+                   help="with --source-camera: score this camera of the source dataset as an "
+                        "unfamiliar camera (BRSET: 'NIKON NF5050'), same clinic, never trained on; "
+                        "patients photographed on both cameras are dropped from it")
+    p.add_argument("--holdout-name", default=None,
+                   help="the held-out camera's device name in the tables "
+                        "(default: the camera string, lower-cased, e.g. nikon_nf5050)")
     p.add_argument("--source-targets", nargs="+", default=list(SOURCE_TARGETS))
     p.add_argument("--probe-targets", nargs="+", default=list(PROBE_TARGETS))
     p.add_argument("--backbone", default=DEFAULT_BACKBONE)
@@ -472,6 +535,12 @@ def main(argv: Sequence[str] = None) -> int:
         raise SystemExit("[fatal] --source-root and --target-root are the same directory")
     if a.calib_batch < 2:
         raise SystemExit("[fatal] --calib-batch must be >= 2 (train-mode BN needs a batch)")
+    if a.holdout_camera and not a.source_camera:
+        raise SystemExit("[fatal] --holdout-camera needs --source-camera: without it the held-out "
+                         "camera's images are in the training split")
+    if a.holdout_camera and a.holdout_camera.strip() == a.source_camera.strip():
+        raise SystemExit("[fatal] --holdout-camera is the --source-camera")
+    unfamiliar_cameras(a)                      # bad / once-only / duplicate specs fail before any work
     seed_everything(a.seed, deterministic=not a.nondeterministic)
     dev = pick_device() if a.device == "auto" else torch.device(a.device)
     os.makedirs(a.out, exist_ok=True)
@@ -479,11 +548,21 @@ def main(argv: Sequence[str] = None) -> int:
     t0 = time.time()
 
     # ---- data ------------------------------------------------------------ #
-    from brset_dataset import load_any
-    tables, splits, img_dirs, audits = {}, {}, {}, {}
+    from brset_dataset import filter_camera, load_any
+    tables, splits, img_dirs, audits, csvs = {}, {}, {}, {}, {}
+    full_src = None
     for name, root, ds in ((a.source_name, a.source_root, a.source_dataset),
                            (a.target_name, a.target_root, a.target_dataset)):
         df, csv = load_table(root, ds)
+        if name == a.source_name and a.source_camera:
+            full_src = df
+            try:
+                df = filter_camera(df, a.source_camera.strip())
+            except ValueError as e:
+                raise SystemExit(f"[fatal] --source-camera: {e}")
+            print(f"[data] {name}: camera {a.source_camera!r} only -- {len(df)} of {len(full_src)} "
+                  f"rows, {df['patient'].nunique()} of {full_src['patient'].nunique()} patients")
+        csvs[name] = csv
         img_dirs[name] = load_any(root, ds)["images_dir"]
         tables[name] = df
         splits[name] = multitask_split(df, a.source_targets[0], seed=a.split_seed)
@@ -496,6 +575,29 @@ def main(argv: Sequence[str] = None) -> int:
         pd.concat([v.assign(split=k)[["file", "patient", "split"]] for k, v in splits[name].items()]
                   ).to_csv(os.path.join(a.out, f"split_{name}.csv"), index=False)
     S, T = a.source_name, a.target_name
+    holdout, holdout_info = None, None
+    if a.holdout_camera:
+        name_h = a.holdout_name or camera_slug(a.holdout_camera)
+        try:
+            df_h, holdout_info = holdout_camera(full_src, tables[S], a.holdout_camera.strip())
+        except ValueError as e:
+            raise SystemExit(f"[fatal] --holdout-camera: {e}")
+        if holdout_info["dropped_patients"]:
+            print(f"[data] held-out camera: dropped {holdout_info['dropped_rows']} rows / "
+                  f"{holdout_info['dropped_patients']} patients also photographed on "
+                  f"{a.source_camera!r}")
+        if df_h.empty:
+            raise SystemExit(f"[fatal] --holdout-camera {a.holdout_camera!r}: no rows left after "
+                             f"dropping the patients shared with {a.source_camera!r}")
+        holdout = (name_h, a.source_dataset, a.source_root, df_h, csvs[S])
+        holdout_info.update(name=name_h, kept_rows=int(len(df_h)),
+                            kept_patients=int(df_h["patient"].nunique()))
+        print(f"[data] held-out camera {a.holdout_camera!r} -> device {name_h}: {len(df_h)} rows / "
+              f"{df_h['patient'].nunique()} patients, scored like an unfamiliar camera")
+    unf_list = unfamiliar_cameras(a, holdout)
+    clash = [u[0] for u in unf_list if u[0] in (S, T)]
+    if clash:
+        raise SystemExit(f"[fatal] unfamiliar camera name(s) {clash} collide with a validated device")
     bad_src = [t for t in a.source_targets if not audits[S][t]["ok"]]
     if bad_src:
         raise SystemExit(f"[fatal] source targets {bad_src} are not usable on {S}: "
@@ -555,7 +657,7 @@ def main(argv: Sequence[str] = None) -> int:
         return run_preflight(a, model, dev, train_loader, loaders,
                              {S: {"pool": src_pool, "test": src_test, "val": src_val},
                               T: {"pool": tgt_pool, "test": tgt_test, "val": tgt_val}},
-                             audits, targets, nS)
+                             audits, targets, nS, holdout=holdout)
     ema = ModelEMA(model, a.ema_decay) if a.ema_decay > 0 else None
     use_amp = a.amp if a.amp is not None else dev.type == "cuda"
     amp_dtype = torch.float16 if dev.type == "cuda" else torch.bfloat16
@@ -997,12 +1099,11 @@ def main(argv: Sequence[str] = None) -> int:
     # An "unsafe" report = the phone shows a target the camera's own labels do not
     # support; a "missed" one = it hides a target they do.
     unf_rows, lookup_rows, unf_info = [], [], {}
-    for spec in a.unfamiliar:
-        root_u, ds_u, name_u = parse_unfamiliar(spec)
-        if name_u in (S, T):
-            raise SystemExit(f"[fatal] --unfamiliar name {name_u!r} collides with a validated device")
-        df_u, csv_u = load_table(root_u, ds_u)
+    for name_u, ds_u, root_u, df_pre, csv_pre in unf_list:
+        df_u, csv_u = (df_pre, csv_pre) if df_pre is not None else load_table(root_u, ds_u)
         split_u = multitask_split(df_u, a.source_targets[0], seed=a.split_seed)
+        pd.concat([v.assign(split=k)[["file", "patient", "split"]] for k, v in split_u.items()]
+                  ).to_csv(os.path.join(a.out, f"split_{name_u}.csv"), index=False)
         au_u = {t: encoding_audit(df_u, t) for t in targets}
         dir_u = load_any(root_u, ds_u)["images_dir"]
         mku = lambda part: MultiTargetDataset(split_u[part], dir_u, targets, "val", a.image_size)
@@ -1018,6 +1119,12 @@ def main(argv: Sequence[str] = None) -> int:
         q_tr[:, nS:] = np.nan
         scores_u = {"trained": q_tr, "calibrated": predict(cal_u, loader_u, dev)}
         del cal_u
+        for proto, q in scores_u.items():            # same layout as the validated devices
+            out_u = pd.DataFrame({"file": test_u.df["file"], "patient": test_u.patients})
+            for t in targets:
+                out_u[f"p_{t}"] = q[:, model.index(t)]
+                out_u[f"threshold_{t}"] = thresholds[proto].get(t, np.nan)
+            out_u.to_csv(os.path.join(a.out, f"predictions_{name_u}_{proto}.csv"), index=False)
         fit_u = pd.concat([split_u["train"], split_u["val"]], ignore_index=True)
         rows_u, strata_u = gate_device(name_u, fit_u, test_u.df, au_u, scores_u)
         unf_rows += rows_u
@@ -1083,7 +1190,8 @@ def main(argv: Sequence[str] = None) -> int:
                "device_recognition": recog, "device_false_accept": false_accept,
                "device_report": report, "camera_decodability": decode,
                "anatomy_ablation": ablation_rows,
-               "unfamiliar": unf_info, "shuffle_source_labels": a.shuffle_source_labels,
+               "unfamiliar": unf_info, "holdout_camera": holdout_info,
+               "shuffle_source_labels": a.shuffle_source_labels,
                "prior_mode": "in_forward",   # runs without this key blended the prior post hoc
                "calibration": {S: vars(info_s), T: vars(info_t)},
                "camera_distance": {"trained_to_" + S: camera_distance(trained_stats, stats[S]),
