@@ -215,6 +215,8 @@ def score_checkpoint(ck: dict, ds, fold: np.ndarray, a, dev) -> Dict[str, object
     """Scores [N, K] under both protocols and the per-row thresholds of every
     (protocol, method), for one frozen checkpoint. Reads no label."""
     model = build_from_checkpoint(ck).to(dev)
+    # the same captures under the source profile's statistics: the em2 / rate reference
+    tab_model = build_from_checkpoint(ck, stats=ck["args"].get("source_name", "tabletop")).to(dev)
     seed = int(ck["args"].get("seed", 0))
     seed_everything(seed)
     dl = lambda d: DataLoader(d, batch_size=a.batch_size, num_workers=a.num_workers,
@@ -223,6 +225,10 @@ def score_checkpoint(ck: dict, ds, fold: np.ndarray, a, dev) -> Dict[str, object
     q = {"trained": predict(model, dl(ds), dev), "calibrated": np.full((n, len(model.targets)), np.nan)}
     thr = {(p, m): {t: np.full(n, np.nan) for t in src} for p, m in PROTOCOL_METHODS}
     refs = {t: ThresholdReference.from_dict(r) for t, r in (ck.get("threshold_reference") or {}).items()}
+    no_rate = [t for t, r in refs.items() if not (r.source_spec == r.source_spec)]
+    if no_rate:          # references written before the rate method's source specificity existed
+        print(f"    [note] no source specificity in the reference of {no_rate}: the rate threshold "
+              f"is skipped for them (its rows stay empty)")
     for t in src:
         thr[("trained", "shipped")][t][:] = ck["thresholds"]["trained"].get(t, np.nan)
     for k in range(int(fold.max()) + 1):
@@ -232,13 +238,15 @@ def score_checkpoint(ck: dict, ds, fold: np.ndarray, a, dev) -> Dict[str, object
         cal = _calibrate(model, ck, Subset(ds, list(pool_idx)), a, dev, seed + k)
         q["calibrated"][test_idx] = predict(cal, dl(Subset(ds, list(test_idx))), dev)
         q_pool = predict(cal, dl(Subset(ds, list(pool_idx))), dev)
+        q_pool_ref = predict(tab_model, dl(Subset(ds, list(pool_idx))), dev)
         del cal
         for t in src:
             j = model.index(t)
             thr[("calibrated", "shipped")][t][test_idx] = ck["thresholds"]["calibrated"].get(t, np.nan)
             for m in THRESHOLD_METHODS[1:]:
-                if t in refs:
-                    thr[("calibrated", m)][t][test_idx] = label_free_threshold(q_pool[:, j], refs[t], m)[0]
+                if t in refs and not (m == "rate" and t in no_rate):
+                    thr[("calibrated", m)][t][test_idx] = label_free_threshold(
+                        q_pool[:, j], refs[t], m, q_pool_ref[:, j])[0]
     return {"q": q, "thr": thr, "targets": list(model.targets), "source_targets": src, "seed": seed}
 
 

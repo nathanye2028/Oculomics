@@ -237,6 +237,73 @@ def test_label_free_threshold_methods():
     t_l, est_l = label_free_threshold(q_l, ref, "em")
     assert est_l["est_prev"] == pytest.approx(0.156, abs=0.02)
     assert abs(sens(y_l, q_l, t_l) - 0.85) < 0.03
+    # em2 / rate: a camera that COMPRESSES the scores (ranks kept) at 2.8x the prevalence.
+    # EM read on the compressed scores misplaces the threshold; em2 estimates the
+    # prevalence on the same captures under source statistics and places the threshold
+    # on the compressed scores; rate flags the expected fraction by rank alone.
+    y_c, q_r = _scores(rng, 20000, 0.156)
+    q_c = 1.0 / (1.0 + np.exp(-(0.6 * np.log(q_r / (1 - q_r)) - 0.4)))
+    t_em, _ = label_free_threshold(q_c, ref, "em")
+    t_e2, e2 = label_free_threshold(q_c, ref, "em2", q_r)
+    t_rt, rt = label_free_threshold(q_c, ref, "rate", q_r)
+    assert e2["est_prev"] == pytest.approx(0.156, abs=0.02) and rt["est_prev"] == e2["est_prev"]
+    assert abs(sens(y_c, q_c, t_e2) - 0.85) < 0.03 and abs(sens(y_c, q_c, t_rt) - 0.85) < 0.04
+    assert abs(sens(y_c, q_c, t_em) - 0.85) > abs(sens(y_c, q_c, t_e2) - 0.85)
+    assert abs(float((q_c >= t_rt).mean()) - rt["flag_rate"]) < 1e-3
+    assert label_free_threshold(q_c, ref, "em2") == label_free_threshold(q_c, ref, "em")   # no reference: em
+    with pytest.raises(ValueError):
+        label_free_threshold(q_c, ref, "em2", q_r[:-1])
+    old = ThresholdReference.from_dict({k: v for k, v in ref.to_dict().items() if k != "source_spec"})
+    assert old.source_spec != old.source_spec                      # a pre-rate reference loads unset
+    with pytest.raises(ValueError):
+        label_free_threshold(q_c, old, "rate", q_r)
+    assert ref.source_spec == pytest.approx(float((q_v[y_v == 0] < thr).mean()))
+    assert set(THRESHOLD_METHODS) == {"shipped", "em", "anchor", "em2", "rate"}
+
+
+def test_prevalence_matched_pool_lowers_the_rate_label_free():
+    from metadata_model import threshold_at_sensitivity
+    from retinareach import (fit_threshold_reference, prevalence_match_weights,
+                             prevalence_matched_sample)
+    rng = np.random.default_rng(2)
+    y_v, q_v = _scores(rng, 20000, 0.055)
+    ref = fit_threshold_reference(q_v, y_v, threshold_at_sensitivity(y_v.astype(int), q_v, 0.85), 0.85)
+    y_h, q_h = _scores(rng, 20000, 0.156)                           # the clinic: 2.8x the disease
+    w, info = prevalence_match_weights(q_h, ref)
+    assert w.sum() == pytest.approx(1.0) and info["est_prev"] == pytest.approx(0.156, abs=0.02)
+    assert float(np.sum(w * y_h)) < 0.10 < float(y_h.mean())        # the weighted pool has less disease
+    assert info["expected_prev"] == pytest.approx(float(np.sum(w * y_h)), abs=0.02)   # and says so, label-free
+    idx, _ = prevalence_matched_sample(q_h, ref, rng, size=4000)
+    assert len(idx) == 4000 and float(y_h[idx].mean()) < 0.10
+    # a clinic with LESS disease than the source: the positives are up-weighted instead
+    y_l, q_l = _scores(rng, 20000, 0.02)
+    w_l, info_l = prevalence_match_weights(q_l, ref)
+    assert info_l["positive_weight"] > 1.0 and float(np.sum(w_l * y_l)) > float(y_l.mean())
+    # pt = 0: predicted disease-free eyes only; a NaN score gets no weight
+    w0, _ = prevalence_match_weights(np.r_[q_h, np.nan], ref, target_prevalence=0.0)
+    assert w0[-1] == 0.0 and float(np.sum(w0[:-1] * y_h)) <= float(np.sum(w * y_h)) + 1e-9
+
+
+def test_cross_fit_probe_scores_every_patient_once_and_controls_sit_at_chance():
+    from metadata_model import _auc
+    from probe_folds import cross_fit_probe
+    rng = np.random.default_rng(3)
+    n_pat, d = 300, 24
+    g = np.repeat(np.arange(n_pat), 2)
+    y = np.repeat((rng.random(n_pat) < 0.3).astype(float), 2)
+    X = rng.normal(size=(2 * n_pat, d))
+    X[:, 0] += 1.5 * y
+    y[:6] = np.nan                                                   # unlabelled rows stay unscored
+    r = cross_fit_probe(X, y, g, folds=5, Cs=(1e-2, 1e-1), seed=0, n_shuffle=3, inner_folds=3)
+    ok = ~np.isnan(y)
+    assert r["fitted"] and np.isfinite(r["scores"][ok]).all() and np.isnan(r["scores"][~ok]).all()
+    assert (r["fold"][~ok] == -1).all() and set(r["fold"][ok]) == set(range(5))
+    f, gg = r["fold"][ok], g[ok]
+    assert all(len(set(f[gg == p])) == 1 for p in np.unique(gg))     # both eyes in one fold
+    assert _auc(y[ok].astype(int), r["scores"][ok]) > 0.7
+    assert abs(r["shuffle"]["auroc"] - 0.5) < 0.1 and r["shuffle"]["n"] == 15
+    assert len(r["C"]) == 5 == len(r["thresholds"]) and 0 < r["threshold"] < 1
+    assert not cross_fit_probe(X, y, g, folds=5, min_pos=1000)["fitted"]
 
 
 def test_self_calibrate_counts_out_batches_of_one(net):
@@ -508,11 +575,19 @@ def test_end_to_end_synthetic(tmp_path):
                "--prior-strengths", "8", "0", "--min-probe-pos", "2", "--n-boot", "20",
                "--envelope-repeats", "4", "--demo-n", "8", "--n-shuffle", "3",
                "--unfamiliar", str(tmp_path / "cam3"), "mbrset", "cam3",
-               "--cv-repeats", "1", "--min-test-pos-patients", "2",
+               "--cv-repeats", "1", "--min-test-pos-patients", "2", "--probe-folds", "2",
                "--out", str(out), "--ckpt", str(ck)])
     assert rc == 0
-    cap = pd.read_csv(out / "capability.csv")
+    cap_all = pd.read_csv(out / "capability.csv")
     targets = ["dr_referable", "edema", "hypertension", "nephropathy", "smoking"]
+    oof = cap_all[cap_all["protocol"] == "calibrated_oof2"]
+    cap = cap_all[cap_all["protocol"].isin(["trained", "calibrated"])].reset_index(drop=True)
+    # cross-fitted probes: every handheld row scored once, gated like any other row
+    assert len(oof) >= 1 and set(oof["target"]) <= {"hypertension", "nephropathy"}
+    assert (oof["device"] == "handheld").all() and (oof["design"] == "oof2").all()
+    pr_oof = pd.read_csv(out / "predictions_handheld_probes_oof2.csv")
+    assert {"fold_hypertension", "p_hypertension", "threshold_hypertension"} <= set(pr_oof.columns)
+    assert set(pr_oof["fold_hypertension"].dropna().astype(int)) <= {-1, 0, 1}
     assert set(cap["target"]) == set(targets)
     assert len(cap) == len(targets) * 2 * 2                 # x devices x protocols
     assert set(cap["status"]) <= {"SUPPORTED", "THRESHOLD_DRIFT", "NO_IMAGE_EVIDENCE",
@@ -569,11 +644,16 @@ def test_end_to_end_synthetic(tmp_path):
     x = torch.randn(2, 3, 64, 64)
     assert not torch.allclose(m0(x), m1(x))
     # label-free operating point: every device x method; the references ship with the profiles
+    from retinareach import THRESHOLD_METHODS
     op = pd.read_csv(out / "operating_point.csv")
-    assert set(op["method"]) == {"shipped", "em", "anchor"} and set(op["device"]) == {"tabletop", "handheld"}
-    assert set(op["target"]) == set(res["threshold_reference"]) and len(op) == 3 * 2 * len(set(op["target"]))
-    assert op.loc[op["method"] == "em", "est_prev"].between(0, 1).all()
-    assert op.loc[op["method"] != "em", "est_prev"].isna().all()
+    assert set(op["method"]) == set(THRESHOLD_METHODS) and set(op["device"]) == {"tabletop", "handheld"}
+    assert set(op["target"]) == set(res["threshold_reference"])
+    assert len(op) == len(THRESHOLD_METHODS) * 2 * len(set(op["target"]))
+    assert op.loc[op["method"].isin(["em", "em2", "rate"]), "est_prev"].between(0, 1).all()
+    assert op.loc[op["method"].isin(["shipped", "anchor"]), "est_prev"].isna().all()
+    assert op.loc[op["method"] == "rate", "flag_rate"].between(0, 1).all()
+    for t in res["threshold_reference"]:
+        assert 0 <= res["threshold_reference"][t]["source_spec"] <= 1
     for t, thr in res["thresholds"]["calibrated"].items():
         if t in res["threshold_reference"]:
             shipped = op.loc[(op["method"] == "shipped") & (op["target"] == t), "threshold"]
@@ -581,7 +661,8 @@ def test_end_to_end_synthetic(tmp_path):
             assert ThresholdReference.from_dict(prof["threshold_reference"][t]).threshold == thr
     assert ckd["threshold_reference"] == prof["threshold_reference"]
     t0 = next(iter(res["threshold_reference"]))
-    assert {f"sens_{t0}__em", f"flagged_{t0}__anchor", f"prev_{t0}__em"} <= set(sweep.columns)
+    assert {f"sens_{t0}__em", f"flagged_{t0}__anchor", f"prev_{t0}__em", f"sens_{t0}__em2",
+            f"prev_{t0}__rate"} <= set(sweep.columns)
     assert sweep.loc[sweep["kind"] == "trained", f"sens_{t0}__em"].isna().all()
     assert sweep.loc[sweep["kind"] != "trained", f"sens_{t0}__anchor"].notna().all()
 
@@ -601,7 +682,7 @@ def test_end_to_end_synthetic(tmp_path):
              "covariate_baseline": {"auroc": 0.6}}))
     assert summarize(["--dir", str(exp)]) == 0
     final = pd.read_csv(exp / "capability_final.csv")
-    assert len(final) == len(cap) and set(final["final"]) <= set(cap["status"]) | {"NO_IMAGE_EVIDENCE"}
+    assert len(final) == len(cap_all) and set(final["final"]) <= set(cap_all["status"]) | {"NO_IMAGE_EVIDENCE"}
     md = (exp / "summary.md").read_text()
     assert md.startswith("# RetinaReach")
     assert "## 4. Controls and mechanism" in md and "## 5. Unfamiliar cameras" in md
@@ -617,7 +698,9 @@ def test_end_to_end_synthetic(tmp_path):
     assert set(px["seed"]) == {0, 1} and set(px["target"]) <= {"hypertension", "nephropathy"}
     assert {"auroc_probe", "auroc_dr_score", "auroc_no_dr", "auroc_within_grade"} <= set(px.columns)
     assert "Label-free operating point" in md and summ["operating_point"]
-    assert {r["method"] for r in summ["operating_point"]} == {"shipped", "em", "anchor"}
+    assert {r["method"] for r in summ["operating_point"]} == set(THRESHOLD_METHODS)
+    final_all = pd.read_csv(exp / "capability_final.csv")
+    assert (final_all["protocol"] == "calibrated_oof2").any()      # the cross-fitted rows summarise too
     assert any(k.startswith(f"sens_{t0}__em") for k in summ["sweep"][0])
     from summarize_retinareach import load as load_runs
     loaded = load_runs(str(exp))
@@ -881,6 +964,17 @@ def test_swift_reference_matches_python(tmp_path):
     assert par["screen"]["max_abs"] < 1e-4
     assert par["preprocessing"]["mean_abs"] < 1.0                   # JPEG decoders differ slightly
     assert par["end_to_end"]["camera_distance_to_python"] < 0.1 * cal["camera_distance_trained_to_pytorch"]
+    # the redesign's device path: shallow mode builds exactly Python's shallow vector, and
+    # the em2 / rate thresholds re-set on the phone equal Python's on the same captures
+    dp = par["device_path"]
+    assert set(dp) == {"em2", "rate"}
+    for d in dp.values():
+        assert d["mode"] == "shallow" and d["shallow_vector_max_abs"] < 1e-6
+        assert d["thresholds"] and all(v["abs_diff"] < 1e-3 for v in d["thresholds"].values())
+        assert all(abs(v["est_prev_swift"] - v["est_prev_python"]) < 1e-3 for v in d["thresholds"].values())
+    prof = json.loads((out / "retinareach_profiles.json").read_text())
+    assert prof["calibration"]["source_profile"] == "tabletop" and prof["calibration"]["shallow_layers"] > 0
+    assert set(prof["threshold_reference"]) == {"dr_referable", "edema"}
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Apple-GPU (MPS) regression")
@@ -961,21 +1055,32 @@ def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
                      "--depth-fractions", "0", "1", "--alphas", "0.5", "--num-workers", "0",
                      "--small-n", "4", "999999", "--small-n-repeats", "2",
                      "--device", "cpu"]) == 0
+    from retinareach import THRESHOLD_METHODS
     df = pd.read_csv(out / "redesign.csv")
-    assert {"baseline", "A_prevalence", "B1_shallow", "B2_prior", "B3_threshold"} <= set(df["experiment"])
+    assert {"baseline", "A_prevalence", "B1_shallow", "B2_prior", "B3_threshold",
+            "D_matched"} <= set(df["experiment"])
     assert {"tabletop", "handheld", "cam3"} <= set(df["device"])
     a = df[df["experiment"] == "A_prevalence"]
     assert (a["device"] == "tabletop").any()                     # the no-camera-change control
     b3 = df[df["experiment"] == "B3_threshold"]
-    assert set(b3["method"]) == {"em", "anchor"} and b3["pool_prev"].notna().all()
-    assert b3.loc[b3["method"] == "em", "est_prev"].between(0, 1).all()
+    assert set(b3["method"]) == set(THRESHOLD_METHODS) - {"shipped"} and b3["pool_prev"].notna().all()
+    assert b3.loc[b3["method"].isin(["em", "em2", "rate"]), "est_prev"].between(0, 1).all()
     assert b3.loc[b3["method"] == "anchor", "est_prev"].isna().all()
-    # C: N captures give both the statistics and the threshold, every method on both bases
+    assert b3.loc[b3["method"] == "rate", "flag_rate"].between(0, 1).all()
+    # D: the label-free prevalence-matched pool, full depth and shallow, then as B3 bases
+    dm = df[df["experiment"] == "D_matched"]
+    assert set(dm["device"]) == {"handheld", "cam3"} and dm["matched_expected_prev"].between(0, 1).all()
+    assert {"matched pool, source prevalence (full depth)", "matched pool, source prevalence + shallow",
+            "matched pool, zero prevalence (full depth)"} <= set(dm["setting"])
+    assert {"matched source (full depth)", "matched source + shallow", "matched zero + shallow"
+            } <= set(b3["base"])
+    # C: N captures give both the statistics and the threshold, every method on every base
     c = df[df["experiment"] == "C_small_n"]
-    assert set(c["method"]) == {"shipped", "em", "anchor"}
+    assert set(c["method"]) == set(THRESHOLD_METHODS)
     shallow_base = [b for b in c["base"].unique() if b.startswith("shallow ")]
     assert len(shallow_base) == 1 and set(c["n_captures"]) == {4}
-    assert set(c["base"]) == {"tabletop statistics", "AdaBN", shallow_base[0]}
+    assert set(c["base"]) == {"tabletop statistics", "AdaBN", shallow_base[0], "matched", "matched + shallow"}
+    assert c.loc[c["base"] == "matched", "matched_expected_prev"].between(0, 1).all()
     assert any(b.startswith("shallow ") for b in b3["base"].unique())
     assert c["meets_floor"].isin([True, False]).all() and (c["repeat"] < 2).all()
     shipped = c[(c["method"] == "shipped") & (c["base"] == "tabletop statistics")]
@@ -987,4 +1092,21 @@ def test_redesign_calibration_runs_on_a_checkpoint(tmp_path):
     k0 = b1[b1["layers"] == 0]["auroc"].iloc[0]
     assert k0 == pytest.approx(base[base["setting"] == "tabletop statistics"]["auroc"].iloc[0])
     summary = (out / "redesign_summary.txt").read_text()
-    assert "C_small_n" in summary and "meets_floor" in summary
+    assert "C_small_n" in summary and "meets_floor" in summary and "D_matched" in summary
+    assert "shallow + EM2 threshold" in summary and "specificity:" in summary
+    # the cross-fitted probes, post hoc on the same checkpoint
+    from probe_folds import main as probe_folds
+    assert probe_folds(["--ckpt", str(ck), "--folds", "2", "--n-shuffle", "2", "--n-boot", "10",
+                        "--num-workers", "0", "--device", "cpu", "--out", str(tmp_path / "out")]) == 0
+    oof = pd.read_csv(tmp_path / "out" / "capability_probes_oof.csv")
+    assert set(oof["protocol"]) == {"calibrated_oof2"} and set(oof["target"]) <= {"hypertension"}
+    assert (oof["device"] == "handheld").all() and oof["pos_patients"].ge(1).all()
+    assert os.path.exists(tmp_path / "out" / "predictions_handheld_probes_oof2.csv")
+    assert json.load(open(tmp_path / "out" / "probe_folds.json"))["settings"]["probe_folds"] == 2
+    # the summarizer picks the post-hoc rows up next to the run's own
+    import shutil
+    from summarize_retinareach import load as load_runs
+    exp = tmp_path / "exp_pf"
+    shutil.copytree(tmp_path / "out", exp / "seed0")
+    runs = load_runs(str(exp))
+    assert (runs[0]["cap"]["protocol"] == "calibrated_oof2").sum() == len(oof)

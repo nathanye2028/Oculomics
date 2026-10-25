@@ -9,7 +9,9 @@ itself: two graphs over the same weights plus a small JSON of device profiles.
     RetinaReachCalibrator.mlpackage  images [B,3,S,S] (0-255)      ->  bn_stats of that batch
     RetinaReachFused.mlpackage       (--fused) BN folded, one fixed profile: the latency baseline
     retinareach_profiles.json        statistics order, trained + per-profile statistics vectors,
-                                     envelopes, thresholds, capability rows, preprocessing
+                                     envelopes, thresholds, capability rows, preprocessing,
+                                     threshold references (em2 / rate) and the calibration spec
+                                     (source profile, shallow_layers)
 
 Why two graphs
 --------------
@@ -181,9 +183,19 @@ def profiles_payload(net: RetinaReachNet, ck: Optional[dict], args) -> dict:
                              "fov_crop": f"crop to the bounding box of max(R,G,B) > {FOV_TOL}",
                              "resize": f"full-frame resize to {args.image_size}x{args.image_size} "
                                        f"(no centre crop)"},
-           "probe_build": ck is None, "profiles": {}, "thresholds": {}}
+           "probe_build": ck is None, "profiles": {}, "thresholds": {}, "threshold_reference": {}}
+    frac = float(getattr(args, "shallow_frac", 0.5))
+    out["calibration"] = {
+        "source_profile": (ck or {}).get("args", {}).get("source_name"),
+        "n_bn_layers": len(order), "shallow_layers": int(round(frac * len(order))), "shallow_frac": frac,
+        "modes": ["full", "shallow"], "threshold_methods": ["shipped", "em2", "rate"],
+        "note": "shallow: the first shallow_layers layers' entries of the measured vector, the rest "
+                "from the source profile; em2 / rate: prevalence from the captures scored under the "
+                "source profile, threshold placed on their calibrated scores "
+                "(retinareach.label_free_threshold)"}
     if ck is not None:
         out["thresholds"] = ck.get("thresholds", {})
+        out["threshold_reference"] = {t: dict(r) for t, r in (ck.get("threshold_reference") or {}).items()}
         for name, p in ck.get("profiles", {}).items():
             out["profiles"][name] = {
                 "dataset": p["dataset"], "n_pool": p["n_pool"], "envelope": p["envelope"],
@@ -361,8 +373,57 @@ def swift_parity(paths: Dict[str, str], net: RetinaReachNet, ck: Optional[dict],
     with open(dev_raw) as fh:
         raw_vec = torch.tensor(json.load(fh)["measured"], dtype=torch.float32)
     e2e = {"camera_distance_to_python": camera_distance(vector_to_stats(raw_vec, net), sw_stats)}
+
+    # 6. the redesign's device path: shallow recalibration (the first K layers from the
+    #    measured vector, the rest from the source profile) and the threshold re-set by
+    #    em2 / rate from the same captures, Swift vs the same arithmetic in Python on
+    #    PyTorch's probabilities
+    device_path = {}
+    with open(os.path.join(args.out_dir, "retinareach_profiles.json")) as fh:
+        prof_json = json.load(fh)
+    spec, refs_json = prof_json.get("calibration") or {}, prof_json.get("threshold_reference") or {}
+    src_name = spec.get("source_profile")
+    if ck is not None and refs_json and src_name in (ck.get("profiles") or {}):
+        from retinareach import ThresholdReference, label_free_threshold
+        src_vec = stats_to_vector(stats_from_lists(ck["profiles"][src_name]["bn_stats"]), order)
+        want, i = src_vec.clone(), 0
+        for layer, c in enumerate(m_.num_features for _, m_ in bn_layers(net)):
+            if layer < int(spec["shallow_layers"]):
+                want[i:i + 2 * c] = sw_vec[i:i + 2 * c]
+            i += 2 * c
+        m_src = copy.deepcopy(net).eval()
+        set_bn_stats(m_src, vector_to_stats(src_vec, net))
+        with torch.no_grad():
+            q_ref = torch.sigmoid(m_src(norm(raw))).numpy()
+        for method in ("em2", "rate"):
+            dev_m = os.path.join(work, f"device_shallow_{method}.json")
+            run("calibrate", "--models", args.out_dir, "--captures", os.path.join(work, "py_pre"),
+                "--n", str(n), "--units", units, "--preprocessed", "--mode", "shallow",
+                "--threshold", method, "--out", dev_m)
+            with open(dev_m) as fh:
+                dm = json.load(fh)
+            inf_vec = torch.tensor(dm["inference"], dtype=torch.float32)
+            m_sh = copy.deepcopy(net).eval()
+            set_bn_stats(m_sh, vector_to_stats(inf_vec, net))
+            with torch.no_grad():
+                q_cal = torch.sigmoid(m_sh(norm(raw))).numpy()
+            rows = {}
+            for t, r in refs_json.items():
+                ref = ThresholdReference.from_dict(r)
+                if method == "rate" and not (ref.source_spec == ref.source_spec):
+                    continue
+                k = net.index(t)
+                py_thr, est = label_free_threshold(q_cal[:, k], ref, method, q_ref[:, k])
+                sw_thr = (dm.get("thresholds") or {}).get(t)
+                rows[t] = {"swift": sw_thr, "python": py_thr,
+                           "abs_diff": abs(sw_thr - py_thr) if sw_thr is not None else float("nan"),
+                           "est_prev_swift": (dm.get("estimatedPrevalence") or {}).get(t),
+                           "est_prev_python": est.get("est_prev")}
+            device_path[method] = {"mode": dm.get("mode"),
+                                   "shallow_vector_max_abs": float((inf_vec - want).abs().max()),
+                                   "thresholds": rows}
     out = {"n_images": n, "preprocessing": pre, "calibration": calib, "lookup": lookup,
-           "screen": screen, "end_to_end": e2e}
+           "screen": screen, "end_to_end": e2e, "device_path": device_path}
     print(f"\n=== Swift reference parity ({n} captures, Core ML on {units}) ===")
     print(f"  preprocessing bytes vs the training pipeline: max |diff| {pre['max_abs']}, mean "
           f"{pre['mean_abs']:.3f}, {100 * pre['frac_differing']:.1f} % of values differ")
@@ -375,6 +436,11 @@ def swift_parity(paths: Dict[str, str], net: RetinaReachNet, ck: Optional[dict],
     print(f"  screening probabilities vs PyTorch: max |diff| {screen['max_abs']:.2e}")
     print(f"  end to end from raw files: camera distance Swift vs Python statistics "
           f"{e2e['camera_distance_to_python']:.2e}")
+    for method, d in device_path.items():
+        worst = max([v["abs_diff"] for v in d["thresholds"].values()] or [float("nan")])
+        print(f"  shallow + {method}: inference vector vs Python's shallow vector max |diff| "
+              f"{d['shallow_vector_max_abs']:.2e}; re-set thresholds Swift vs Python max |diff| {worst:.2e} "
+              f"({len(d['thresholds'])} targets)")
     return out
 
 
@@ -410,6 +476,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--image-size", type=int, default=None)
     p.add_argument("--calib-batch", type=int, default=None,
                    help="calibrator batch size (default: the checkpoint's, else 16)")
+    p.add_argument("--shallow-frac", type=float, default=0.5,
+                   help="fraction of the BN layers (from the input) the device recalibrates in "
+                        "shallow mode; exported as calibration.shallow_layers")
     p.add_argument("--collector-precision", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--precision", choices=["fp32", "fp16"], default="fp16",
                    help="inference graph precision")

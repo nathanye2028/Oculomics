@@ -20,16 +20,47 @@ public struct DeviceReport: Codable {
     public let targets: [TargetStatus]
 }
 
+/// Which BatchNorm layers the camera's measured statistics replace at screening time.
+public enum CalibrationMode: String, Codable {
+    /// Every layer (AdaBN). On BRSET -> mBRSET this raised the AUROC and cut the
+    /// sensitivity at the shipped threshold (REPORT 10.6-10.8).
+    case full
+    /// The first `calibration.shallow_layers` layers only; the deeper, more
+    /// disease-specific statistics stay the source profile's (REPORT 10.8).
+    case shallow
+}
+
+/// How the per-target threshold is set after calibration (retinareach.label_free_threshold).
+public enum ThresholdMethod: String, Codable {
+    /// The threshold fixed on the source camera's validation split, unchanged.
+    case shipped
+    /// Prevalence by EM on the captures scored under the source profile, posteriors
+    /// carried to the same captures' calibrated scores, threshold by expected sensitivity.
+    case em2
+    /// Rank only: flag the top fraction expected from the estimated prevalence and the
+    /// source's false-alarm rate.
+    case rate
+}
+
 /// The stored result of calibrating to one camera.
 public struct Calibration: Codable {
     public let nImages: Int
     /// Measured statistics: drives the camera lookup (envelopes are unblended).
     public let measured: [Float]
-    /// What every later screen passes to the model: `measured`, or blended with
-    /// the trained statistics when `priorStrength` > 0.
+    /// What every later screen passes to the model: `measured` (full), its first
+    /// `shallow_layers` layers over the source profile (shallow), or `measured`
+    /// blended with the trained statistics when `priorStrength` > 0.
     public let inference: [Float]
     public let priorStrength: Double
     public let report: DeviceReport
+    /// `full` or `shallow`; absent in calibrations stored before shallow mode (full).
+    public let mode: String?
+    /// The threshold method the stored thresholds came from; absent = shipped.
+    public let thresholdMethod: String?
+    /// Per source target: the threshold this camera screens at when it was re-set.
+    public let thresholds: [String: Double]?
+    /// Per source target: the clinic's prevalence estimated from the captures.
+    public let estimatedPrevalence: [String: Double]?
 }
 
 public struct ScreenResult: Codable {
@@ -102,10 +133,103 @@ public final class RetinaReach {
         return zip(profiles.trainedStats, measured).map { a * $0 + (1 - a) * $1 }
     }
 
-    public func calibrate(_ images: [RGBImage], priorStrength: Double = 0) throws -> Calibration {
+    /// Shallow recalibration (retinareach.calibrate_blended with `adapt` = the first K
+    /// layers): the first `calibration.shallow_layers` layers' entries come from the
+    /// measured statistics, the rest from the source profile. The collector needs no
+    /// change: layer k's batch statistics depend only on the layers below it, so the
+    /// measured vector's first K entries are exactly the shallow calibration's.
+    public func shallowVector(_ measured: [Float]) -> [Float] {
+        guard let spec = profiles.calibration, let src = profiles.sourceStats, src.count == measured.count
+        else { return measured }
+        var out = src
+        var i = 0
+        for (layer, c) in profiles.statsLayout.channels.enumerated() {
+            if layer < spec.shallowLayers { for j in i..<(i + 2 * c) { out[j] = measured[j] } }
+            i += 2 * c
+        }
+        return out
+    }
+
+    public func calibrate(_ images: [RGBImage], mode: CalibrationMode = .full, priorStrength: Double = 0,
+                          thresholdMethod: ThresholdMethod = .shipped) throws -> Calibration {
         let (m, n) = try measure(images)
-        return Calibration(nImages: n, measured: m, inference: blend(m, nImages: n, priorStrength: priorStrength),
-                           priorStrength: priorStrength, report: lookup(m, nImages: n))
+        let inference: [Float]
+        switch mode {
+        case .full: inference = blend(m, nImages: n, priorStrength: priorStrength)
+        case .shallow: inference = shallowVector(m)
+        }
+        var thresholds: [String: Double] = [:], prevalence: [String: Double] = [:]
+        if thresholdMethod != .shipped, let refs = profiles.thresholdReference, let src = profiles.sourceStats {
+            // The same captures scored under the source profile (where the Platt map was
+            // fit: the prevalence estimate) and under the calibrated statistics (what the
+            // device will act on: where the threshold is placed).
+            let qRef = try images.map { try probabilities($0, stats: src) }
+            let qCal = try images.map { try probabilities($0, stats: inference) }
+            for (t, ref) in refs {
+                guard let k = profiles.targets.firstIndex(of: t) else { continue }
+                let (thr, pi) = labelFreeThreshold(qCal.map { Double($0[k]) }, reference: qRef.map { Double($0[k]) },
+                                                   ref: ref, method: thresholdMethod)
+                if let thr = thr { thresholds[t] = thr; prevalence[t] = pi }
+            }
+        }
+        return Calibration(nImages: n, measured: m, inference: inference, priorStrength: priorStrength,
+                           report: lookup(m, nImages: n), mode: mode.rawValue,
+                           thresholdMethod: thresholdMethod.rawValue, thresholds: thresholds,
+                           estimatedPrevalence: prevalence)
+    }
+
+    // MARK: label-free threshold (retinareach.label_free_threshold, em2 / rate)
+
+    /// Saerens, Latinne & Decaestecker (2002): EM re-estimate of the class prior from
+    /// posteriors `pCal` calibrated at `prior` (retinareach.em_prevalence, same arithmetic).
+    public func emPrevalence(_ pCal: [Double], prior: Double, iters: Int = 200, tol: Double = 1e-7) -> (Double, [Double]) {
+        var pi = prior, post = pCal
+        for _ in 0..<iters {
+            post = pCal.map { p in
+                let a = (pi / prior) * p, b = ((1 - pi) / (1 - prior)) * (1 - p)
+                return a / max(a + b, 1e-12)
+            }
+            let new = post.reduce(0, +) / Double(max(post.count, 1))
+            let done = abs(new - pi) < tol
+            pi = new
+            if done { break }
+        }
+        return (pi, post)
+    }
+
+    /// Highest threshold whose expected sensitivity under soft labels reaches `target`
+    /// (retinareach.expected_sensitivity_threshold).
+    public func expectedSensitivityThreshold(_ scores: [Double], soft: [Double], target: Double) -> Double {
+        let order = scores.indices.sorted { scores[$0] > scores[$1] }
+        let total = max(soft.reduce(0, +), 1e-12)
+        var cum = 0.0
+        for i in order {
+            cum += soft[i] / total
+            if cum >= target { return scores[i] }
+        }
+        return scores[order.last!]
+    }
+
+    /// The threshold the device applies after scoring its captures under the calibrated
+    /// statistics (`qCal`) and under the source profile (`qRef`, same captures, same order).
+    /// Returns (threshold or nil when the method cannot run, estimated prevalence).
+    public func labelFreeThreshold(_ qCal: [Double], reference qRef: [Double], ref: ThresholdReference,
+                                   method: ThresholdMethod) -> (Double?, Double) {
+        guard !qCal.isEmpty, qCal.count == qRef.count else { return (nil, .nan) }
+        let logit = { (p: Double) -> Double in let c = min(max(p, 1e-6), 1 - 1e-6); return log(c / (1 - c)) }
+        let pCal = qRef.map { 1 / (1 + exp(-(ref.plattA * logit($0) + ref.plattB))) }
+        let (pi, post) = emPrevalence(pCal, prior: ref.prior)
+        switch method {
+        case .shipped:
+            return (ref.threshold, pi)
+        case .em2:
+            return (expectedSensitivityThreshold(qCal, soft: post, target: ref.targetSens), pi)
+        case .rate:
+            guard let spec = ref.sourceSpec else { return (nil, pi) }
+            let f = min(max(pi * ref.targetSens + (1 - pi) * (1 - spec), 0), 1)
+            let k = min(max(Int(ceil(f * Double(qCal.count))), 1), qCal.count)
+            return (qCal.sorted(by: >)[k - 1], pi)
+        }
     }
 
     // MARK: camera signature and capability lookup
@@ -197,7 +321,10 @@ public final class RetinaReach {
         var probs: [String: Float] = [:], flags: [String: Bool] = [:]
         for (t, v) in zip(profiles.targets, p) { probs[t] = v }
         for t in calibration?.report.shown ?? [] {
-            if let thr = profiles.threshold(t), let v = probs[t] { flags[t] = Double(v) >= thr }
+            // the camera's own re-set threshold when the calibration carries one, else the shipped one
+            if let thr = calibration?.thresholds?[t] ?? profiles.threshold(t), let v = probs[t] {
+                flags[t] = Double(v) >= thr
+            }
         }
         return ScreenResult(file: file, probabilities: probs, flagged: flags)
     }

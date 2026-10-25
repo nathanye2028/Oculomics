@@ -92,7 +92,14 @@ def load(d: str, prefix: str = "seed"):
             sweep = sweep[sweep["prior_strength"] <= 0]
             if n_bad:
                 print(f"[note] {base}: dropped {n_bad} post-hoc-prior sweep rows (pre-fix run)")
-        runs[s] = {"results": res, "cap": _csv(base, "capability.csv", s),
+        cap = _csv(base, "capability.csv", s)
+        oof = _csv(base, "capability_probes_oof.csv", s)          # probe_folds.py, run post hoc
+        if len(oof):
+            key = ["target", "device", "protocol"]
+            have = set(map(tuple, cap[key].to_numpy())) if len(cap) else set()
+            oof = oof[[tuple(r) not in have for r in oof[key].to_numpy()]]
+            cap = pd.concat([cap, oof], ignore_index=True)
+        runs[s] = {"results": res, "cap": cap,
                    "sweep": sweep,
                    "strata": _csv(base, "quality_strata.csv", s),
                    "op": _csv(base, "operating_point.csv", s),

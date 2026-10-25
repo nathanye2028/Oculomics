@@ -47,11 +47,24 @@ B3 Re-estimated threshold: the clinic's prevalence estimated from the model's ow
 C  Deployment-sized calibration sets. The phone has N captures, not a pool of
    thousands, and one draw gives it both the BN statistics and the threshold. N
    random captures at the camera's natural prevalence (``--small-n`` x
-   ``--small-n-repeats``), each threshold method on three bases from those same
-   N -- tabletop statistics, full AdaBN, and shallow-only AdaBN (the first
-   ``--shallow-frac`` of the BN layers; B3 runs the same three on the full pool):
-   mean and SD of sensitivity, and how often a single clinic's draw reaches the
-   sensitivity floor.
+   ``--small-n-repeats``), each threshold method on five bases from those same
+   N -- tabletop statistics, full AdaBN, shallow-only AdaBN (the first
+   ``--shallow-frac`` of the BN layers), and D's prevalence-matched pool at full
+   depth and shallow (B3 runs the same bases on the full pool): mean and SD of
+   sensitivity, and how often a single clinic's draw reaches the sensitivity
+   floor.
+D  Prevalence-matched calibration pool, label-free: the device-side answer to A.
+   The captures are scored under tabletop statistics, EM on the Platt-calibrated
+   scores gives each capture's posterior and the clinic's prevalence, and the
+   pool is resampled so that its expected disease rate is the source's (or zero:
+   predicted disease-free eyes only; ``retinareach.prevalence_matched_sample``).
+   Statistics on that pool, full depth or shallow, at the shipped threshold;
+   ``matched_expected_prev`` is the label-free estimate of the pool's rate and
+   ``matched_actual_prev`` the labels' answer (audit only).
+   Threshold methods, every one on every base: ``em`` and ``anchor`` as before,
+   ``em2`` (EM on the tabletop-statistics scores, posteriors carried to the
+   calibrated scores of the same captures) and ``rate`` (flag the top fraction
+   expected from the estimated prevalence and the source's false-alarm rate).
 
 The cameras are the ones the checkpoint's run scored, with that run's own tables:
 a run trained with ``--source-camera`` gets its source camera filtered the same way
@@ -86,7 +99,7 @@ from fundus_utils import seed_worker  # noqa: E402
 from metadata_model import _auc, load_table  # noqa: E402
 from retinareach import (THRESHOLD_METHODS, bn_layers, build_from_checkpoint,  # noqa: E402
                          calibrate_blended, fit_threshold_reference, label_free_threshold,
-                         set_bn_stats, stats_from_lists)
+                         prevalence_matched_sample, set_bn_stats, stats_from_lists)
 from train_mbrset import pick_device  # noqa: E402
 from train_retinareach import (MultiTargetDataset, camera_slug, holdout_camera,  # noqa: E402
                                parse_unfamiliar, predict)
@@ -275,20 +288,23 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
     floor = a.target_sens - float(args.get("sens_tolerance", 0.10))
     plain = lambda ds: DataLoader(ds, batch_size=64, num_workers=a.num_workers)
 
-    def threshold_rows(exp, dname, base_name, q_cap, q_te, methods, **extra):
+    def threshold_rows(exp, dname, base_name, q_cap, q_te, methods, q_ref=None, **extra):
         """One row per target x method: the threshold set from the captures'
-        scores ``q_cap``, scored on the camera's test split ``q_te``."""
+        scores ``q_cap`` (``q_ref``: the same captures under tabletop statistics,
+        the reference of ``em2`` / ``rate``), scored on the camera's test split ``q_te``."""
         y_te = devs[dname]["test"].label_array()
         for t, ref in refs.items():
             k = targets.index(t)
             for method in methods:
-                thr, est = label_free_threshold(q_cap[:, k], ref, method)
+                thr, est = label_free_threshold(q_cap[:, k], ref, method,
+                                                None if q_ref is None else q_ref[:, k])
                 m = metrics(y_te[:, k], q_te[:, k], thr)
                 if m:
                     rows.append({"ckpt": os.path.basename(path), "seed": seed, "experiment": exp,
                                  "device": dname, "setting": f"{base_name} + {method} threshold",
                                  "target": t, **m, "base": base_name, "method": method,
-                                 "est_prev": est.get("est_prev"), "meets_floor": m["sensitivity"] >= floor,
+                                 "est_prev": est.get("est_prev"), "flag_rate": est.get("flag_rate"),
+                                 "meets_floor": m["sensitivity"] >= floor,
                                  **{kk: (v[k] if isinstance(v, np.ndarray) else v)
                                     for kk, v in extra.items()}})
 
@@ -297,20 +313,45 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
     k_sh = int(round(a.shallow_frac * len(names)))
     shallow = f"shallow {k_sh}/{len(names)}"
 
-    # B3: label-free thresholds from the full natural pool
+    # B3: label-free thresholds from the full natural pool, every method on every
+    #     base; the pool scored under tabletop statistics is the reference of em2 / rate.
+    # D:  the prevalence-matched pool (label-free), full depth and shallow, at the
+    #     shipped threshold, and then as two more B3 bases.
+    primary = src_targets[0]
+    q_pool_ref: Dict[str, np.ndarray] = {}
     for dname in others:
-        pool = devs[dname]["pool"]
+        pool, y_pool = devs[dname]["pool"], devs[dname]["pool_y"]
+        q_pool_ref[dname] = predict(tab_model, plain(pool), dev)
         full, _ = calibrate_blended(tab_model, calib_loader(pool, seed), dev)
         part, _ = calibrate_blended(tab_model, calib_loader(pool, seed), dev, adapt=names[:k_sh])
-        prev = _prevalence(devs[dname]["pool_y"])
-        for base_name, model in (("tabletop statistics", tab_model), ("AdaBN (full pool)", full),
-                                 (shallow + " (full pool)", part)):
-            threshold_rows("B3_threshold", dname, base_name, predict(model, plain(pool), dev),
-                           predict(model, loaders[dname], dev), ("em", "anchor"), pool_prev=prev)
-        del full, part
+        prev = _prevalence(y_pool)
+        bases = [("tabletop statistics", tab_model), ("AdaBN (full pool)", full),
+                 (shallow + " (full pool)", part)]
+        if primary in refs:
+            for label, pt in (("source", None), ("zero", 0.0)):
+                idx, info = prevalence_matched_sample(q_pool_ref[dname][:, k_primary], refs[primary],
+                                                      rng, target_prevalence=pt)
+                audit = {"pool_prev": float(prev[k_primary]), "est_prev": info["est_prev"],
+                         "matched_target_prev": info["target_prev"],
+                         "matched_expected_prev": info["expected_prev"],
+                         "matched_actual_prev": float(_prevalence(y_pool[idx])[k_primary])}
+                cal_m, _ = calibrate_blended(tab_model, calib_loader(Subset(pool, idx), seed), dev)
+                part_m, _ = calibrate_blended(tab_model, calib_loader(Subset(pool, idx), seed), dev,
+                                              adapt=names[:k_sh])
+                add("D_matched", dname, f"matched pool, {label} prevalence (full depth)",
+                    score(cal_m, dname, thr_cal), **audit)
+                add("D_matched", dname, f"matched pool, {label} prevalence + shallow",
+                    score(part_m, dname, thr_cal), **audit)
+                bases += [(f"matched {label} (full depth)", cal_m), (f"matched {label} + shallow", part_m)]
+        for base_name, model in bases:          # the shipped threshold is the baseline / D row
+            q_cap = q_pool_ref[dname] if model is tab_model else predict(model, plain(pool), dev)
+            threshold_rows("B3_threshold", dname, base_name, q_cap, predict(model, loaders[dname], dev),
+                           THRESHOLD_METHODS[1:], q_ref=q_pool_ref[dname], pool_prev=prev)
+        del full, part, bases
 
     # C: deployment-sized calibration sets -- one draw of N captures gives both the
-    #    BN statistics and the threshold, as on the device
+    #    BN statistics and the threshold, as on the device; the matched pool is
+    #    resampled from those same N captures
     for dname in others:
         pool, y_pool = devs[dname]["pool"], devs[dname]["pool_y"]
         q_te_tab = predict(tab_model, loaders[dname], dev)
@@ -320,17 +361,30 @@ def run_checkpoint(path: str, a, dev) -> List[dict]:
             for r in range(a.small_n_repeats):
                 idx = rng.choice(len(pool), size=n, replace=False)
                 sub = Subset(pool, idx)
+                q_ref_sub = q_pool_ref[dname][idx]
                 cal, info = calibrate_blended(tab_model, calib_loader(sub, seed + 5000 + r), dev)
                 part, _ = calibrate_blended(tab_model, calib_loader(sub, seed + 5000 + r), dev,
                                             adapt=names[:k_sh])
+                bases = [("tabletop statistics", tab_model, q_te_tab), ("AdaBN", cal, None),
+                         (shallow, part, None)]
+                extra_m = {}
+                if primary in refs:
+                    idx_m, info_m = prevalence_matched_sample(q_ref_sub[:, k_primary], refs[primary],
+                                                              rng, size=n)
+                    sub_m = Subset(pool, idx[idx_m])
+                    cal_m, _ = calibrate_blended(tab_model, calib_loader(sub_m, seed + 5000 + r), dev)
+                    part_m, _ = calibrate_blended(tab_model, calib_loader(sub_m, seed + 5000 + r), dev,
+                                                  adapt=names[:k_sh])
+                    bases += [("matched", cal_m, None), ("matched + shallow", part_m, None)]
+                    extra_m = {"matched_expected_prev": info_m["expected_prev"],
+                               "matched_actual_prev": float(_prevalence(y_pool[idx[idx_m]])[k_primary])}
                 prev = _prevalence(y_pool[idx])
-                for base_name, model, q_te in (("tabletop statistics", tab_model, q_te_tab),
-                                               ("AdaBN", cal, None), (shallow, part, None)):
+                for base_name, model, q_te in bases:
                     q_te = predict(model, loaders[dname], dev) if q_te is None else q_te
                     threshold_rows("C_small_n", dname, base_name, predict(model, plain(sub), dev),
-                                   q_te, THRESHOLD_METHODS, n_captures=n, repeat=r,
-                                   n_images=info.n_images, pool_prev=prev)
-                del cal, part
+                                   q_te, THRESHOLD_METHODS, q_ref=q_ref_sub, n_captures=n, repeat=r,
+                                   n_images=info.n_images, pool_prev=prev, **extra_m)
+                del cal, part, bases
     return rows
 
 
@@ -352,6 +406,18 @@ LADDER = (
      & _col(d, "base").astype(str).str.startswith("shallow") & (_col(d, "method") == "em")),
     ("AdaBN + EM threshold", lambda d: (d["experiment"] == "B3_threshold")
      & (_col(d, "base") == "AdaBN (full pool)") & (_col(d, "method") == "em")),
+    ("matched pool, source prevalence", lambda d: (d["experiment"] == "D_matched")
+     & (d["setting"] == "matched pool, source prevalence (full depth)")),
+    ("matched + shallow", lambda d: (d["experiment"] == "D_matched")
+     & (d["setting"] == "matched pool, source prevalence + shallow")),
+    ("shallow + EM2 threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & _col(d, "base").astype(str).str.startswith("shallow") & (_col(d, "method") == "em2")),
+    ("shallow + rate threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & _col(d, "base").astype(str).str.startswith("shallow") & (_col(d, "method") == "rate")),
+    ("matched + shallow + EM2 threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & (_col(d, "base") == "matched source + shallow") & (_col(d, "method") == "em2")),
+    ("matched + shallow + rate threshold", lambda d: (d["experiment"] == "B3_threshold")
+     & (_col(d, "base") == "matched source + shallow") & (_col(d, "method") == "rate")),
 )
 
 
@@ -381,12 +447,13 @@ def ladder(df: pd.DataFrame, primary: str, devices: Sequence[str], shallow_frac:
 def summarise(df: pd.DataFrame, primary: str) -> str:
     d = df[df["target"] == primary]
     out = []
-    for exp in ("baseline", "A_prevalence", "B1_shallow", "B2_prior", "B3_threshold"):
+    for exp in ("baseline", "A_prevalence", "B1_shallow", "B2_prior", "D_matched", "B3_threshold"):
         e = d[d["experiment"] == exp]
         if e.empty:
             continue
         cols = ["auroc", "sensitivity", "specificity", "flagged", "logit_neg"]
-        cols += [c for c in ("pool_prev", "est_prev") if c in e and e[c].notna().any()]
+        cols += [c for c in ("pool_prev", "est_prev", "flag_rate", "matched_expected_prev",
+                             "matched_actual_prev") if c in e and e[c].notna().any()]
         g = e.groupby(["device", "setting"], sort=False)[cols].mean()
         out.append(f"\n--- {exp} ({primary}; mean over checkpoints and repeats) ---\n"
                    + g.to_string(float_format=lambda v: f"{v:.3f}"))
@@ -448,12 +515,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     lad = ladder(df, primary, order, a.shallow_frac)
     if len(lad):
         lad.to_csv(os.path.join(a.out, "ladder.csv"), index=False)
-        txt += (f"\n\n--- camera ladder ({primary}; cameras in ladder order; sensitivity at the shipped "
-                f"threshold unless re-set; mean over checkpoints and repeats) ---\n"
-                + lad.pivot_table(index="device", columns="setting", values="sensitivity", sort=False)
-                .reindex(index=[o for o in order if o in set(lad["device"])],
-                         columns=[s for s, _ in LADDER if s in set(lad["setting"])])
-                .to_string(float_format=lambda v: f"{v:.3f}"))
+        pivot = lambda value: (lad.pivot_table(index="device", columns="setting", values=value, sort=False)
+                               .reindex(index=[o for o in order if o in set(lad["device"])],
+                                        columns=[s for s, _ in LADDER if s in set(lad["setting"])])
+                               .T.to_string(float_format=lambda v: f"{v:.3f}"))
+        txt += (f"\n\n--- camera ladder ({primary}; cameras in ladder order; at the shipped threshold "
+                f"unless re-set; mean over checkpoints and repeats) ---\nsensitivity:\n"
+                + pivot("sensitivity") + "\nspecificity:\n" + pivot("specificity"))
     print(txt)
     with open(os.path.join(a.out, "redesign_summary.txt"), "w") as f:
         f.write(txt + "\n")

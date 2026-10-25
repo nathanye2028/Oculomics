@@ -1,16 +1,20 @@
 // retinareach-cli: the phone-side procedure on a Mac.
 //
 //   retinareach-cli calibrate --models <export dir> --captures <dir> [--n N] [--prior N0]
+//                             [--mode full|shallow] [--threshold shipped|em2|rate]
 //                             [--units all|ane|cpu] [--preprocessed] --out device.json
 //   retinareach-cli screen    --models <export dir> [--device device.json]
 //                             [--units ...] [--preprocessed] IMAGE...
 //   retinareach-cli preprocess --size S [--preprocessed] --out <dir> IMAGE...
 //
 // calibrate: preprocess the captures (sorted by file name, first N, full batches
-// only), measure the camera's BatchNorm statistics with the calibrator, look the
-// camera up against the validated profiles, print the capability report and
-// store it. screen: per-target probabilities under the stored statistics, with a
-// flag at the shipped threshold for the targets the report shows.
+// only), measure the camera's BatchNorm statistics with the calibrator (--mode
+// shallow keeps the deeper layers at the source profile's), look the camera up
+// against the validated profiles, optionally re-set each source target's
+// threshold from the same captures (--threshold em2 | rate), print the
+// capability report and store it. screen: per-target probabilities under the
+// stored statistics, with a flag at the stored threshold (the re-set one when the
+// calibration carries it, else the shipped one) for the targets the report shows.
 // preprocess: dump the prepared S x S bytes (for the parity check).
 import CoreML
 import Foundation
@@ -106,12 +110,28 @@ do {
         let t0 = Date()
         let images = try files.map { try Preprocess.prepare($0, size: S, preprocessed: flags.contains("--preprocessed")) }
         let t1 = Date()
-        let cal = try rr.calibrate(images, priorStrength: Double(opts["--prior"] ?? "0") ?? 0)
+        guard let mode = CalibrationMode(rawValue: opts["--mode"] ?? "full") else { fail("--mode full|shallow") }
+        guard let method = ThresholdMethod(rawValue: opts["--threshold"] ?? "shipped") else {
+            fail("--threshold shipped|em2|rate")
+        }
+        if mode == .shallow && rr.profiles.calibration == nil { fail("this export has no calibration spec: re-export") }
+        if method != .shipped && rr.profiles.thresholdReference == nil {
+            fail("this export has no threshold references: re-export from a trained checkpoint")
+        }
+        let cal = try rr.calibrate(images, mode: mode, priorStrength: Double(opts["--prior"] ?? "0") ?? 0,
+                                   thresholdMethod: method)
         let t2 = Date()
         try writeJSON(cal, to: URL(fileURLWithPath: out))
         let r = cal.report
-        print("calibrated on \(cal.nImages) captures (preprocess \(String(format: "%.2f", t1.timeIntervalSince(t0))) s, "
-              + "calibrator \(String(format: "%.2f", t2.timeIntervalSince(t1))) s)")
+        print("calibrated on \(cal.nImages) captures, mode \(mode.rawValue) (preprocess "
+              + "\(String(format: "%.2f", t1.timeIntervalSince(t0))) s, calibrator + thresholds "
+              + "\(String(format: "%.2f", t2.timeIntervalSince(t1))) s)")
+        for (t, thr) in (cal.thresholds ?? [:]).sorted(by: { $0.key < $1.key }) {
+            let pi = cal.estimatedPrevalence?[t].map { String(format: "%.3f", $0) } ?? "n/a"
+            let shipped = rr.profiles.threshold(t).map { String(format: "%.3f", $0) } ?? "n/a"
+            print("  threshold \(t): \(String(format: "%.3f", thr)) by \(method.rawValue) "
+                  + "(shipped \(shipped); estimated prevalence \(pi))")
+        }
         print("nearest profile: \(r.nearestProfile ?? "none")  inside envelope: \(r.insideEnvelope)"
               + (r.radius.map { "  (radius \(String(format: "%.3g", $0)))" } ?? ""))
         for (k, v) in r.distances.sorted(by: { $0.key < $1.key }) { print("  distance to \(k): \(String(format: "%.4g", v))") }

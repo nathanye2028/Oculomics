@@ -45,7 +45,8 @@ import pandas as pd
 SURFACE = "#fcfcfb"
 INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS = "#e1e0d9", "#c3c2b7"
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]            # slots 1-3 (validated all-pairs)
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a",            # slots 1-3 (validated all-pairs)
+          "#8e44ad", "#5d6d7e"]                         # slots 4-5: the em2 / rate threshold lines
 STATUS_FILL = {"SUPPORTED": "#0ca30c", "THRESHOLD_DRIFT": "#fab219",
                "NO_IMAGE_EVIDENCE": "#ec835a", "UNDERPOWERED": "#e1e0d9",
                "NOT_VALIDATED": "#f0efec"}
@@ -272,12 +273,16 @@ def fig_calibration_size(plt, sweep: pd.DataFrame, source: List[str], device: st
     fig, axes = plt.subplots(len(source), 2, figsize=(10, 3.1 * len(source)), squeeze=False)
     rows = []
     sub = sweep[sweep["kind"] == "subset"]
-    # Runs with label-free thresholds: one calibration (AdaBN), three ways to set the
-    # threshold from the same captures. Older runs: AdaBN with and without the prior.
+    # Runs with label-free thresholds: one calibration (AdaBN), the ways to set the
+    # threshold from the same captures that the run recorded (em2 / rate exist in runs
+    # from 2026-10-25 on). Older runs: AdaBN with and without the prior.
     label_free = any(c.endswith(("__em", "__anchor")) for c in sweep.columns)
     if label_free:
         lines = [(0.0, "", "shipped threshold"), (0.0, "__em", "threshold re-set by EM prevalence"),
                  (0.0, "__anchor", "threshold anchored to the lower quartile")]
+        lines += [(0.0, s, lab) for s, lab in (("__em2", "EM on source-statistics scores (em2)"),
+                                               ("__rate", "expected flag rate by rank (rate)"))
+                  if any(c.endswith(s) for c in sweep.columns)]
     else:
         lines = [(pr, "", "AdaBN only" if pr == 0 else f"with source prior (N0 = {pr:g})")
                  for pr in sorted(sub["prior_strength"].unique())[:2]]

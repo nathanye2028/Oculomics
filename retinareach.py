@@ -631,7 +631,7 @@ def device_capability(profiles: Sequence[DeviceProfile], stats: Stats, n_images:
 # whatever the AUROC. So the threshold has to move with the clinic too, from the
 # same unlabelled captures the BN statistics come from. Pure numpy and scalar
 # reference parameters, so the device runs the same arithmetic.
-THRESHOLD_METHODS = ("shipped", "em", "anchor")
+THRESHOLD_METHODS = ("shipped", "em", "anchor", "em2", "rate")
 
 
 def _logit_np(p: np.ndarray) -> np.ndarray:
@@ -655,13 +655,16 @@ class ThresholdReference:
     platt_b: float
     anchor_q: float             # quantile of the score distribution used as the anchor
     anchor_logit: float         # that quantile of logit(q) on source validation
+    source_spec: float = float("nan")   # specificity at ``threshold`` on source validation:
+                                        # the ``rate`` method's expected false-alarm rate
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ThresholdReference":
-        return cls(**{k: float(d[k]) for k in cls.__dataclass_fields__})
+        # a reference written before ``source_spec`` existed loads with it unset
+        return cls(**{k: float(d[k]) for k in cls.__dataclass_fields__ if k in d})
 
 
 def fit_threshold_reference(q_val: np.ndarray, y_val: np.ndarray, threshold: float,
@@ -674,9 +677,11 @@ def fit_threshold_reference(q_val: np.ndarray, y_val: np.ndarray, threshold: flo
     if len(np.unique(y)) < 2:
         raise ValueError("fit_threshold_reference needs both classes in the validation labels")
     lr = LogisticRegression(C=1e6, max_iter=2000).fit(_logit_np(q)[:, None], y)
+    neg = y == 0
+    spec = float((q[neg] < threshold).mean()) if neg.any() and threshold == threshold else float("nan")
     return ThresholdReference(float(threshold), float(target_sens), float(y.mean()),
                               float(lr.coef_[0, 0]), float(lr.intercept_[0]), float(anchor_q),
-                              float(np.quantile(_logit_np(q), anchor_q)))
+                              float(np.quantile(_logit_np(q), anchor_q)), spec)
 
 
 def em_prevalence(p_cal: np.ndarray, prior: float, iters: int = 200,
@@ -708,30 +713,144 @@ def expected_sensitivity_threshold(scores: np.ndarray, soft: np.ndarray, target:
     return float(s[min(k, len(s) - 1)])
 
 
-def label_free_threshold(q_captures: np.ndarray, ref: ThresholdReference,
-                         method: str) -> Tuple[float, Dict[str, float]]:
+def _platt_posteriors(q_reference: np.ndarray, ref: ThresholdReference) -> Tuple[float, np.ndarray]:
+    """EM prevalence and per-capture posteriors from scores produced under the
+    statistics the Platt map was fit for (the source profile's)."""
+    p_cal = _sigmoid_np(ref.platt_a * _logit_np(q_reference) + ref.platt_b)
+    return em_prevalence(p_cal, ref.prior)
+
+
+def label_free_threshold(q_captures: np.ndarray, ref: ThresholdReference, method: str,
+                         q_reference: Optional[np.ndarray] = None) -> Tuple[float, Dict[str, float]]:
     """The threshold the device applies after scoring N unlabelled captures
     ``q_captures`` with its calibrated model, and what it estimated on the way.
+
+    ``q_reference`` (``em2``, ``rate``): the SAME captures scored under the source
+    profile's statistics, where the Platt map was fit, aligned with ``q_captures``.
+    Without it both read the captures' own scores, i.e. they reduce to ``em``.
 
     shipped  ``ref.threshold``, unchanged.
     em       the clinic's prevalence by EM on the Platt-calibrated scores, then
              the highest threshold whose expected sensitivity under the EM
-             posteriors reaches ``target_sens``. Assumes the Platt map still
-             holds on the new camera (label shift only) -- the thing to test.
+             posteriors reaches ``target_sens``. Assumes the Platt map holds on
+             the scores it is given (label shift only): on real cameras it held
+             under source statistics and broke after full AdaBN (REPORT 10.8).
+    em2      EM run where the map holds -- on ``q_reference`` -- and the posteriors
+             carried to the calibrated scores of the same captures, which then set
+             the threshold by expected sensitivity. Estimating the prevalence
+             (needs an unshifted map) is separated from placing the threshold
+             (needs the scores the device will act on).
+    rate     rank only: flag the top fraction f = pi * target_sens
+             + (1 - pi) * (1 - source_spec) of the captures, pi from EM on
+             ``q_reference``. Immune to score compression; wrong only through pi
+             and through the source's false-alarm rate not holding on the camera.
     anchor   the shipped threshold moved in logit space by how far the
              ``anchor_q`` quantile of the captures sits from source validation.
-             A low quantile is made of disease-free eyes at any plausible
-             prevalence, so it tracks a shift of the whole score distribution
-             (camera, calibration) without estimating the prevalence.
+             Failed on real cameras, which compress the scores rather than shift
+             them (REPORT 10.8); kept as the recorded negative result.
     """
     q = np.asarray(q_captures, dtype=float)
-    q = q[~np.isnan(q)]
-    if method == "shipped" or len(q) == 0:
+    if method == "shipped":
+        return float(ref.threshold), {}
+    if method not in THRESHOLD_METHODS:
+        raise ValueError(f"unknown threshold method {method!r}; expected one of {THRESHOLD_METHODS}")
+    r = q if q_reference is None else np.asarray(q_reference, dtype=float)
+    if r.shape != q.shape:
+        raise ValueError(f"q_reference has shape {r.shape}, q_captures {q.shape}: they must be the "
+                         f"same captures in the same order")
+    ok = ~np.isnan(q) & ~np.isnan(r)
+    q, r = q[ok], r[ok]
+    if len(q) == 0:
         return float(ref.threshold), {}
     if method == "em":
-        pi, post = em_prevalence(_sigmoid_np(ref.platt_a * _logit_np(q) + ref.platt_b), ref.prior)
+        pi, post = _platt_posteriors(q, ref)
         return expected_sensitivity_threshold(q, post, ref.target_sens), {"est_prev": pi}
-    if method == "anchor":
-        shift = float(np.quantile(_logit_np(q), ref.anchor_q) - ref.anchor_logit)
-        return float(_sigmoid_np(_logit_np(ref.threshold) + shift)), {"shift": shift}
-    raise ValueError(f"unknown threshold method {method!r}; expected one of {THRESHOLD_METHODS}")
+    if method == "em2":
+        pi, post = _platt_posteriors(r, ref)
+        return expected_sensitivity_threshold(q, post, ref.target_sens), {"est_prev": pi}
+    if method == "rate":
+        if not (ref.source_spec == ref.source_spec):
+            raise ValueError("the 'rate' method needs ref.source_spec: refit the threshold reference")
+        pi, _ = _platt_posteriors(r, ref)
+        f = float(np.clip(pi * ref.target_sens + (1.0 - pi) * (1.0 - ref.source_spec), 0.0, 1.0))
+        k = int(min(max(math.ceil(f * len(q)), 1), len(q)))
+        return float(np.sort(q)[::-1][k - 1]), {"est_prev": pi, "flag_rate": f}
+    shift = float(np.quantile(_logit_np(q), ref.anchor_q) - ref.anchor_logit)        # anchor
+    return float(_sigmoid_np(_logit_np(ref.threshold) + shift)), {"shift": shift}
+
+
+# --------------------------------------------------------------------------- #
+# Prevalence-matched calibration pool (label-free)
+# --------------------------------------------------------------------------- #
+def prevalence_match_weights(q_reference: np.ndarray, ref: ThresholdReference,
+                             target_prevalence: Optional[float] = None
+                             ) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Per-capture sampling weights that turn the clinic's captures into a
+    calibration pool whose expected disease rate is ``target_prevalence``
+    (default: the source's).
+
+    Experiment A (REPORT 10.8) showed that what AdaBN normalises away is the
+    pool's disease rate, not the camera: statistics taken on a pool held at the
+    source's prevalence keep the shipped threshold's sensitivity. The device has
+    no labels to build that pool, but it has its own posteriors: EM on the
+    Platt-calibrated source-statistics scores gives the clinic's prevalence
+    ``pi`` and each capture's posterior ``r``, and the weights ``w = r * a + (1 - r)``
+    re-weight the captures so that the pool's expected disease rate
+    ``sum(w r) / sum(w)`` is ``pt``, with ``a`` solved for (the importance ratio
+    pt (1 - pi) / (pi (1 - pt)) is its hard-posterior special case). ``pt = 0``
+    keeps the predicted disease-free eyes only. Weights sum to one; a NaN score
+    gets weight zero. ``expected_prev`` in the returned info is the label-free
+    estimate of the pool's rate the device can report.
+    """
+    q = np.asarray(q_reference, dtype=float)
+    ok = ~np.isnan(q)
+    pt = float(ref.prior if target_prevalence is None else target_prevalence)
+    w = np.zeros(len(q))
+    info = {"est_prev": float("nan"), "target_prev": pt, "expected_prev": float("nan"),
+            "n": int(ok.sum())}
+    if not ok.any():
+        return w, info
+    pi, post = _platt_posteriors(q[ok], ref)
+    pi = float(np.clip(pi, 1e-3, 1 - 1e-3))
+    # Weights r * a + (1 - r): ``a`` is the weight a predicted positive keeps relative
+    # to a predicted negative. The importance ratio pt (1 - pi) / (pi (1 - pt)) is
+    # exact only for hard posteriors; the pool's expected rate sum(w r) / sum(w)
+    # rises with ``a``, so ``a`` is solved for so that the rate equals ``pt`` where
+    # the posteriors allow it (a = 0, predicted-negatives only, is as low as it goes).
+    def rate(a_):
+        ww_ = post * a_ + (1.0 - post)
+        return float(np.sum(ww_ * post) / max(float(ww_.sum()), 1e-12))
+    lo, hi = 0.0, 1.0
+    if rate(lo) >= pt:
+        a_ = lo
+    else:
+        while rate(hi) < pt and hi < 1e6:
+            hi *= 2.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if rate(mid) < pt else (lo, mid)
+        a_ = hi
+    ww = post * a_ + (1.0 - post)
+    if not np.isfinite(ww).all() or ww.sum() <= 0:
+        # every capture read as a sure positive (a degenerate model): nothing to
+        # down-weight, so the pool is the captures as they are
+        ww = np.ones_like(post)
+    ww = ww / ww.sum()
+    w[ok] = ww
+    info.update(est_prev=pi, expected_prev=float(np.sum(ww * post)), positive_weight=float(a_))
+    return w, info
+
+
+def prevalence_matched_sample(q_reference: np.ndarray, ref: ThresholdReference,
+                              rng: np.random.Generator, size: Optional[int] = None,
+                              target_prevalence: Optional[float] = None
+                              ) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Indices of a calibration pool resampled, with replacement, from the captures
+    by :func:`prevalence_match_weights`; ``size`` defaults to the number of
+    captures. The same draw, in the same order, builds the device's calibration
+    batches."""
+    w, info = prevalence_match_weights(q_reference, ref, target_prevalence)
+    if len(w) == 0 or w.sum() <= 0:
+        raise ValueError("no scored captures to build a calibration pool from")
+    idx = rng.choice(len(w), size=len(w) if size is None else int(size), replace=True, p=w)
+    return idx, info

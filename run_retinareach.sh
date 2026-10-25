@@ -46,6 +46,9 @@ Every knob is an environment variable:
                    train_mbrset.py model per seed, on the same handheld split
                    (--split-file), e.g. "hypertension insulin"                      (default "")
     PT_EXTRA       extra flags for those runs                     (default "--ema-decay 0.999")
+  systemic probes
+    PROBE_FOLDS    K > 0 = also fit every probe K-fold out of fold on ALL handheld rows
+                   (protocol calibrated_oof<K>; probe_folds.py does it post hoc)   (default "")
   controls
     SHUFFLE        1 = also run the first seed with permuted source labels into
                    $OUT/shuffle_seed<s>/ (every source-target AUROC must sit at chance) (default 0)
@@ -97,6 +100,7 @@ PERTARGET=${PERTARGET:-}
 PT_EXTRA=${PT_EXTRA:---ema-decay 0.999}
 SOURCE_CAMERA=${SOURCE_CAMERA:-}
 HOLDOUT_CAMERA=${HOLDOUT_CAMERA:-}
+PROBE_FOLDS=${PROBE_FOLDS:-}
 PY=.venv/bin/python
 
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2 3 4)
@@ -116,6 +120,8 @@ if [ -n "$U" ]; then
   echo "[info] unfamiliar camera: $U_NAME ($U_DATASET) @ $U"
   UNF=(--unfamiliar "$U" "$U_DATASET" "$U_NAME")
 fi
+PF=()
+[ -n "$PROBE_FOLDS" ] && PF=(--probe-folds "$PROBE_FOLDS")
 # camera names hold spaces ("Canon CR"), so they travel as array elements, never via EXTRA
 CAM=()
 [ -n "$SOURCE_CAMERA" ] && CAM+=(--source-camera "$SOURCE_CAMERA")
@@ -133,7 +139,7 @@ run() {  # run <dir name> <seed> [extra flags...]
   $PY -u train_retinareach.py --source-root "$B" --target-root "$M" \
       --backbone "$STUDENT" --image-size "$SIZE" --epochs "$EPOCHS" --num-workers "$WORKERS" \
       --seed "$s" --out "$OUT/$name" --ckpt "$CK/$name.pt" ${UNF[@]+"${UNF[@]}"} \
-      ${CAM[@]+"${CAM[@]}"} $AMP $EXTRA "$@"
+      ${CAM[@]+"${CAM[@]}"} ${PF[@]+"${PF[@]}"} $AMP $EXTRA "$@"
 }
 
 if [ "$PREFLIGHT" = 1 ]; then

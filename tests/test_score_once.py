@@ -52,12 +52,13 @@ def _checkpoint(path, seed=0):
                          pretrained=False, probe_size=64)
     net, _ = self_calibrate(net, [{"image": torch.randn(8, 3, 64, 64)} for _ in range(2)],
                             torch.device("cpu"))
-    ref = ThresholdReference(0.5, 0.85, 0.2, 1.0, 0.0, 0.25, -1.0).to_dict()
+    ref = ThresholdReference(0.5, 0.85, 0.2, 1.0, 0.0, 0.25, -1.0, 0.9).to_dict()
+    ref_old = {k: v for k, v in ref.items() if k != "source_spec"}     # written before the rate method
     torch.save({"model": {k: v.cpu() for k, v in net.state_dict().items()},
                 "config": {**net.config(), "image_size": 64},
                 "thresholds": {p: {"dr_referable": 0.5, "edema": 0.5} for p in ("trained", "calibrated")},
                 "profiles": {"tabletop": {"bn_stats": stats_to_lists(get_bn_stats(net))}},
-                "threshold_reference": {"dr_referable": ref, "edema": ref},
+                "threshold_reference": {"dr_referable": ref, "edema": ref_old},
                 "args": {"seed": seed, "split_seed": 42, "calib_batch": 4, "source_name": "tabletop",
                          "source_camera": "Canon CR", "target_sens": 0.85, "sens_tolerance": 0.10,
                          "gate_margin": 0.02, "min_test_pos_patients": 2}}, path)
@@ -103,8 +104,9 @@ def test_one_look_writes_everything_and_a_second_is_refused(tmp_path):
     assert set(cap["target"]) == {"dr_referable", "edema"} and set(cap["protocol"]) == {"trained", "calibrated"}
     assert set(cap["seed"]) == {0, 1} and (cap["meta_feature_set"] == "none (chance)").all()
     ops = pd.read_csv(out / "operating_point_messidor2.csv")
-    assert set(zip(ops["protocol"], ops["method"])) == {("trained", "shipped"), ("calibrated", "shipped"),
-                                                         ("calibrated", "em"), ("calibrated", "anchor")}
+    from score_once import PROTOCOL_METHODS
+    assert set(zip(ops["protocol"], ops["method"])) == set(PROTOCOL_METHODS)
+    assert {("calibrated", "em2"), ("calibrated", "rate")} <= set(PROTOCOL_METHODS)
     ref = pd.read_csv(out / "referral_messidor2.csv")
     assert set(ref["rule"]) == {"dr_referable", "dr_or_edema"}
     every = ["per1000_correct_referrals", "per1000_missed", "per1000_unnecessary",
@@ -112,7 +114,10 @@ def test_one_look_writes_everything_and_a_second_is_refused(tmp_path):
     assert np.allclose(ref[every].sum(1), 1000.0)
     assert (ref["retakes"] == 1).all() and (ref["patients"] == 16).all()   # the ungradable exam
     pr = pd.read_csv(out / "seed0" / "predictions_messidor2_calibrated.csv")
-    assert {"fold", "threshold_dr_referable__em", "threshold_dr_referable__anchor"} <= set(pr.columns)
+    assert {"fold", "threshold_dr_referable__em", "threshold_dr_referable__anchor",
+            "threshold_dr_referable__em2", "threshold_dr_referable__rate"} <= set(pr.columns)
+    assert pr["threshold_dr_referable__rate"].notna().all()      # its reference carries source_spec
+    assert pr["threshold_edema__rate"].isna().all()               # edema's does not: skipped, not guessed
     assert pr["p_dr_referable"].notna().all() and set(pr["fold"]) == {0, 1}
     # both eyes of an examination share a fold (the release's pairing sheet)
     pr["exam"] = pr["file"].str.extract(r"IM(\d{4})")[0]

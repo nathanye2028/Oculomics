@@ -513,6 +513,14 @@ def main(argv: Sequence[str] = None) -> int:
     p.add_argument("--probe-C", type=float, nargs="+", default=[1e-3, 1e-2, 1e-1, 1.0])
     p.add_argument("--min-probe-pos", type=int, default=10,
                    help="positive training images needed to fit a probe at all")
+    p.add_argument("--probe-folds", type=int, default=0,
+                   help="K > 0: also fit every probe K-fold out of fold on ALL handheld rows "
+                        "(patient-grouped; the trunk stays frozen), gate those scores against a "
+                        "comparator cross-fit on the same folds (protocol calibrated_oof<K> in "
+                        "capability.csv) and write predictions_<device>_probes_oof<K>.csv. "
+                        "0 = the test-split probes only; probe_folds.py does the same post hoc")
+    p.add_argument("--probe-inner-folds", type=int, default=3,
+                   help="inner patient-grouped folds that pick each outer fold's C and threshold")
     p.add_argument("--target-sens", type=float, default=0.85)
     p.add_argument("--sens-tolerance", type=float, default=0.10)
     p.add_argument("--anchor-quantile", type=float, default=0.25,
@@ -805,7 +813,7 @@ def main(argv: Sequence[str] = None) -> int:
             threshold_refs[t] = fit_threshold_reference(
                 preds[("calibrated", S, "val")][:, k], y_sv[:, k], thresholds["calibrated"][t],
                 a.target_sens, a.anchor_quantile)
-    q_pool_cal, op_rows = {}, []
+    q_pool_cal, q_pool_ref, op_rows = {}, {}, []
     print(f"\n=== label-free operating point (calibrated protocol; threshold re-set from each "
           f"device's unlabelled pool, scored on its test split; floor "
           f"{a.target_sens - a.sens_tolerance:.2f}) ===")
@@ -813,6 +821,12 @@ def main(argv: Sequence[str] = None) -> int:
         m_ = with_stats(model, stats[name]).to(dev)
         q_pool_cal[name] = predict(m_, dl(pool), dev)
         del m_
+        if name == S:
+            q_pool_ref[name] = q_pool_cal[name]
+        else:               # the same captures under the source statistics: the em2 / rate reference
+            m_ = with_stats(model, stats[S]).to(dev)
+            q_pool_ref[name] = predict(m_, dl(pool), dev)
+            del m_
         y_pool, y_te = pool_labels(pool), ds.label_array()
         for t, ref in threshold_refs.items():
             k = model.index(t)
@@ -821,7 +835,8 @@ def main(argv: Sequence[str] = None) -> int:
                 continue
             yy, qq, gg = y_te[ok, k].astype(int), preds[("calibrated", name, "test")][ok, k], ds.patients[ok]
             for method in THRESHOLD_METHODS:
-                thr, est = label_free_threshold(q_pool_cal[name][:, k], ref, method)
+                thr, est = label_free_threshold(q_pool_cal[name][:, k], ref, method,
+                                                q_pool_ref[name][:, k])
                 op = operating_point(yy, qq, thr)
                 lo, hi = sensitivity_ci(yy, qq, gg, thr, a.n_boot, a.seed)
                 op_rows.append({"target": t, "device": name, "method": method, "threshold": thr,
@@ -830,6 +845,7 @@ def main(argv: Sequence[str] = None) -> int:
                                 "flagged_fraction": op["flagged_fraction"],
                                 "meets_floor": op["sensitivity"] >= a.target_sens - a.sens_tolerance,
                                 "est_prev": est.get("est_prev", float("nan")),
+                                "flag_rate": est.get("flag_rate", float("nan")),
                                 "pool_prev": float(np.nanmean(y_pool[:, k])),
                                 "test_prev": float(yy.mean()), "n_pool": len(pool),
                                 "pos_patients": int(len(np.unique(gg[yy == 1])))})
@@ -896,6 +912,32 @@ def main(argv: Sequence[str] = None) -> int:
                              shuffle=probe_shuffles if name == T else None)
         cap_rows += r
         strata_rows += st_
+
+    # ---- cross-fitted probes: every handheld patient tested once ------------ #
+    # The trunk is frozen and never saw a handheld label, so each probe can be fit
+    # K-fold out of fold on ALL handheld rows (probe_folds.py): the gate then has
+    # every positive patient instead of the test split's fifth of them.
+    if a.probe_folds > 0 and probes:
+        from probe_folds import gate_probe_folds
+        parts = ("train", "val", "test")
+        tgt_sets = (tgt_train, tgt_val, tgt_test)
+        df_all = pd.concat([ds_.df for ds_ in tgt_sets], ignore_index=True)
+        g_all = np.concatenate([ds_.patients for ds_ in tgt_sets])
+        Z_all, Y_all = np.concatenate([Z[p_] for p_ in parts]), np.concatenate([Y[p_] for p_ in parts])
+        print(f"\n=== cross-fitted probes: {a.probe_folds}-fold out of fold on all {len(df_all)} {T} "
+              f"images / {len(np.unique(g_all))} patients (trunk frozen; comparator cross-fit on the "
+              f"same folds) ===")
+        rows_oof, strata_oof, oof_pred, oof_info = gate_probe_folds(
+            df_all, Z_all, Y_all, g_all, probes, {t: model.index(t) for t in probes}, T, a, audits[T])
+        cap_rows += rows_oof
+        strata_rows += strata_oof
+        for t, inf in oof_info.items():
+            probe_info.setdefault(t, {})["oof"] = inf
+        if oof_pred is not None:
+            oof_pred.to_csv(os.path.join(a.out, f"predictions_{T}_probes_oof{a.probe_folds}.csv"),
+                            index=False)
+        if rows_oof:
+            print(format_table(rows_oof))
     pd.DataFrame(cap_rows).to_csv(os.path.join(a.out, "capability.csv"), index=False)
     print(format_table(cap_rows))
     bad = [(t, i["shuffle"]) for t, i in probe_info.items() if i.get("fitted")
@@ -963,11 +1005,12 @@ def main(argv: Sequence[str] = None) -> int:
     sweep = []
     y_tt = tgt_test.label_array()
 
-    def score_row(q, n, r, prior, kind, q_cap=None):
+    def score_row(q, n, r, prior, kind, q_cap=None, q_ref=None):
         """``q_cap``: the calibrated model's scores on the captures it was calibrated
         from -- the device re-sets each source threshold from them
-        (``sens_<t>__<method>``, ``flagged_<t>__<method>``; ``prev_<t>__em`` = EM's
-        prevalence estimate)."""
+        (``sens_<t>__<method>``, ``flagged_<t>__<method>``; ``prev_<t>__<method>`` =
+        the method's prevalence estimate); ``q_ref``: the same captures under the
+        source statistics, the reference of ``em2`` / ``rate``."""
         row = {"n": n, "repeat": r, "prior_strength": prior, "kind": kind}
         for t in targets:
             k = model.index(t)
@@ -982,7 +1025,8 @@ def main(argv: Sequence[str] = None) -> int:
             row[f"flagged_{t}"] = float(flag.mean())
             if q_cap is not None and t in threshold_refs:
                 for method in THRESHOLD_METHODS[1:]:
-                    thr_m, est = label_free_threshold(q_cap[:, k], threshold_refs[t], method)
+                    thr_m, est = label_free_threshold(q_cap[:, k], threshold_refs[t], method,
+                                                      None if q_ref is None else q_ref[:, k])
                     f_m = qq >= thr_m
                     row[f"sens_{t}__{method}"] = float(f_m[yy == 1].mean())
                     row[f"flagged_{t}__{method}"] = float(f_m.mean())
@@ -992,7 +1036,7 @@ def main(argv: Sequence[str] = None) -> int:
 
     sweep.append(score_row(preds[("trained", T, "test")], 0, 0, 0.0, "trained"))
     sweep.append(score_row(preds[("calibrated", T, "test")], len(tgt_pool), 0, 0.0, "full_pool",
-                           q_pool_cal[T]))
+                           q_pool_cal[T], q_pool_ref[T]))
     rng = np.random.default_rng(a.seed)
 
     def subset_calibration(ds, n, seed, prior=0.0, idx=None):
@@ -1016,7 +1060,7 @@ def main(argv: Sequence[str] = None) -> int:
                 else:
                     cal, info = cal0, info0
                 row = score_row(predict(cal, loaders[(T, "test")], dev), n, r, prior, "subset",
-                                predict(cal, dl(Subset(tgt_pool, idx)), dev))
+                                predict(cal, dl(Subset(tgt_pool, idx)), dev), q_pool_ref[T][idx])
                 row.update(dist_own=camera_distance(st, stats[T]),
                            dist_other=camera_distance(st, stats[S]), n_used=info.n_images)
                 sweep.append(row)

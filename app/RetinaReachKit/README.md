@@ -8,11 +8,20 @@ on iOS and macOS). It does what the app does, nothing more:
    antialiased bilinear resize to S × S, 8-bit.
 2. **Calibrate** to the camera: run `RetinaReachCalibrator.mlpackage` on the
    first captures in batches of B and average (AdaBN's statistics, no labels,
-   no gradients).
+   no gradients). Mode `full` replaces every layer's statistics; mode `shallow`
+   replaces the first `calibration.shallow_layers` layers' only and keeps the
+   rest at the source profile's (the redesign's candidate: camera colour and
+   blur live in the early layers, disease-specific statistics deeper).
 3. **Look the camera up** against the validated device profiles
    (`camera_distance`, envelope by N) and decide which targets to show.
-4. **Screen**: `RetinaReach.mlpackage` with the stored statistics vector; a
-   shown target is flagged at its shipped threshold.
+4. **Re-set the threshold** (optional, `em2` or `rate`): score the same captures
+   under the source profile and under the calibrated statistics; EM on the
+   source-profile scores gives the clinic's prevalence, and the threshold is
+   placed on the calibrated scores (by expected sensitivity, or by rank for
+   `rate`). Same arithmetic as `retinareach.label_free_threshold`.
+5. **Screen**: `RetinaReach.mlpackage` with the stored statistics vector; a
+   shown target is flagged at the stored threshold (the re-set one when the
+   calibration carries it, else the shipped one).
 
 Inputs are the three files `export_retinareach.py` writes to one directory:
 `RetinaReach.mlpackage`, `RetinaReachCalibrator.mlpackage`,
@@ -31,9 +40,12 @@ app/RetinaReachKit/.build/release/retinareach-cli screen --models edge_export/re
 `calibrate` prints the report the phone would show (nearest validated camera,
 inside its envelope or not, status per target) and stores the statistics;
 `screen` prints REFER / no for each target shown on that camera. `--units ane`
-keeps Core ML on the Neural Engine; `--prior N0` shrinks a small calibration set
-toward the trained statistics (the camera lookup always uses the unshrunk
-measurement).
+keeps Core ML on the Neural Engine; `--mode shallow` recalibrates the first
+`shallow_layers` layers only; `--threshold em2|rate` re-sets each source
+target's threshold from the captures and prints it beside the shipped one with
+the estimated prevalence; `--prior N0` shrinks a small calibration set toward
+the trained statistics (the camera lookup always uses the unshrunk measurement).
+The defaults (`full`, `shipped`) are the procedure the parity check compares.
 
 ## In an app
 

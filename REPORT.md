@@ -820,6 +820,49 @@ too stays below the floor, the label-free design reaches its limit, and the
 honest outcome is a device that reports THRESHOLD_DRIFT on a new camera until a
 small labelled check is done there.
 
+### 10.10 Round 3 of the redesign, built 25 October (not yet run on the Canon checkpoints)
+
+What the 5-seed Canon sweep showed (24 October; per patient, shipped threshold,
+mean over seeds): Canon sensitivity 0.932 / specificity 0.949 and the held-out
+Nikon 0.954 / 0.933, both meeting the IDx-DR targets on every seed; the phone
+0.815 / 0.762 as trained and 0.655 / 0.958 after full AdaBN (AUROC 0.913 →
+0.926), meeting them on no seed; edema as trained flagging 59 % ± 24 % of phone
+images; every systemic probe failing the gate, four UNDERPOWERED. Three changes
+were built to test on those checkpoints without retraining:
+
+* **The prevalence-matched calibration pool** (experiment D in
+  `redesign_calibration.py`, `retinareach.prevalence_matched_sample`). Experiment
+  A located AdaBN's sensitivity loss in the pool's disease rate; the device now
+  builds a pool at the source's rate from its own posteriors: captures scored
+  under tabletop statistics, EM for the clinic's prevalence and each capture's
+  posterior, weights `r·a + (1 − r)` with `a` solved so the pool's expected rate
+  is the source's (or zero), calibration batches resampled by those weights. The
+  floor of what the pool can reach is set by how soft the posteriors are, and
+  `matched_expected_prev` reports it label-free beside the labels' audit value.
+* **Two threshold rules that survive score compression.** `em2` estimates the
+  prevalence where the Platt map holds (the captures under tabletop statistics)
+  and places the threshold on the same captures' calibrated scores; `rate` flags
+  the top fraction `π·0.85 + (1 − π)·(1 − source specificity)` by rank alone. In
+  simulation with ranks kept and logits compressed to 0.6× (the phone's
+  pattern), the shipped threshold's sensitivity moves, `em` on the compressed
+  scores over-flags, `anchor` collapses, and `em2` / `rate` hold 0.85. Every
+  method now runs on every base in B3 and C, the ladder prints specificity next
+  to sensitivity, and `score_once.py` accepts `calibrated:em2:<rule>` as the
+  Messidor-2 primary.
+* **Cross-fitted systemic probes** (`probe_folds.py`, or `--probe-folds 5` in a
+  run): each probe fit 5-fold out of fold over all 1,291 handheld patients with
+  the trunk frozen, the comparator cross-fit on the same folds. Positive patients
+  available for the gate: nephropathy 46, neuropathy 55, myocardial infarction
+  98, smoking 81, against 7–16 on the test split. Rows carry protocol
+  `calibrated_oof5`; the test-split rows are kept beside them.
+
+The phone path follows: `export_retinareach.py` ships the threshold references
+and the shallow depth, and `app/RetinaReachKit` calibrates in `full` or `shallow`
+mode and re-sets the threshold by `em2` or `rate` with the same arithmetic;
+defaults are unchanged. Next: the ladder and `probe_folds.py` on
+`ck_rr_canon/seed*.pt` (RUNBOOK step 5), then the primary for the Nov 8 look is
+chosen from the ladder.
+
 ### 10.9 Next run (lab box)
 
 ```bash

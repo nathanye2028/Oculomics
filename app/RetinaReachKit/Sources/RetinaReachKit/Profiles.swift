@@ -47,6 +47,49 @@ public struct StatsLayout: Codable {
     public let channels: [Int]
 }
 
+/// One source target's label-free threshold reference
+/// (retinareach.ThresholdReference): fit once on the source validation outputs
+/// of the calibrated protocol, shipped so the device can re-set its threshold
+/// from unlabelled captures. `sourceSpec` is absent in references written
+/// before the `rate` method existed.
+public struct ThresholdReference: Codable {
+    public let threshold: Double
+    public let targetSens: Double
+    public let prior: Double
+    public let plattA: Double
+    public let plattB: Double
+    public let anchorQ: Double
+    public let anchorLogit: Double
+    public let sourceSpec: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case threshold, prior
+        case targetSens = "target_sens"
+        case plattA = "platt_a"
+        case plattB = "platt_b"
+        case anchorQ = "anchor_q"
+        case anchorLogit = "anchor_logit"
+        case sourceSpec = "source_spec"
+    }
+}
+
+/// How the device recalibrates (`calibration` in retinareach_profiles.json):
+/// which profile is the source, and how many of the BatchNorm layers, from the
+/// input, shallow mode takes from the camera.
+public struct CalibrationSpec: Codable {
+    public let sourceProfile: String?
+    public let nBnLayers: Int
+    public let shallowLayers: Int
+    public let shallowFrac: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case sourceProfile = "source_profile"
+        case nBnLayers = "n_bn_layers"
+        case shallowLayers = "shallow_layers"
+        case shallowFrac = "shallow_frac"
+    }
+}
+
 /// `retinareach_profiles.json`: the contract between the Python build and the app.
 public struct ProfilesFile: Codable {
     public let targets: [String]
@@ -59,9 +102,13 @@ public struct ProfilesFile: Codable {
     public let probeBuild: Bool
     public let profiles: [String: DeviceProfile]
     public let thresholds: [String: [String: Double?]]
+    /// Absent in files written before the device re-set its own threshold.
+    public let thresholdReference: [String: ThresholdReference]?
+    /// Absent in files written before shallow mode: full calibration only.
+    public let calibration: CalibrationSpec?
 
     enum CodingKeys: String, CodingKey {
-        case targets, profiles, thresholds
+        case targets, profiles, thresholds, calibration
         case sourceTargets = "source_targets"
         case probeTargets = "probe_targets"
         case imageSize = "image_size"
@@ -69,6 +116,7 @@ public struct ProfilesFile: Codable {
         case statsLayout = "stats_layout"
         case trainedStats = "trained_stats"
         case probeBuild = "probe_build"
+        case thresholdReference = "threshold_reference"
     }
 
     public static func load(_ url: URL) throws -> ProfilesFile {
@@ -80,5 +128,13 @@ public struct ProfilesFile: Codable {
     /// The shipped (self-calibrated protocol) threshold for a target, if one was fixed.
     public func threshold(_ target: String) -> Double? {
         (thresholds["calibrated"] ?? [:])[target] ?? nil
+    }
+
+    /// The source profile's calibrated statistics (the tabletop camera the model
+    /// was built on): the layers shallow mode keeps, and the statistics the
+    /// captures are scored under to estimate the clinic's prevalence.
+    public var sourceStats: [Float]? {
+        guard let name = calibration?.sourceProfile, let p = profiles[name] else { return nil }
+        return p.bnStats
     }
 }
