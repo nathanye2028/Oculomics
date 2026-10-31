@@ -85,11 +85,16 @@ Pipeline (one seed)
    checkpoint after the analysis freeze, never inside a training run.
 13. **Simulated phone photos** (``--phone-sim <profile.json>``, ``phone_sim.py``):
    in stage 1, each source training photo is re-rendered as a handheld one with
-   probability ``--phone-sim-p`` (default 0.5) at ``--phone-sim-strength``, from a
-   view ``supersample`` times the image size (the profile's), before the
-   device-side augmentation; the device-side path is switched on for it. No
-   handheld photo or label enters training: the profile holds statistics of
-   unlabelled handheld train-split photos only.
+   probability ``--phone-sim-p`` (default 0.5) at ``--phone-sim-strength``, before
+   the device-side augmentation (switched on for it). It renders from the photo's
+   whole FOV at ``supersample`` times the image size (the profile's), the view
+   ``phone_sim.py fit`` and ``check`` measure it on; the photos left alone keep
+   the ordinary training crop (``phone_sim.TrainViews``; one decode, drafted for
+   the larger view). No handheld photo or label enters training: the profile holds
+   statistics of handheld train-split photos only (the split itself is stratified
+   on referable DR; a profile fitted with ``--select icdr0`` was chosen by grade),
+   and the run refuses a profile fitted on another split, seed or stratification,
+   or naming a photo outside its handheld train split.
 
 Outputs (``--out``): ``results.json``, ``capability.csv``,
 ``calibration_sweep.csv``, ``operating_point.csv``, ``quality_strata.csv``,
@@ -108,6 +113,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -150,7 +156,7 @@ class MultiTargetDataset(MBRSETDataset):
     the two devices differ only in their pixels."""
 
     def __init__(self, df: pd.DataFrame, images_dir: str, targets: Sequence[str], split: str,
-                 image_size: int, device_aug: bool = False) -> None:
+                 image_size: int, device_aug: bool = False, transform=None) -> None:
         self._rr_targets = list(targets)
         files = df["file"].astype(str)
         if files.str.contains("/", regex=False).any():      # public sets: nested folders
@@ -161,7 +167,7 @@ class MultiTargetDataset(MBRSETDataset):
         df = df[ok.to_numpy()].reset_index(drop=True)
         super().__init__(csv=df, images_dir=images_dir, task="retinareach", split=split,
                          image_size=image_size, drop_missing_labels=False,
-                         drop_missing_files=False, fov_crop=True, device_aug=device_aug)
+                         drop_missing_files=False, fov_crop=True, device_aug=device_aug, transform=transform)
         self.df = df
         self.patients = df["patient"].to_numpy()
 
@@ -326,16 +332,17 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
     losses, t_steps, t_sim = [], [], []
     it = iter(train_loader)
     psim_gen = torch.Generator().manual_seed(a.seed + 7919)
+    sync = (torch.cuda.synchronize if cuda else torch.mps.synchronize if dev.type == "mps" else lambda: None)
     for step in range(3):
         b = next(it)
         t0 = time.time()
-        x = b["image"].to(dev, non_blocking=cuda)
+        x = (b["image"]["crop"] if phone_sim is not None else b["image"]).to(dev, non_blocking=cuda)
         y = b["label"][:, :nS].contiguous().to(dev, non_blocking=cuda)
         if phone_sim is not None:
+            sync()                                    # the batch copy is not the simulator's time
             ts = time.time()
-            x = phone_sim.augment(x, a.phone_sim_p, psim_gen, out_size=a.image_size)
-            if cuda:
-                torch.cuda.synchronize()
+            x = phone_sim.augment_views(x, b["image"]["full"], a.phone_sim_p, psim_gen)
+            sync()
             t_sim.append(time.time() - ts)
             if not torch.isfinite(x).all() or tuple(x.shape[-2:]) != (a.image_size, a.image_size):
                 problems.append(f"phone_sim produced {tuple(x.shape)} / non-finite pixels")
@@ -360,6 +367,28 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
     if t_sim:
         print(f"  phone_sim: {1000 * np.mean(t_sim[1:]):.0f} ms per batch of {a.batch_size} "
               f"(p {a.phone_sim_p}) of the step time above")
+    # the steps above drew batches the workers had prefetched: time the loader itself (one
+    # image through the source training dataset in this process, on one thread as a
+    # DataLoader worker runs, times the workers; still an upper bound: no collation or
+    # transfer, one core per worker)
+    ds_train = train_loader.dataset
+    n_probe = min(16, len(ds_train))
+    n_threads = torch.get_num_threads()
+    if a.num_workers > 0:
+        torch.set_num_threads(1)
+    try:
+        tl = time.time()
+        for i in range(n_probe):
+            ds_train[i * len(ds_train) // n_probe]
+        t_item = (time.time() - tl) / max(n_probe, 1)
+    finally:
+        torch.set_num_threads(n_threads)
+    step_rate = a.batch_size / np.mean(t_steps[1:])
+    loader_rate = a.num_workers / max(t_item, 1e-6) if a.num_workers > 0 else None
+    print(f"  data loading: {1000 * t_item:.0f} ms per training image"
+          + (f" on one thread -> at most ~{loader_rate:.0f} img/s with {a.num_workers} workers"
+             + (" -- slower than the steps: the loader sets the pace (more --num-workers)" if loader_rate < step_rate
+                else "") if loader_rate else " in the main process (no workers: loading and steps take turns)"))
     if bad:
         problems.append(f"implausible training loss {bad} on {dev}: labels or inputs are corrupted")
     model.eval()
@@ -384,8 +413,9 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
         if free < 0.5 * total:
             notes.append("less than half the GPU memory is free: another job is on this card")
 
-    # wall-clock estimate from the measured rates
-    train_rate = a.batch_size / np.mean(t_steps[1:])
+    # wall-clock estimate from the measured rates (the slower of the steps and the loader;
+    # without workers the two take turns)
+    train_rate = min(step_rate, loader_rate) if loader_rate else 1.0 / (1.0 / step_rate + t_item)
     n_train = len(train_loader) * a.batch_size
     tgt_test = len(datasets[a.target_name]["test"])
     sizes = [n for n in a.calib_sizes]
@@ -501,7 +531,9 @@ def main(argv: Sequence[str] = None) -> int:
     p.add_argument("--phone-sim-p", type=float, default=0.5,
                    help="fraction of source training photos re-rendered, per draw")
     p.add_argument("--phone-sim-strength", type=float, default=1.0,
-                   help="0 = handheld aperture only, 1 = the measured handheld camera")
+                   help="0-1: scales the simulated camera's photometric changes, rotation and framing "
+                        "shift; 0 keeps the un-squash, the zoom that clears a truncated FOV and the "
+                        "handheld aperture")
     p.add_argument("--nondeterministic", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -569,7 +601,7 @@ def main(argv: Sequence[str] = None) -> int:
         raise SystemExit("[fatal] --source-root and --target-root are the same directory")
     if a.calib_batch < 2:
         raise SystemExit("[fatal] --calib-batch must be >= 2 (train-mode BN needs a batch)")
-    phone_sim = None
+    phone_sim, phone_sim_info = None, None
     if a.phone_sim:
         if not 0.0 < a.phone_sim_p <= 1.0:
             raise SystemExit("[fatal] --phone-sim-p must be in (0, 1]")
@@ -580,6 +612,31 @@ def main(argv: Sequence[str] = None) -> int:
             phone_sim.check_size(a.image_size)
         except (OSError, ValueError) as e:
             raise SystemExit(f"[fatal] --phone-sim: {e}")
+        # the bank must come from THIS run's handheld train split (its photos are checked
+        # against the split's validation and test patients once the split is built)
+        src_p = phone_sim.profile.source
+        why = [f"{what} {got!r}, this run {want!r}" for what, got, want in (
+            ("split", src_p.get("split"), "train"), ("split seed", src_p.get("split_seed"), a.split_seed),
+            ("stratified on", src_p.get("strat_target"), a.source_targets[0]),
+            ("handheld dataset", src_p.get("target_dataset"), a.target_dataset)) if got != want]
+        if why or not src_p.get("files"):
+            raise SystemExit("[fatal] --phone-sim: the profile was not fitted on this run's handheld train "
+                             f"split ({'; '.join(why) or 'no bank file list'}): refit it with phone_sim.py fit "
+                             "--target-root and this run's --split-seed / --strat-target")
+        if src_p.get("target") and os.path.realpath(src_p["target"]) != os.path.realpath(a.target_root):
+            print(f"[warn] --phone-sim: profile fitted on {src_p['target']}, this run's handheld root is "
+                  f"{a.target_root} (fine if it is the same dataset elsewhere)")
+        if (src_p.get("source_camera") or None) != (a.source_camera or None):
+            print(f"[warn] --phone-sim: profile's tabletop statistics from camera {src_p.get('source_camera')!r}, "
+                  f"this run trains on {a.source_camera!r}")
+        if src_p.get("select", "all") != "all":
+            print(f"[phone-sim] the bank was chosen by handheld grade (--select {src_p['select']}): "
+                  "handheld train-split labels shaped it")
+        with open(a.phone_sim, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        phone_sim_info = {"path": a.phone_sim, "sha256": sha, "n_bank": len(phone_sim.profile),
+                          "source": {k: v for k, v in src_p.items() if k != "files"},
+                          "params": {k: v for k, v in phone_sim.p.items() if k != "src_illum"}}
         if a.gpu_aug is False:
             print("[phone-sim] --no-gpu-aug overridden: the simulator runs before the device-side "
                   "augmentation (on any device)")
@@ -647,6 +704,17 @@ def main(argv: Sequence[str] = None) -> int:
     clash = [u[0] for u in unf_list if u[0] in (S, T)]
     if clash:
         raise SystemExit(f"[fatal] unfamiliar camera name(s) {clash} collide with a validated device")
+    if phone_sim is not None:
+        bank_files = set(map(str, phone_sim.profile.source["files"]))
+        held = set(splits[T]["val"]["file"].astype(str)) | set(splits[T]["test"]["file"].astype(str))
+        leak = sorted(held & bank_files)
+        if leak:
+            raise SystemExit(f"[fatal] --phone-sim: {len(leak)} of the profile's bank photos are in this run's "
+                             f"{T} validation / test split (e.g. {leak[:3]}): refit it on this run's train split")
+        unknown = sorted(bank_files - set(splits[T]["train"]["file"].astype(str)))
+        if unknown:                                  # e.g. renamed copies: nothing proves they are train photos
+            raise SystemExit(f"[fatal] --phone-sim: {len(unknown)} of the profile's bank photos are not in this "
+                             f"run's {T} train split (e.g. {unknown[:3]}): refit it on this run's train split")
     bad_src = [t for t in a.source_targets if not audits[S][t]["ok"]]
     if bad_src:
         raise SystemExit(f"[fatal] source targets {bad_src} are not usable on {S}: "
@@ -658,17 +726,23 @@ def main(argv: Sequence[str] = None) -> int:
     targets = list(a.source_targets) + list(a.probe_targets)
 
     gpu_aug = a.gpu_aug if a.gpu_aug is not None else dev.type == "cuda"
-    # the simulator zooms into the photo: it renders from a supersampled training view
-    train_size = (int(round(a.image_size * float(phone_sim.profile.params["supersample"])))
-                  if phone_sim is not None else a.image_size)
     mk = lambda name, part, split: MultiTargetDataset(
-        splits[name][part], img_dirs[name], targets, split,
-        train_size if split == "train" else a.image_size, device_aug=gpu_aug and split == "train")
+        splits[name][part], img_dirs[name], targets, split, a.image_size, device_aug=gpu_aug and split == "train")
     if phone_sim is not None:
+        # the simulator zooms into the photo: it renders from the whole FOV, supersampled
+        # (the view fit and check measure it on); the photos it leaves alone keep the
+        # ordinary training crop. Both views come from one decode
+        from phone_sim import TrainViews
+        train_size = int(round(a.image_size * float(phone_sim.profile.params["supersample"])))
+        src_train = MultiTargetDataset(splits[S]["train"], img_dirs[S], targets, "train", train_size,
+                                       transform=TrainViews(a.image_size, train_size))
+        phone_sim_info["train_size"] = train_size
         print(f"[phone-sim] {a.phone_sim}: {len(phone_sim.profile)} handheld photos in the bank; "
-              f"p {a.phone_sim_p}, strength {a.phone_sim_strength}; training views {train_size} px -> "
-              f"{a.image_size} px")
-    src_train, src_val, src_test = mk(S, "train", "train"), mk(S, "val", "val"), mk(S, "test", "val")
+              f"p {a.phone_sim_p}, strength {a.phone_sim_strength}; renders from the whole FOV at {train_size} px, "
+              f"the other photos keep the {a.image_size} px training crop")
+    else:
+        src_train = mk(S, "train", "train")
+    src_val, src_test = mk(S, "val", "val"), mk(S, "test", "val")
     tgt_train, tgt_val, tgt_test = mk(T, "train", "val"), mk(T, "val", "val"), mk(T, "test", "val")
     src_pool = torch.utils.data.ConcatDataset([mk(S, "train", "val"), src_val])
     tgt_pool = torch.utils.data.ConcatDataset([tgt_train, tgt_val])
@@ -742,11 +816,11 @@ def main(argv: Sequence[str] = None) -> int:
         model.train()
         run, nb, te = 0.0, 0, time.time()
         for b in train_loader:
-            x = b["image"].to(dev, non_blocking=cuda)
+            x = (b["image"]["crop"] if phone_sim is not None else b["image"]).to(dev, non_blocking=cuda)
             # the label slice is strided: never a non-blocking copy off CUDA (see predict)
             y = b["label"][:, :nS].contiguous().to(dev, non_blocking=cuda)
             if phone_sim is not None:
-                x = phone_sim.augment(x, a.phone_sim_p, psim_gen, out_size=a.image_size)
+                x = phone_sim.augment_views(x, b["image"]["full"], a.phone_sim_p, psim_gen)
             if dev_aug is not None:
                 x = dev_aug(x)
             opt.zero_grad(set_to_none=True)
@@ -1276,8 +1350,9 @@ def main(argv: Sequence[str] = None) -> int:
                 "threshold_reference": profiles_json["threshold_reference"],
                 "trained_stats": profiles_json["trained_stats"], "probe_info": probe_info,
                 "capability": cap_rows, "args": vars(a), "best_epoch": best_ep,
-                "best_val": best}, a.ckpt)
+                "best_val": best, "phone_sim_profile": phone_sim_info}, a.ckpt)
     results = {"args": vars(a), "best_epoch": best_ep, "best_val_mean_auroc": best,
+               "phone_sim_profile": phone_sim_info,
                "targets": targets, "probe_info": probe_info, "audits": audits,
                "thresholds": thresholds, "capability": cap_rows, "envelope": envelope,
                "threshold_reference": profiles_json["threshold_reference"],

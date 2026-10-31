@@ -14,30 +14,33 @@ from measurements of real, unlabelled handheld photos.
     # (or from two folders of photos: --target-dir DIR --source-dir DIR)
     # 2. look at it: tabletop -> simulated -> real handheld, plus a per-stage strip
     python phone_sim.py render --profile ck_phone_sim/profile.json --source-dir fundus_samples/brset \\
-        --target-dir fundus_samples/mbrset --out exp_phone_sim/render
+        --target-dir fundus_samples/mbrset --out ck_phone_sim/render
     # 3. train with it (each tabletop training photo re-rendered with probability p)
     python train_retinareach.py ... --phone-sim ck_phone_sim/profile.json --phone-sim-p 0.5
 
 What the two cameras' photos differ in, in the model's view, and the stage that
 carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
-``fit`` re-measures it on the full train split):
+``fit`` re-measures it on up to ``--max-target`` photos of the handheld train split):
 
 ``field``   The loader crops each photo to its FOV bounding box and squashes it to
             a square. Canon frames truncate the FOV circle, so a Canon retina
             arrives squashed ~20 % horizontally (aspect 0.80, the crop's own
             height/width); the phone's FOV is an exact digital circle (aspect
             1.00, hard edge). The phone's field is also narrower: its disc-fovea
-            distance is ~1.15x the tabletop's in FOV radii (``fit`` measures it;
-            disc size reads higher because phone discs bloom), and its disc sits
-            nearer the centre (0.45 vs 0.58 of the radius). So: un-squash (the
-            FOV ellipse fitted per image from its side boundaries), zoom about the
-            FOV centre -- at least enough for the aperture to clear a truncated
-            FOV's flat top and bottom (~1.25 for Canon frames, found by checking
-            coverage) -- shift toward the detected disc until it lands where the
-            drawn handheld photo has its disc (capped so the aperture never
-            leaves the tabletop FOV), a small rotation, and the phone's aperture.
-            Training passes a supersampled view (``supersample`` x the model
-            size) so the zoom does not cost detail the phone's own photo has.
+            distance is ~1.10x the tabletop's in FOV radii (0.67 vs 0.61; ``fit``
+            measures it; disc size reads 1.15x because phone discs bloom), and its
+            disc sits nearer the centre (0.45 vs 0.58 of the radius). So: un-squash
+            (the FOV ellipse fitted per image from its side boundaries), zoom about
+            the FOV centre -- at least enough for the aperture to clear a truncated
+            FOV's flat top and bottom (~1.3 for Canon frames, found by checking
+            coverage at the aperture's edge; that, not the phone's angular scale,
+            sets a Canon render's zoom) -- shift toward the detected disc until it
+            lands where the drawn handheld photo has its disc (capped so the
+            aperture never leaves the tabletop FOV), a small rotation, and the
+            phone's aperture. It renders from the photo's whole FOV, supersampled
+            (``supersample`` x the model size, so the zoom costs no detail the
+            phone's own photo has): a training crop cuts the FOV on all sides and
+            its ellipse cannot be read (:class:`TrainViews`).
 ``light``   Low-order illumination shape (log intensity on 1, r^2, r^4, x, y,
             fitted inside 0.85 of the radius with the disc left out) transferred
             from the drawn handheld photo -- the phone's light is tilted (brighter
@@ -46,7 +49,8 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             bands; and smooth random blotches at the measured scale (1/e length
             0.17 FOV diameters, about 1.7 disc diameters -- finer ones read as
             haemorrhages) up to the photo's own blotchiness. The change is scaled
-            back until no more retina sits in shadow than in the drawn photo.
+            back until no more retina sits in shadow than in the drawn photo
+            (+0.05, read after this stage).
 ``colour``  Green left alone; red and blue take on green's structure, the
             strongest camera fingerprint (the phone's B and R carry G's vessel
             pattern: band correlation 0.94 / 0.85 vs 0.54 / 0.61): each becomes
@@ -54,8 +58,13 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             drawn photo's correlation; then ratio-preserving gains to the drawn
             photo's centre-zone means. All on the image divided by its own
             low-order illumination field, multiplied back after, so the light
-            pattern survives. Measured on planted lesions in the samples: lesion
-            contrast x0.96-0.97 (real phones show ~x1.1). Rejected, each on the
+            pattern survives. After the grain, as the phone's demosaic and colour
+            matrix act after its sensor, R and B fine structure (grain included)
+            is pulled toward G's up to the drawn photo's correlation (G and the
+            low frequencies untouched). Measured on planted lesions in the samples:
+            green contrast x0.96-0.97 (real phones show ~x1.1); R and B take on
+            G's lesion signal, so a small red lesion's luminance contrast rises
+            ~1.4x, as on the phone but ~15 % further. Rejected, each on the
             samples: whole-image moment matching -- a 3x3 optimal-transport map
             (``colour_mode: mk``) closed more of the statistical gap but made
             lesions 1.4-1.7x more conspicuous than on the tabletop photo, i.e. the
@@ -65,10 +74,12 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             tabletop blue channel is nearly flat and stretching it amplifies
             texture).
 ``bloom``   The phone's auto-exposure blows the optic disc out to near-white;
-            the detected disc region (and only it) is pushed toward the drawn
-            photo's disc colour, by local brightness so vessels on the disc stay
-            darker than its rim. A luminance-wide highlight curve, tried first,
-            whitened exudates and rim reflections into lesion-like specks.
+            the detected disc (to 1.1 of its radius, and only when the disc pick
+            is unambiguous: :func:`disc_gate`) is pushed toward the drawn photo's
+            disc colour, by local brightness so vessels on the disc stay darker
+            than its rim. A luminance-wide highlight curve, tried first, whitened
+            exudates and rim reflections into lesion-like specks; a region to 1.3
+            radii made peripapillary lesions up to 2-4x more conspicuous.
 ``detail``  The phone is NOT blurrier in the model's view (vessel edges 2.34 vs
             2.29 px at 384); its extra high-frequency power is grain. So blur
             only, at most 0.8 px, and only when a tabletop photo's contrast-
@@ -79,10 +90,7 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             samples), nearly white at the model's scale and mostly luma; its
             spatial and cross-channel correlation are calibrated by simulation in
             ``fit``. Tapered off on clipped and black pixels, where the phone has
-            none (grain on a blown-out disc would read as fine new vessels). Then,
-            as the phone's demosaic and colour matrix act after its sensor, R and B
-            fine structure (grain included) is pulled toward G's up to the drawn
-            photo's correlation; G and the low frequencies are not touched.
+            none (grain on a blown-out disc would read as fine new vessels).
 ``rim``     The drawn photo's bluish-white rim haze, per sector and channel,
             relative to its own illumination model (stray light, added). A drawn
             photo's horizontal light and rim are mirrored when its disc sits on
@@ -96,12 +104,19 @@ handheld photos' pixels only, no label, unless ``--select icdr0``.
 
 What it does not do: invent or remove lesions on purpose. Every stage is either
 geometric, a smooth low-order or large-scale field, a pixel-wise colour map that
-leaves the green channel's ratios alone, the disc region, a capped blur or grain. The zoom can still crop a peripheral
-lesion out of the narrower field (the phone's own field has the same limit), and
-blur can soften microaneurysms the phone also softens; ``tests/test_phone_sim.py``
-checks that planted lesions keep their sign and contrast, and that a lesion-free
-fundus gains no lesion-like spots. The realism and label-preservation checks on
-real data are ``style_transfer_xfer.py check --methods phone_sim``.
+leaves the green channel's ratios alone, the disc region, a capped blur or grain.
+The zoom can still crop a peripheral lesion out of the field: renders keep ~65 % of
+the Canon FOV's area (r < ~0.76 FOV radii), where the phone's narrower field alone
+would keep ~86 % (the rest is the zoom that clears the truncated frame). Blur can soften
+microaneurysms the phone also softens, and where red saturates (~4 % of the retina,
+~0.6 % on real phones) a lesion keeps only its green and blue contrast.
+``tests/test_phone_sim.py`` checks, on synthetic fundi, that lesions planted on a
+tabletop photo keep their sign and 0.7-1.3x of their relative contrast (0.65 at
+the blur cap), that the bloom changes nothing beyond 1.1 disc radii and leaves a
+lesion there alone, and that a lesion-free fundus gains no lesion-like spots more
+than 2 disc radii from the disc (a few bright flecks still appear at the disc's
+margin on real photos: 4-6 in 48 renders of the samples). The realism and label-preservation checks on real data are
+``fit``'s report and ``style_transfer_xfer.py check --methods phone_sim``.
 """
 from __future__ import annotations
 
@@ -121,8 +136,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from style_transfer import Stylizer, denorm, renorm  # noqa: E402
 from vessel_ablation import FOV_TOL, fov_mask  # noqa: E402
 
-FORMAT = "phone_sim/1"
+FORMAT = "phone_sim/2"            # /2: blotch residual smoothed over the fitted cells only
 STAGES = ("field", "light", "colour", "bloom", "detail", "noise", "rim")
+COLOUR_MODES = ("coupled", "mk", "affine")
 N_SECTORS = 16
 # The detail ladder: (a, r) with a > 0 = Gaussian blur of sigma a px, a = 0 = unchanged.
 # Blur only, capped at 0.8 px at 384: in the model's view the handheld is not blurrier
@@ -135,7 +151,28 @@ DEFAULT_PARAMS: Dict[str, object] = {
     "source_aspect": 0.80, "src_illum": None, "shrink": 0.5, "disc_dist": 0.45,
     "noise_corr": 0.55, "noise_rho": 0.94, "light_lim": [0.25, 2.5], "colour_common": [0.6, 1.6],
     "colour_spread": 1.15, "colour_mode": "coupled", "kappa": [0.4, 1.4], "fine_chroma": False, "supersample": 1.5, "disc_prom": 6.0, "blotch_len": 0.7, "blotch_max": 0.3, "blotch_gain": 1.0,
+    "disc_margin": [1.2, 1.4],
 }
+
+
+def check_params(p: Dict[str, object]) -> None:
+    """Refuse parameter values the chain would silently misread (a misspelt colour
+    mode would run another ablation; reversed limits clamp every gain to one value)."""
+    if p["colour_mode"] not in COLOUR_MODES:
+        raise ValueError(f"colour_mode {p['colour_mode']!r} is not one of {COLOUR_MODES}")
+    for key, n in (("light_lim", 2), ("colour_common", 2), ("kappa", 2), ("disc_margin", 2)):
+        v = p[key]
+        if not isinstance(v, (list, tuple)) or len(v) != n:
+            raise ValueError(f"{key} must be a list of {n} numbers, not {v!r}")
+    lo, hi = (float(v) for v in p["light_lim"])
+    if not 0 < lo <= 1 <= hi:
+        raise ValueError(f"light_lim {p['light_lim']} must satisfy 0 < low <= 1 <= high")
+    lo, hi = (float(v) for v in p["colour_common"])
+    if not 0 < lo <= hi:
+        raise ValueError(f"colour_common {p['colour_common']} must satisfy 0 < low <= high")
+    lo, hi = (float(v) for v in p["disc_margin"])
+    if not 1 <= lo < hi:
+        raise ValueError(f"disc_margin {p['disc_margin']} must satisfy 1 <= low < high")
 
 
 # --------------------------------------------------------------------------- #
@@ -163,10 +200,16 @@ def gaussian_kernels(sigma: torch.Tensor, radius: int) -> torch.Tensor:
 def blur(x: torch.Tensor, sigma) -> torch.Tensor:
     """Separable Gaussian blur, one sigma (px) per image (or one for all), reflect padding."""
     B, C, H, W = x.shape
-    sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).expand(B).contiguous()
-    smax = float(sigma.max()) if B else 0.0
-    if smax <= 1e-3:
-        return x
+    if isinstance(sigma, (int, float)):                # one for all: no host-device round trip
+        smax = float(np.float32(sigma)) if B else 0.0
+        if smax <= 1e-3:
+            return x
+        sigma = torch.full((B,), smax, dtype=torch.float32, device=x.device)
+    else:
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).expand(B).contiguous()
+        smax = float(sigma.max()) if B else 0.0
+        if smax <= 1e-3:
+            return x
     r = min(max(1, int(math.ceil(3.0 * smax))), (min(H, W) - 1) // 2)
     k = gaussian_kernels(sigma, r).to(x.dtype).repeat_interleave(C, dim=0)        # [B*C, K]
     y = x.reshape(1, B * C, H, W)
@@ -188,9 +231,20 @@ def _masked_quantiles(v: torch.Tensor, keep: torch.Tensor, q: Sequence[float]) -
     """Quantiles over the last dim of ``v`` where ``keep``; [len(q), *v.shape[:-1]]
     (computed on the CPU for backends without nanquantile)."""
     dev = v.device
-    work = "cpu" if dev.type == "mps" else dev
+    work = torch.device("cpu") if dev.type == "mps" else dev
     vv = v.to(work).float().masked_fill(~keep.to(work), float("nan"))
-    return torch.nanquantile(vv, torch.tensor(list(q), device=work), dim=-1).to(dev, v.dtype)
+    return torch.nanquantile(vv, _q_tensor(q, work), dim=-1).to(dev, v.dtype)
+
+
+_Q_CACHE: Dict[Tuple[Tuple[float, ...], str], torch.Tensor] = {}
+
+
+def _q_tensor(q: Sequence[float], device) -> torch.Tensor:
+    """The quantile levels on ``device``, built once (not a host-device copy per call)."""
+    key = (tuple(float(v) for v in q), str(device))
+    if key not in _Q_CACHE:
+        _Q_CACHE[key] = torch.tensor(list(key[0]), device=device)
+    return _Q_CACHE[key]
 
 
 def _strided(x: torch.Tensor, m: torch.Tensor, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -216,8 +270,13 @@ def _to_source(px: torch.Tensor, py: torch.Tensor, zoom: torch.Tensor, a_f: torc
 def warp(x: torch.Tensor, zoom: torch.Tensor, a_f: torch.Tensor, b_f: torch.Tensor, offset: torch.Tensor,
          rot: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
     """The handheld frame sampled bilinearly from the source (see :func:`_to_source`);
-    outside the source is black."""
+    outside the source is black. Where the warp shrinks the source (~1.5 source px
+    per output px from the supersampled view), the source is first blurred by
+    0.5 sqrt(step^2 - 1) px: bilinear sampling alone aliases texture and grain into
+    crisper, microaneurysm-like dots (+10 % peak depth on planted ones)."""
     B = x.shape[0]
+    step = (x.shape[-2] / out_hw[0]) * torch.maximum(a_f, b_f).float() / zoom.float()     # source px / output px
+    x = blur(x, 0.5 * torch.sqrt((step.to(x.device) ** 2 - 1).clamp_min(0)))
     xx, yy = frame_coords(B, out_hw[0], out_hw[1], x.device)
     gx, gy = _to_source(xx, yy, zoom, a_f, b_f, offset, rot)
     return F.grid_sample(x, torch.stack([gx, gy], dim=-1).to(x.dtype), mode="bilinear",
@@ -235,8 +294,10 @@ def aperture(radius: torch.Tensor, width: float, H: int, W: int) -> torch.Tensor
 
 
 def _rim_inside(fov: torch.Tensor, zoom: torch.Tensor, a_f: torch.Tensor, b_f: torch.Tensor,
-                offset: torch.Tensor, rot: torch.Tensor, radius: float = 0.97, n_pts: int = 48) -> torch.Tensor:
-    """Fraction of the handheld aperture's rim that lands inside the source FOV mask.
+                offset: torch.Tensor, rot: torch.Tensor, radius: float = 1.0, n_pts: int = 96) -> torch.Tensor:
+    """Fraction of the handheld aperture's rim that lands inside the source FOV mask,
+    tested at the aperture's own edge (a test further in left black chords inside
+    the circle where it crossed a truncated frame's flat top or bottom).
     ``zoom``/``offset`` may carry a candidate axis: [B,K] and [B,K,2] -> [B,K]."""
     B, dev = fov.shape[0], fov.device
     K = zoom.shape[1]
@@ -253,16 +314,18 @@ def _rim_inside(fov: torch.Tensor, zoom: torch.Tensor, a_f: torch.Tensor, b_f: t
 
 
 def min_zoom(fov: torch.Tensor, want: torch.Tensor, a_f: torch.Tensor, b_f: torch.Tensor, centre: torch.Tensor,
-             rot: torch.Tensor, need: float = 0.98, top: float = 1.8, n: int = 16) -> torch.Tensor:
+             rot: torch.Tensor, need: float = 0.98, top: float = 1.8, n: int = 48, return_ok: bool = False):
     """The smallest zoom >= ``want`` (up to ``top``) whose aperture stays inside the
-    source FOV: a truncated tabletop FOV needs ~1.25 before the circle clears its
-    flat top and bottom."""
+    source FOV: a truncated tabletop FOV needs ~1.3 before the circle clears its
+    flat top and bottom. When no candidate does, ``top`` (and, with ``return_ok``,
+    False for that image)."""
     B, dev = fov.shape[0], fov.device
     f = torch.linspace(0, 1, n, device=dev).view(1, -1)
     cand = want.view(B, 1) + f * (torch.maximum(want, torch.full_like(want, top)) - want).view(B, 1)
     ok = _rim_inside(fov, cand, a_f, b_f, centre.view(B, 1, 2).expand(B, n, 2), rot) >= need
     first = torch.where(ok.any(1), ok.float().argmax(1), torch.full((B,), n - 1, device=dev))
-    return cand.gather(1, first.view(B, 1))[:, 0]
+    z = cand.gather(1, first.view(B, 1))[:, 0]
+    return (z, ok.any(1)) if return_ok else z
 
 
 def safe_shift(fov: torch.Tensor, want: torch.Tensor, zoom: torch.Tensor, a_f: torch.Tensor, b_f: torch.Tensor,
@@ -287,7 +350,7 @@ def correlated_noise(shape, sigma_c: float, rho: float, gen: Optional[torch.Gene
     eps = math.sqrt(rho) * w[:, :1] + math.sqrt(max(0.0, 1.0 - rho)) * w[:, 1:]
     if sigma_c > 1e-3:
         r = min(max(1, int(math.ceil(3 * sigma_c))), (min(H, W) - 1) // 2)
-        k = gaussian_kernels(torch.tensor([sigma_c], device=device), r)
+        k = gaussian_kernels(torch.tensor([float(sigma_c)]), r)                # on the CPU: no device sync
         eps = blur(eps, sigma_c) / float(k.pow(2).sum())          # 2-D variance factor (sum k^2)^2
     return eps
 
@@ -358,10 +421,18 @@ def fov_shape(x01: torch.Tensor, min_rows: float = 0.5) -> Dict[str, torch.Tenso
             "area": area, "radius": torch.sqrt(area * 4 / math.pi)}
 
 
+def _pool(x: torch.Tensor, grid: int) -> torch.Tensor:
+    """adaptive_avg_pool2d; on the CPU when MPS cannot do the size (it needs the
+    input divisible by the grid, e.g. not 448 or 512 px with a 96 grid)."""
+    if x.device.type == "mps" and (x.shape[-1] % grid or x.shape[-2] % grid):
+        return F.adaptive_avg_pool2d(x.cpu(), grid).to(x.device)
+    return F.adaptive_avg_pool2d(x, grid)
+
+
 def _pooled(c: torch.Tensor, m: torch.Tensor, grid: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    ms = F.adaptive_avg_pool2d(m, grid)
+    ms = _pool(m, grid)
     inm = ms > 0.5
-    v = F.adaptive_avg_pool2d(c * m, grid) / ms.clamp_min(1e-3)
+    v = _pool(c * m, grid) / ms.clamp_min(1e-3)
     fill = (v * inm).sum(dim=(2, 3), keepdim=True) / inm.sum(dim=(2, 3), keepdim=True).clamp_min(1)
     return torch.where(inm, v, fill), inm
 
@@ -387,8 +458,10 @@ def find_disc(x01: torch.Tensor, grid: int = 96, n_cand: int = 3) -> Dict[str, t
     inside the FOV eroded by a tenth of the frame), the one with the most vessel
     signal around it -- the vessels converge on the disc, a reflection washes
     them out. Returns centre ``cx, cy`` (frame coordinates), radius ``r`` (frame
-    half-widths), ``prom`` (peak over the blob map's robust spread) and
-    ``vessel`` (vessel signal near it over the FOV's mean)."""
+    half-widths), ``prom`` (peak over the blob map's robust spread),
+    ``vessel`` (vessel signal near it over the FOV's mean) and ``margin`` (its
+    score over the runner-up's: a pale laser scar or exudate cluster can tie with
+    the disc, see :func:`disc_gate`)."""
     B, dev = x01.shape[0], x01.device
     m = fov_mask(x01).float()
     lum, inm = _pooled(x01.mean(dim=1, keepdim=True), m, grid)
@@ -419,6 +492,8 @@ def find_disc(x01: torch.Tensor, grid: int = 96, n_cand: int = 3) -> Dict[str, t
     score = torch.where(Pk > -1e8, Pk.clamp_min(0) / Pk[:, :1].clamp_min(1e-6) * Vs.clamp_min(1e-3),
                         torch.full_like(Pk, -1.0))
     k = score.argmax(dim=1, keepdim=True)
+    top2 = score.topk(2, dim=1).values
+    margin = top2[:, 0] / top2[:, 1].clamp_min(1e-6)
     gx, gy = torch.stack(pxs, 1).gather(1, k)[:, 0], torch.stack(pys, 1).gather(1, k)[:, 0]
     peak, vessel = Pk.gather(1, k)[:, 0], Vs.gather(1, k)[:, 0]
     Din = torch.where(inner, D, torch.zeros_like(D)).view(B, -1)
@@ -427,7 +502,7 @@ def find_disc(x01: torch.Tensor, grid: int = 96, n_cand: int = 3) -> Dict[str, t
     half = (D.view(B, -1) > 0.5 * peak.view(B, 1)) & inner.view(B, -1) & (d2 <= (0.15 * grid) ** 2)
     return {"cx": (gx + 0.5) / grid * 2 - 1, "cy": (gy + 0.5) / grid * 2 - 1,
             "r": torch.sqrt(half.float().sum(dim=1) / math.pi) / (grid / 2),
-            "prom": peak / mad, "vessel": vessel}
+            "prom": peak / mad, "vessel": vessel, "margin": margin}
 
 
 @torch.no_grad()
@@ -470,6 +545,17 @@ def disc_confidence(d: Dict[str, torch.Tensor], min_prom: float = 6.0) -> torch.
             * (pos < 0.95).float())
 
 
+def disc_gate(d: Dict[str, torch.Tensor], lo: float = 1.2, hi: float = 1.4) -> torch.Tensor:
+    """0..1: 0 when the winning disc candidate scored under ``lo`` x the runner-up's,
+    1 above ``hi``. On the samples a PDR eye's pale laser-scar patch won on every
+    training view at margins 1.05-1.17 with full confidence, and the bloom then
+    painted a white disc over the lesions there; true discs scored a median 4.9x
+    (5th percentile 2.1). The render's disc-keyed steps (bloom, the shift toward
+    the drawn photo's disc position, the left-right mirroring) are switched off
+    when the pick is that ambiguous; the bank's statistics do not use it."""
+    return ((d["margin"] - lo) / (hi - lo)).clamp(0, 1)
+
+
 def _illum_basis(xx: torch.Tensor, yy: torch.Tensor) -> torch.Tensor:
     r2 = xx ** 2 + yy ** 2
     return torch.stack([torch.ones_like(xx), r2, r2 ** 2, xx, yy], dim=1)
@@ -482,13 +568,14 @@ def illum_coeffs(x01: torch.Tensor, grid: int = 32, r_max: float = 0.85, disc_q:
     fitted on a coarse grid inside ``r_max`` with the brightest cells (the disc)
     left out, robustly (three Cauchy-reweighted passes). ``with_residual`` also
     returns [B] the RMS of what the model leaves in the luminance log field,
-    smoothed by a Gaussian of 1/16 of the FOV diameter (finer, it reads anatomy):
-    the blotchy uneven illumination of a handheld capture (0.15 handheld vs 0.06
-    tabletop on the samples)."""
+    smoothed by a Gaussian of 1/16 of the FOV diameter (finer, it reads anatomy)
+    over the fitted cells only (cells outside the FOV and the left-out disc would
+    leak in: an evenly lit circle read 0.06): the blotchy uneven illumination of
+    a handheld capture."""
     B, C, H, W = x01.shape
     m = fov_mask(x01).float()
-    ms = F.adaptive_avg_pool2d(m, grid)
-    val = F.adaptive_avg_pool2d(x01 * m, grid) / ms.clamp_min(1e-6)
+    ms = _pool(m, grid)
+    val = _pool(x01 * m, grid) / ms.clamp_min(1e-6)
     xx, yy = frame_coords(B, grid, grid, x01.device)
     ok = (ms[:, 0] > 0.99) & (torch.sqrt(xx ** 2 + yy ** 2) <= r_max)
     lum = val.mean(dim=1)
@@ -511,8 +598,10 @@ def illum_coeffs(x01: torch.Tensor, grid: int = 32, r_max: float = 0.85, disc_q:
         w = base / (1.0 + (res / (2.5 * s)) ** 2)
     if not with_residual:
         return c
-    rl = blur(res.mean(dim=1).view(B, 1, grid, grid), grid / 16).view(B, -1)       # sigma ~ D/16
     okf = ok.view(B, -1).float()
+    fin = okf.view(B, 1, grid, grid)
+    rl = (blur(res.mean(dim=1).view(B, 1, grid, grid) * fin, grid / 16)                 # sigma ~ D/16
+          / blur(fin, grid / 16).clamp_min(1e-3)).view(B, -1)
     mu = (rl * okf).sum(1) / okf.sum(1).clamp_min(1)
     rms = torch.sqrt((((rl - mu.view(B, 1)) ** 2) * okf).sum(1) / okf.sum(1).clamp_min(1))
     return c, rms
@@ -582,7 +671,7 @@ def coupling_stats(xf: torch.Tensor, m: torch.Tensor, zone: torch.Tensor) -> Dic
     bd = bd - (bd * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
     v = ((bd ** 2) * me).sum(dim=(2, 3)) / n
     cov = lambda i: ((bd[:, i] * bd[:, 1]) * me[:, 0]).sum(dim=(1, 2)) / n[:, 0]
-    rho = torch.stack([cov(0), cov(2)], 1) / torch.sqrt(v[:, [0, 2]] * v[:, 1:2]).clamp_min(1e-12)
+    rho = torch.stack([cov(0), cov(2)], 1) / torch.sqrt(v[:, 0::2] * v[:, 1:2]).clamp_min(1e-12)
     fd = _dog(xf, 1.0, 4.0)
     fd = fd - (fd * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
     amp = torch.sqrt(((fd ** 2) * me).sum(dim=(2, 3)) / n)
@@ -601,18 +690,21 @@ def coupled_colour(yf: torch.Tensor, m: torch.Tensor, zone: torch.Tensor, T: Dic
     soft toe below 8/255. Whole-image moment matching (3x3 included) raised lesion and
     vessel contrast 1.3-2.2x on the samples where real phones raise it 1.1-1.2x."""
     B = yf.shape[0]
-    src = coupling_stats(yf, m, zone)
-    mu = src["ctr"].clamp_min(1e-3)
-    G = yf[:, 1:2].clamp_min(0)
+    # the statistics coupling_stats would give, computed only where they are used
     me = erode(m, 25).float()
     n = me.sum(dim=(1, 2, 3)).clamp_min(1)
+    zf = (zone & m).float()
+    nz = zf.sum(dim=(2, 3)).clamp_min(1)
+    centre_mean = lambda t: (t * zf).sum(dim=(2, 3)) / nz
+    cen = lambda t: t - (t * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
+    mu = centre_mean(yf).clamp_min(1e-3)
+    G = yf[:, 1:2].clamp_min(0)
+    b3 = _dog(torch.cat([yf[:, 0:1], G, yf[:, 2:3]], dim=1), 1.0, 8.0)              # R, G (>= 0), B
+    bg = cen(b3[:, 1:2])
     out = yf.clone()
-    bG = _dog(G, 1.0, 8.0)
     for j, (c, kap) in enumerate(((0, kappa[0]), (2, kappa[1]))):
         S = mu[:, c].view(B, 1, 1, 1) * (G / mu[:, 1].view(B, 1, 1, 1)) ** kap
-        bC, bS = _dog(yf[:, c:c + 1], 1.0, 8.0), _dog(S, 1.0, 8.0)
-        cen = lambda t: t - (t * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
-        bC, bS, bg = cen(bC), cen(bS), cen(bG)
+        bC, bS = cen(b3[:, c:c + 1]), cen(_dog(S, 1.0, 8.0))
         mom = lambda a, b: ((a * b) * me).sum(dim=(1, 2, 3)) / n
         Vcc, Vss, Vcs, Vcg, Vsg, Vgg = mom(bC, bC), mom(bS, bS), mom(bC, bS), mom(bC, bg), mom(bS, bg), mom(bg, bg)
         w = torch.linspace(0, 1, 41, device=yf.device).view(1, -1)
@@ -622,10 +714,13 @@ def coupled_colour(yf: torch.Tensor, m: torch.Tensor, zone: torch.Tensor, T: Dic
         k = torch.where(reach.any(1), reach.float().argmax(1), torch.full((B,), 40, device=yf.device))
         wk = (w.view(-1)[k] * s).view(B, 1, 1, 1)
         out[:, c:c + 1] = (1 - wk) * yf[:, c:c + 1] + wk * S
-    cs = coupling_stats(out, m, zone)
-    gain = (T["ctr"] / cs["ctr"].clamp_min(1e-3)).clamp(0.2, 5.0)                     # [B,3]
-    a_r = (T["fine_amp"][:, 0] / cs["fine_amp"][:, 0].clamp_min(1e-4)).clamp(0.5, 2.0)
-    b_r = T["ctr"][:, 0] - a_r * cs["ctr"][:, 0]
+    ctr = centre_mean(out)
+    fd = _dog(out[:, 0:1], 1.0, 4.0)                                                # R's fine amplitude
+    fd = fd - (fd * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
+    amp_r = torch.sqrt(((fd ** 2) * me).sum(dim=(2, 3)) / n.view(-1, 1))[:, 0]
+    gain = (T["ctr"] / ctr.clamp_min(1e-3)).clamp(0.2, 5.0)                          # [B,3]
+    a_r = (T["fine_amp"][:, 0] / amp_r.clamp_min(1e-4)).clamp(0.5, 2.0)
+    b_r = T["ctr"][:, 0] - a_r * ctr[:, 0]
     tgt = out.clone()
     tgt[:, 1:2] = out[:, 1:2] * gain[:, 1].view(B, 1, 1, 1)
     tgt[:, 2:3] = out[:, 2:3] * gain[:, 2].view(B, 1, 1, 1)
@@ -707,16 +802,18 @@ def structure_corr(x01: torch.Tensor, m: torch.Tensor, sigma: float = 3.0,
     d = d - (d * me).sum(dim=(2, 3), keepdim=True) / n.view(-1, 1, 1, 1)
     v = ((d ** 2) * me).sum(dim=(2, 3)) / n.view(-1, 1)                           # [B,3]
     cov = lambda i: ((d[:, i] * d[:, 1]) * me[:, 0]).sum(dim=(1, 2)) / n
-    return torch.stack([cov(0), cov(2)], dim=1) / torch.sqrt(v[:, [0, 2]] * v[:, 1:2]).clamp_min(1e-12)
+    return torch.stack([cov(0), cov(2)], dim=1) / torch.sqrt(v[:, 0::2] * v[:, 1:2]).clamp_min(1e-12)
 
 
 def mix_structure(y: torch.Tensor, m: torch.Tensor, target: torch.Tensor, s: float = 1.0,
                   me: Optional[torch.Tensor] = None) -> torch.Tensor:
     """R and B structure moved toward G's until their correlation with G reaches
     ``target`` [B,2] (never lowered): d_c <- ((1-l) d_c + l k d_G) / norm, k keeping
-    the channel's own structure amplitude, l the smallest mix that gets there.
-    Luminance contrast of every structure is kept; small lesions' hue moves toward
-    neutral, as on the phone."""
+    each channel's overall structure amplitude (not each structure's). G is not
+    touched; R and B take on G's lesion signal, so a small red lesion's hue moves
+    toward neutral and its luminance contrast rises, as on the phone but further:
+    small dark spots' luminance / green contrast reads 0.45 tabletop, 0.54 real
+    handheld, 0.62 simulated on the samples."""
     B = y.shape[0]
     d = _band(y)
     me = (erode(m, 9) if me is None else me).float()
@@ -817,7 +914,8 @@ def describe(x01: torch.Tensor) -> Dict[str, torch.Tensor]:
     flat = x01 / illum_field(c, x01.shape[-2], x01.shape[-1]).clamp(0.2, 5.0)
     rc = robust_colour(flat, me)
     mu, cov = colour_moments(flat, me)
-    disc_xy = torch.where(good.view(-1, 1), torch.stack([d["cx"], d["cy"]], 1), torch.full((len(good), 2), 9.0))
+    disc_xy = torch.where(good.view(-1, 1), torch.stack([d["cx"], d["cy"]], 1),
+                          torch.full((len(good), 2), 9.0, device=x01.device))
     cpl = coupling_stats(flat, m, _centre_zone(x01.shape[0], x01.shape[-2], x01.shape[-1], disc_xy, x01.device))
     return {**rc, "mu": mu, "cov": cov, "ctr": cpl["ctr"], "band_rho": cpl["band_rho"], "fine_amp": cpl["fine_amp"],
             "illum": c, "detail": band_energy(g, m) / rc["lscale"] ** 2, "noise": noise_level(g, m),
@@ -858,6 +956,7 @@ class PhoneProfile:
         if len(n) != 1 or 0 in n:
             raise ValueError(f"phone profile bank rows disagree or are empty: {n}")
         self.params = {**DEFAULT_PARAMS, **self.params}
+        check_params(self.params)
 
     def __len__(self) -> int:
         return len(self.bank["med"])
@@ -925,6 +1024,11 @@ def match_detail(x01: torch.Tensor, target: torch.Tensor, m: torch.Tensor,
     return out
 
 
+def _batch_key(x: torch.Tensor) -> torch.Tensor:
+    """[B] a cheap fingerprint of a batch (sums over a sparse pixel grid)."""
+    return x[:, :, ::31, ::31].float().sum(dim=(1, 2, 3))
+
+
 def _mirror_index(n: int, device) -> torch.Tensor:
     """Sector k of a rim profile -> its left-right mirror (angle theta -> pi - theta)."""
     th = (torch.arange(n, device=device, dtype=torch.float32) + 0.5) / n * 2 * math.pi - math.pi
@@ -936,9 +1040,11 @@ class PhoneSimulator(Stylizer):
     """Tabletop -> handheld, ``[B,3,H,W]`` in [0,1] -> ``[B,3,S,S]`` in [0,1].
 
     ``out_size`` (default: the input size) is the model's image size; training
-    passes a ``supersample``-times larger view. ``strength`` scales every
-    photometric change and the geometric offsets (0 keeps only the handheld
-    aperture). ``stages`` picks a subset of :data:`STAGES` (ablations)."""
+    passes a ``supersample``-times larger view of the whole FOV (:class:`TrainViews`).
+    ``strength`` in [0, 1] scales every photometric change, the rotation and the
+    framing shift; 0 still un-squashes, zooms as far as the aperture needs to
+    clear a truncated tabletop FOV, and applies the aperture. ``stages`` picks a
+    subset of :data:`STAGES` (ablations)."""
     name = "phone_sim"
 
     def __init__(self, profile: PhoneProfile, strength: float = 1.0, stages: Sequence[str] = STAGES,
@@ -946,17 +1052,33 @@ class PhoneSimulator(Stylizer):
         bad = sorted(set(stages) - set(STAGES))
         if bad:
             raise ValueError(f"unknown phone_sim stages {bad}; known: {STAGES}")
-        if not 0.0 <= strength <= 1.5:
-            raise ValueError(f"phone_sim strength {strength} outside [0, 1.5]")
+        if not 0.0 <= strength <= 1.0:
+            # above 1 the colour stage extrapolates a channel past zero and the bloom past
+            # the disc colour (whole channels and discs clipped)
+            raise ValueError(f"phone_sim strength {strength} outside [0, 1]")
         self.profile, self.strength, self.stages, self.out_size = profile, float(strength), tuple(stages), out_size
         self.p = profile.params
         self._bank = {k: torch.from_numpy(np.asarray(v)) for k, v in profile.bank.items()}
+        self._bank_dev: Optional[Tuple[torch.device, Dict[str, torch.Tensor]]] = None
         dd = self._bank["disc_dist"]
         self.disc_dist = float(dd[torch.isfinite(dd)].median()) if torch.isfinite(dd).any() \
             else float(self.p["disc_dist"])
         si = self.p.get("src_illum")
-        self.src_illum = torch.tensor(si, dtype=torch.float32).view(1, 3, 5) if si is not None else None
+        self.src_illum = None
+        if si is not None:
+            # the light stage's shrink target, without its left-right and up-down tilt:
+            # training flips the tabletop photos both ways, so their mean tilt is 0 (a
+            # tilt kept here pulls a mirrored photo the wrong way)
+            self.src_illum = torch.tensor(si, dtype=torch.float32).view(1, 3, 5).clone()
+            self.src_illum[..., 3:] = 0.0
         self._last: Optional[Dict[str, torch.Tensor]] = None
+        self._last_key: Optional[torch.Tensor] = None
+
+    def _bank_on(self, dev) -> Dict[str, torch.Tensor]:
+        """The bank on ``dev``, moved once (not a host-device copy per key per batch)."""
+        if self._bank_dev is None or self._bank_dev[0] != dev:
+            self._bank_dev = (dev, {k: v.to(dev) for k, v in self._bank.items()})
+        return self._bank_dev[1]
 
     def check_size(self, out_size: int) -> None:
         """The bank's detail and noise readings are per pixel at the profile's size."""
@@ -984,9 +1106,10 @@ class PhoneSimulator(Stylizer):
         centre = torch.stack([torch.zeros_like(aspect), torch.where(rel, shape["yc"], torch.zeros_like(aspect))], 1)
         rot = s * prm["rot"].to(dev)
         fov = fov_mask(x01)
-        z = min_zoom(fov, 1 + s * (prm["zoom"].to(dev) - 1), a_f, b_f, centre, rot)
+        z, clear = min_zoom(fov, 1 + s * (prm["zoom"].to(dev) - 1), a_f, b_f, centre, rot, return_ok=True)
         d = find_disc(x01)
-        conf = disc_confidence(d, float(self.p["disc_prom"]))
+        lo, hi = (float(v) for v in self.p["disc_margin"])
+        conf = disc_confidence(d, float(self.p["disc_prom"])) * disc_gate(d, lo, hi)
         ab = torch.stack([a_f, b_f], dim=1)
         dv = (torch.stack([d["cx"], d["cy"]], dim=1) - centre) / ab                    # FOV units
         tgt = torch.where(torch.isfinite(T["disc_dist"]), T["disc_dist"], torch.full_like(z, self.disc_dist))
@@ -997,9 +1120,12 @@ class PhoneSimulator(Stylizer):
         p = z.view(B, 1) * (torch.stack([d["cx"], d["cy"]], dim=1) - offset) / ab        # disc, rotated frame
         cr, sr = torch.cos(-rot), torch.sin(-rot)
         disc_xy = torch.stack([cr * p[:, 0] - sr * p[:, 1], sr * p[:, 0] + cr * p[:, 1]], dim=1)
+        # diagnostics (fit's report): whether a zoom cleared the FOV (else black crescents at
+        # the top zoom), whether the FOV ellipse was read, the disc pick's margin
         return {"zoom": z, "a_f": a_f, "b_f": b_f, "offset": offset, "rot": rot,
                 "radius": torch.ones_like(z), "disc_xy": disc_xy,
-                "disc_r": (z * d["r"] / torch.sqrt(a_f * b_f)).clamp(0.06, 0.22), "disc_conf": conf}
+                "disc_r": (z * d["r"] / torch.sqrt(a_f * b_f)).clamp(0.06, 0.22), "disc_conf": conf,
+                "clear": clear.float(), "reliable": rel.float(), "disc_margin": d["margin"]}
 
     # ---- the chain ------------------------------------------------------- #
     @torch.no_grad()
@@ -1009,13 +1135,15 @@ class PhoneSimulator(Stylizer):
         self.check_size(H)
         dev, s, p = x01.device, self.strength, self.p
         x01 = x01.float()
-        T = {k: v[prm["idx"]].to(dev) for k, v in self._bank.items()}
+        rows = prm["idx"].to(dev)
+        T = {k: v[rows] for k, v in self._bank_on(dev).items()}
         seed = int(prm["seed"][0]) if "seed" in prm else 0
         gen_dev = _device_generator(dev, seed)            # None: the backend's default generator
         geo = None
         if "field" in self.stages:
             geo = self._field(x01, prm, T)
             self._last = {k: v.detach() for k, v in geo.items()}
+            self._last_key = _batch_key(x01)
             y = warp(x01, geo["zoom"], geo["a_f"], geo["b_f"], geo["offset"], geo["rot"], (H, W))
             A = aperture(geo["radius"], float(p["rim_width"]), H, W)
             y = y * A
@@ -1030,14 +1158,13 @@ class PhoneSimulator(Stylizer):
             # them when its disc sits on the other side from this one's
             flip = (torch.isfinite(T["disc_x"]) & (geo["disc_conf"] > 0)
                     & (torch.sign(torch.nan_to_num(T["disc_x"])) != torch.sign(geo["disc_xy"][:, 0])))
-            if bool(flip.any()):
-                T = dict(T)
-                ill = T["illum"].clone()
-                ill[flip, :, 3] = -ill[flip, :, 3]
-                T["illum"] = ill
-                mi = _mirror_index(N_SECTORS, dev)
-                T["rim_add"] = torch.where(flip.view(B, 1, 1), T["rim_add"][..., mi], T["rim_add"])
-                T["rim_ratio"] = torch.where(flip.view(B, 1), T["rim_ratio"][..., mi], T["rim_ratio"])
+            T = dict(T)
+            ill = T["illum"].clone()
+            ill[..., 3] = torch.where(flip.view(B, 1), -ill[..., 3], ill[..., 3])
+            T["illum"] = ill
+            mi = _mirror_index(N_SECTORS, dev)
+            T["rim_add"] = torch.where(flip.view(B, 1, 1), T["rim_add"][..., mi], T["rim_add"])
+            T["rim_ratio"] = torch.where(flip.view(B, 1), T["rim_ratio"][..., mi], T["rim_ratio"])
         if "light" in self.stages:
             c_s, blotch_s = illum_coeffs(y, with_residual=True)
             if self.src_illum is not None:
@@ -1054,13 +1181,15 @@ class PhoneSimulator(Stylizer):
                 -float(p["blotch_max"]), float(p["blotch_max"]))
             lo, hi = p["light_lim"]
             G = g_l + g_c + Z
-            # no more retina in shadow than the drawn photo had (+0.05): scale the
+            # no more retina in shadow than the drawn photo had, +0.05, after this stage
+            # (read like the bank's, on the FOV eroded by 1/64 of the frame): scale the
             # change back, image by image, until it fits
             cap = (T["shadow"] + 0.05).view(B)
+            me_sh = erode(inside, max(3, H // 64))
             f = torch.ones(B, device=dev)
             for fk in (0.8, 0.6, 0.4, 0.2):
                 sh = shadow_fraction((y * torch.exp(s * f.view(B, 1, 1, 1) * G).clamp(float(lo), float(hi))).clamp(0, 1),
-                                     inside)
+                                     me_sh)
                 f = torch.where(sh > cap, torch.full_like(f, fk), f)
             y = (y * torch.exp(s * f.view(B, 1, 1, 1) * G).clamp(float(lo), float(hi))).clamp(0, 1)
             if "rim" in self.stages:                      # the drawn photo's dark rim bands
@@ -1080,25 +1209,31 @@ class PhoneSimulator(Stylizer):
                 mu_s, cov_s = colour_moments(yf, m)
                 Tm = mk_map(cov_s, T["cov"])
                 f = T["mu"][..., None, None] + torch.einsum("bij,bjhw->bihw", Tm, yf - mu_s[..., None, None])
-            else:
+            elif p["colour_mode"] == "affine":
                 src = robust_colour(yf, m)
                 k = (T["lscale"] / src["lscale"]).clamp(*[float(v) for v in p["colour_common"]]).unsqueeze(1)
                 sp = float(p["colour_spread"])
                 kc = torch.minimum(torch.maximum(T["scale"] / src["scale"], k / sp), k * sp)
                 f = T["med"][..., None, None] + kc[..., None, None] * (yf - src["med"][..., None, None])
+            else:
+                raise ValueError(f"colour_mode {p['colour_mode']!r}")
             y = ((yf + s * (f - yf)) * Fy).clamp(0, 1)
         if "bloom" in self.stages and geo is not None:
             xx, yy = frame_coords(B, H, W, dev)
             dist = torch.sqrt((xx - geo["disc_xy"][:, 0].view(B, 1, 1)) ** 2 + (yy - geo["disc_xy"][:, 1].view(B, 1, 1)) ** 2)
             r = geo["disc_r"].view(B, 1, 1)
-            t = ((1.3 * r - dist) / (0.3 * r)).clamp(0, 1)                # full to 1.0 r, gone by 1.3 r
+            # the disc itself: full to 0.85 r, gone by 1.1 r. Reaching 1.3 r, the push of
+            # every pixel brighter than the FOV mean toward the near-white disc colour made
+            # peripapillary haemorrhages and exudates up to 2-4x more conspicuous and
+            # drew exudate-like flecks beside clean discs
+            t = ((1.1 * r - dist) / (0.25 * r)).clamp(0, 1)
             region = (t * t * (3 - 2 * t)).unsqueeze(1)
             lum = y.mean(dim=1, keepdim=True)
             mf = m.float()
             bg = (lum * mf).sum(dim=(2, 3), keepdim=True) / mf.sum(dim=(2, 3), keepdim=True).clamp_min(1)
             peak = (lum * region).amax(dim=(2, 3), keepdim=True)
             rel = ((lum - bg) / (peak - bg).clamp_min(1e-3)).clamp(0, 1)
-            w = (s * T["bloom"].clamp(0, 1) * geo["disc_conf"]).view(B, 1, 1, 1) * region * rel.sqrt()
+            w = ((s * T["bloom"].clamp(0, 1) * geo["disc_conf"]).view(B, 1, 1, 1) * region * rel.sqrt()).clamp(max=1.0)
             y = (y + w * (T["hcol"].view(B, 3, 1, 1) - y)).clamp(0, 1)
         if "detail" in self.stages:
             # the bank's detail is per unit background contrast: rescale to this image's
@@ -1109,13 +1244,13 @@ class PhoneSimulator(Stylizer):
                 target = torch.exp(cur.log() + s * (target.clamp_min(1e-12).log() - cur.log()))
             y = match_detail(y, target, inside, me=me9).clamp(0, 1)
         if "noise" in self.stages:
-            # the phone ISP's chroma noise reduction: fine detail kept as luma
-            have_c = fine_chroma(y, inside, me9) if p["fine_chroma"] else T["chroma"]
-            keep = (T["chroma"] / have_c.clamp_min(1e-6)).clamp(0, 1)
-            keep = 1 - s * (1 - keep)
-            r = y - blur(y, 1.0)
-            lum_r = r.mean(dim=1, keepdim=True)
-            y = (y - (1 - keep).view(B, 1, 1, 1) * (r - lum_r)).clamp(0, 1)
+            if p["fine_chroma"]:
+                # the phone ISP's chroma noise reduction, fine detail kept as luma (off by default)
+                keep = (T["chroma"] / fine_chroma(y, inside, me9).clamp_min(1e-6)).clamp(0, 1)
+                keep = 1 - s * (1 - keep)
+                r = y - blur(y, 1.0)
+                lum_r = r.mean(dim=1, keepdim=True)
+                y = (y - (1 - keep).view(B, 1, 1, 1) * (r - lum_r)).clamp(0, 1)
             eps = correlated_noise((B, C, H, W), float(p["noise_corr"]), float(p["noise_rho"]), gen_dev, dev)
             ref = noise_level(eps.mean(dim=1, keepdim=True), inside, me=me9)
             have = noise_level(y.mean(dim=1, keepdim=True), inside, me=me9)
@@ -1161,29 +1296,56 @@ class PhoneSimulator(Stylizer):
 
     @torch.no_grad()
     def geometry(self, x01: torch.Tensor) -> torch.Tensor:
-        """The last call's warp and aperture on ``x01`` (same batch), so a structural
-        check compares like with like; without one, the profile's mean warp."""
+        """The last render's warp and aperture on ``x01`` -- the batch that render
+        was given (refused otherwise) -- so a structural check compares like with
+        like; without a render (or a field stage), the profile's mean warp."""
         B = x01.shape[0]
         H = W = int(self.out_size or x01.shape[-1])
         L = self._last
-        if L is None or L["zoom"].shape[0] != B or "field" not in self.stages:
+        if L is not None and "field" in self.stages:
+            if L["zoom"].shape[0] != B or not torch.allclose(self._last_key.to(x01.device), _batch_key(x01),
+                                                             rtol=1e-4, atol=1e-6):
+                raise ValueError("geometry() takes the batch the last render was given")
+        else:
             prm = self.sample(B, torch.Generator().manual_seed(0))
             prm["zoom"] = torch.full((B,), float(self.p["zoom"]))
             prm["rot"], prm["jit"] = torch.zeros(B), torch.zeros(B, 2)
-            T = {k: v[prm["idx"]].to(x01.device) for k, v in self._bank.items()}
-            L = self._field(x01.float(), prm, T)
+            rows = prm["idx"].to(x01.device)
+            L = self._field(x01.float(), prm, {k: v[rows] for k, v in self._bank_on(x01.device).items()})
         L = {k: v.to(x01.device) for k, v in L.items()}
         y = warp(x01.float(), L["zoom"], L["a_f"], L["b_f"], L["offset"], L["rot"], (H, W))
-        return (y * aperture(L["radius"], float(self.p["rim_width"]), H, W)).to(x01.dtype)
+        A = aperture(L["radius"], float(self.p["rim_width"]), H, W)
+        return (y * A * A).to(x01.dtype)                  # render applies it at the field stage and at the end
 
     # ---- training -------------------------------------------------------- #
     @torch.no_grad()
+    def augment_views(self, crop: torch.Tensor, full: torch.Tensor, prob: float,
+                      gen: torch.Generator) -> torch.Tensor:
+        """Training on :class:`TrainViews` batches: each image re-rendered with
+        probability ``prob`` (draws from ``gen``) from ``full``, its whole FOV at the
+        supersampled size (any device: only the picked images are moved), the rest
+        keeping ``crop``, the ordinary training crop at the model's size on the
+        training device. The simulator only ever sees the view that ``fit``, ``check``
+        and the tests measure it on: a random-resized crop of a Canon frame cuts the
+        FOV on all four sides, its ellipse cannot be read, and the whole frame's
+        aspect stretched simulated retinas 14 % wide."""
+        pick = torch.rand(crop.shape[0], generator=gen) < prob
+        if not bool(pick.any()):
+            return crop
+        idx = pick.nonzero()[:, 0]
+        y = self.render(full[idx.to(full.device)].to(crop.device), self.sample(len(idx), gen),
+                        out_size=crop.shape[-1])
+        out = crop.clone()
+        out[idx.to(crop.device)] = y.to(out.dtype)
+        return out
+
+    @torch.no_grad()
     def augment(self, x01: torch.Tensor, prob: float, gen: torch.Generator,
                 out_size: Optional[int] = None) -> torch.Tensor:
-        """Training: each image re-rendered with probability ``prob`` (draws from
-        ``gen``), the rest only resized to ``out_size`` (antialiased bilinear,
-        torchvision's Resize on tensors), so a supersampled batch comes out at
-        the model's size either way."""
+        """Each image of a supersampled batch re-rendered with probability ``prob``
+        (draws from ``gen``), the rest only resized to ``out_size`` (antialiased
+        bilinear, torchvision's Resize on tensors). The batch must be whole-FOV views
+        (the loader's 'val' view); training uses :meth:`augment_views`."""
         B, C, H, W = x01.shape
         S = int(out_size or H)
         out = x01 if S == H else F.interpolate(x01, size=(S, S), mode="bilinear", antialias=True,
@@ -1196,6 +1358,27 @@ class PhoneSimulator(Stylizer):
         out[idx.to(x01.device)] = self.render(x01[idx.to(x01.device)], self.sample(len(idx), gen),
                                               out_size=S).to(out.dtype)
         return out
+
+
+class TrainViews:
+    """The source training transform of a ``--phone-sim`` run (a top-level class, so
+    DataLoader workers can unpickle it): ``crop`` is the ordinary training view at
+    the model's size (random resized crop and flips, the Canon-only run's own
+    transform), ``full`` the whole FOV at ``train_size`` with flips -- the loader's
+    'val' view, which :meth:`PhoneSimulator.augment_views` renders from. Both come
+    from one decode, drafted for ``train_size``: for most BRSET frame sizes that is
+    twice the Canon-only run's draft, so the kept crop is the same transform on a
+    slightly richer decode (mid-band energy +1.6 % median on the samples)."""
+
+    def __init__(self, image_size: int, train_size: int) -> None:
+        from dataset import _V2, T, build_transforms
+        self.crop = build_transforms("train", image_size, device_aug=True)
+        to_tensor = [T.ToImage(), T.ToDtype(torch.float32, scale=True)] if _V2 else [T.ToTensor()]
+        self.full = T.Compose(to_tensor + [T.Resize((train_size, train_size), antialias=True),
+                                           T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
+
+    def __call__(self, img) -> Dict[str, torch.Tensor]:
+        return {"crop": self.crop(img), "full": self.full(img)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1418,10 +1601,11 @@ def folder_dataset(path: str, size: int):
 
 
 def split_dataset(root: str, dataset: str, size: int, split_seed: int = 42, part: str = "train",
-                  camera: Optional[str] = None, select: str = "all"):
-    """One part of the trainer's own patient split (``multitask_split`` on referable
-    DR after the ``--source-camera`` filter), as ``train_retinareach.py`` builds it.
-    ``select='icdr0'`` keeps grade-0 photos only (reads the grade)."""
+                  camera: Optional[str] = None, select: str = "all", strat: str = "dr_referable"):
+    """One part of the trainer's own patient split (``multitask_split`` on its first
+    source target, ``strat``, after the ``--source-camera`` filter), as
+    ``train_retinareach.py`` builds it. ``select='icdr0'`` keeps grade-0 photos only
+    (reads the grade)."""
     import pandas as pd
     from brset_dataset import filter_camera, load_any
     from capability_gate import multitask_split
@@ -1430,7 +1614,7 @@ def split_dataset(root: str, dataset: str, size: int, split_seed: int = 42, part
     df, _ = load_table(root, dataset)
     if camera:
         df = filter_camera(df, camera.strip())
-    part_df = multitask_split(df, "dr_referable", seed=split_seed)[part]
+    part_df = multitask_split(df, strat, seed=split_seed)[part]
     if select == "icdr0":
         part_df = part_df[pd.to_numeric(part_df["final_icdr"], errors="coerce") == 0]
     elif select != "all":
@@ -1442,14 +1626,20 @@ def split_dataset(root: str, dataset: str, size: int, split_seed: int = 42, part
 def _source(a, size: int, part: str):
     if a.source_dir:
         return folder_dataset(a.source_dir, size)
-    return split_dataset(a.source_root, a.source_dataset, size, a.split_seed, part, a.source_camera)
+    return split_dataset(a.source_root, a.source_dataset, size, a.split_seed, part, a.source_camera,
+                         strat=a.strat_target)
 
 
 def _target(a, size: int, part: str):
     if a.target_dir:
         return folder_dataset(a.target_dir, size)
     return split_dataset(a.target_root, a.target_dataset, size, a.split_seed, part, None,
-                         getattr(a, "select", "all"))
+                         getattr(a, "select", "all"), strat=a.strat_target)
+
+
+def _files(ds) -> List[str]:
+    """The photo file names of a dataset or a Subset of one, in order."""
+    return [ds.dataset.files[i] for i in ds.indices] if hasattr(ds, "indices") else list(ds.files)
 
 
 def _subset(ds, n: int, seed: int):
@@ -1491,28 +1681,45 @@ def save_rows(path: str, rows: Sequence[torch.Tensor], labels: Sequence[str] = (
 
 @torch.no_grad()
 def cross_fitted_report(profile: PhoneProfile, src_hi: torch.Tensor, real: torch.Tensor, real_rows: np.ndarray,
-                        seed: int, out_size: int, strength: float = 1.0) -> Tuple[object, torch.Tensor]:
+                        seed: int, out_size: int, strength: float = 1.0, src_lo: Optional[torch.Tensor] = None,
+                        log: Callable[[str], None] = print):
     """Two folds: the source photos rendered from half the bank rows, compared
-    with the real handheld photos behind the OTHER half, so no simulated photo is
+    with the real handheld photos not behind that half, so no simulated photo is
     scored against the photo it drew its statistics from. ``real_rows`` maps each
-    real photo to its bank row (-1 = not in the bank)."""
+    real photo to its bank row (-1 = not in the bank: it goes to alternate folds).
+    ``src_lo`` is the tabletop column's view at ``out_size`` (one resize from the
+    photo, as the model sees it; default ``src_hi`` resized). Returns the table
+    (None when no fold has a real photo), the whole-bank render of ``src_hi``, that
+    render's field diagnostics and [(fold, simulated, real)] counts."""
     N = len(profile)
     half = np.arange(N) % 2
-    sims, reals, tabs = [], [], []
+    fold_of = np.where(real_rows >= 0, 1 - half[np.clip(real_rows, 0, N - 1)], np.arange(len(real_rows)) % 2)
+    sims, reals, counts = [], [], []
     gen = torch.Generator().manual_seed(seed)
     for f in (0, 1):
+        sel, part = fold_of == f, slice(f, None, 2)
+        missing = [what for what, none in (("bank row", not (half == f).any()),
+                                           ("tabletop photo", len(src_hi[part]) == 0),
+                                           ("real handheld photo", not sel.any())) if none]
+        if missing:
+            log(f"[fit] realism fold {f}: no {' / '.join(missing)} for it, left out")
+            continue
         sub = PhoneProfile(profile.image_size, {k: v[half == f] for k, v in profile.bank.items()}, profile.params)
-        sim = PhoneSimulator(sub, strength=strength, out_size=out_size)
-        part = slice(f, None, 2)
-        y = sim(src_hi[part], gen)
+        y = PhoneSimulator(sub, strength=strength, out_size=out_size)(src_hi[part], gen)
         sims.append(camera_stats(y))
-        sel = torch.from_numpy((real_rows >= 0) & (half[np.clip(real_rows, 0, N - 1)] != f))
-        reals.append(camera_stats(real[sel]))
-    sim_y = PhoneSimulator(profile, strength=strength, out_size=out_size)(src_hi, torch.Generator().manual_seed(seed))
-    cat = lambda L: {k: torch.cat([d[k] for d in L]).numpy() for k in L[0]}
-    tab = {k: v.numpy() for k, v in camera_stats(F.interpolate(src_hi, size=(out_size, out_size), mode="bilinear",
-                                                                antialias=True, align_corners=False)).items()}
-    return realism_table(tab, cat(sims), cat(reals)), sim_y
+        reals.append(camera_stats(real[torch.from_numpy(sel).to(real.device)]))
+        counts.append((f, len(y), int(sel.sum())))
+    whole = PhoneSimulator(profile, strength=strength, out_size=out_size)
+    sim_y = whole(src_hi, torch.Generator().manual_seed(seed))
+    diag = {k: v.cpu() for k, v in (whole._last or {}).items()
+            if k in ("zoom", "clear", "reliable", "disc_conf", "disc_margin")}
+    if not sims:
+        return None, sim_y, diag, counts
+    cat = lambda L: {k: torch.cat([d[k] for d in L]).cpu().numpy() for k in L[0]}
+    lo = src_lo if src_lo is not None else F.interpolate(src_hi, size=(out_size, out_size), mode="bilinear",
+                                                         antialias=True, align_corners=False)
+    tab = {k: v.cpu().numpy() for k, v in camera_stats(lo).items()}
+    return realism_table(tab, cat(sims), cat(reals)), sim_y, diag, counts
 
 
 def _fmt_table(df) -> str:
@@ -1525,50 +1732,94 @@ def cmd_fit(a) -> int:
     S_hi = int(round(S * ss))
     tgt = _subset(_target(a, S, "train"), a.max_target, a.seed)
     src = _subset(_source(a, S, "train"), a.max_source, a.seed + 1)
-    print(f"[fit] handheld photos {len(tgt)} ({a.target_dir or a.target_root}, train split, select {a.select}); "
+    where = ("a folder, no split" if a.target_dir else
+             f"train split, seed {a.split_seed}, stratified on {a.strat_target}")
+    print(f"[fit] handheld photos {len(tgt)} ({a.target_dir or a.target_root}, {where}, select {a.select}); "
           f"tabletop photos {len(src)} ({a.source_dir or a.source_root}"
           f"{', camera ' + repr(a.source_camera) if a.source_camera else ''}); {S} px on {dev}")
     prof, src_desc = fit_profile(batches(tgt, a.batch_size, a.num_workers, dev),
                                  batches(src, a.batch_size, a.num_workers, dev), S,
-                                 params={"supersample": ss})
+                                 params={"supersample": ss, "colour_mode": a.colour_mode})
+    tgt_files = _files(tgt)
+    # where the bank came from: the trainer refuses a profile whose photos are not in its
+    # own handheld train split. ``files`` are the photos behind the bank rows (names only)
     prof.source = {"target": a.target_dir or a.target_root, "target_dataset": None if a.target_dir else a.target_dataset,
                    "source": a.source_dir or a.source_root, "source_dataset": None if a.source_dir else a.source_dataset,
-                   "source_camera": a.source_camera, "split_seed": a.split_seed, "split": "train",
-                   "select": a.select, "n_target": len(prof), "n_source": len(src), "image_size": S}
+                   "source_camera": a.source_camera, "split": None if a.target_dir else "train",
+                   "split_seed": None if a.target_dir else a.split_seed,
+                   "strat_target": None if a.target_dir else a.strat_target,
+                   "source_split": None if a.source_dir else "train",
+                   "select": a.select, "n_target": len(prof), "n_source": len(src), "image_size": S,
+                   "files": [tgt_files[k] for k in prof.report["kept"]]}
     out_dir = os.path.dirname(os.path.abspath(a.out))
-    report_lines = [f"phone_sim profile {a.out}: {len(prof)} handheld photos in the bank, {S} px"]
+    os.makedirs(out_dir, exist_ok=True)
+    prof.save(a.out)                              # the bank is kept even if the report below fails
+    written = [a.out]
+    stale = os.path.join(out_dir, "fit_report.csv")
+    if os.path.exists(stale):
+        os.remove(stale)                          # an earlier fit's table must not sit beside this profile
+    report_lines = [f"phone_sim profile {a.out}: {len(prof)} handheld photos in the bank ({where}), {S} px"]
     if a.validate:
         n = min(a.validate, len(src))
         src_hi_ds = _subset(_source(a, S_hi, "train"), n, a.seed + 2)
+        src_lo_ds = _subset(_source(a, S, "train"), n, a.seed + 2)            # the same photos at the model's size
         real_ds = _subset(_target(a, S, "train"), min(a.validate, len(tgt)), a.seed + 3)
         X_hi = torch.cat(list(batches(src_hi_ds, a.batch_size, a.num_workers, dev)))
+        X_lo = torch.cat(list(batches(src_lo_ds, a.batch_size, a.num_workers, dev)))
         R = torch.cat(list(batches(real_ds, a.batch_size, a.num_workers, dev)))
         prof.params["noise_corr"], prof.params["noise_rho"] = calibrate_grain(prof, X_hi[:32], S, a.seed)
-        # the real photos behind the bank rows: the bank is fitted on tgt in order, so match by file
-        tgt_files = [tgt.dataset.files[i] for i in tgt.indices] if hasattr(tgt, "indices") else list(tgt.files)
-        real_files = [real_ds.dataset.files[i] for i in real_ds.indices] if hasattr(real_ds, "indices") else list(real_ds.files)
-        # bank row r came from target photo kept[r] (photos with an undefined measurement were dropped)
+        # the real photos behind the bank rows: the bank is fitted on tgt in order, so match by
+        # file; bank row r came from target photo kept[r] (photos with an undefined measurement
+        # were dropped); the rest are not in the bank
         pos = {tgt_files[k]: r for r, k in enumerate(prof.report["kept"])}
-        rows = np.array([pos.get(f, -1) for f in real_files])
-        df, Y = cross_fitted_report(prof, X_hi, R, rows, a.seed, S)
-        prof.report.update({"realism": df.to_dict(orient="list"), "n_validate": int(n)})
+        rows = np.array([pos.get(f, -1) for f in _files(real_ds)])
+        df, Y, diag, counts = cross_fitted_report(prof, X_hi, R, rows, a.seed, S, src_lo=X_lo)
+        prof.report["n_validate"] = int(n)
         report_lines += ["", "REALISM (cross-fitted: a simulated photo is never scored against the photo its "
-                         "statistics came from)", "auc_* = AUROC against real handheld photos, 0.5 = cannot tell "
-                         "them apart; gap = |auc - 0.5| x 2", _fmt_table(df),
-                         f"mean gap: tabletop {df.gap_tabletop.mean():.3f} -> simulated {df.gap_simulated.mean():.3f}"]
-        k = min(8, len(X_hi), len(R))
-        save_rows(os.path.join(out_dir, "fit_grid.jpg"),
-                  [F.interpolate(X_hi[:k], size=(S, S), mode="bilinear", antialias=True, align_corners=False),
-                   Y[:k], R[:k]], ["tabletop", "simulated", "real handheld"])
-        df.to_csv(os.path.join(out_dir, "fit_report.csv"), index=False)
+                         "statistics came from)"]
+        if df is None:
+            report_lines.append("too few validation photos for either fold (each needs bank rows, tabletop and real "
+                                "handheld photos): raise --validate")
+        else:
+            prof.report["realism"] = df.to_dict(orient="list")
+            report_lines += ["auc_* = AUROC against real handheld photos, 0.5 = cannot tell them apart; "
+                             "gap = |auc - 0.5| x 2", _fmt_table(df),
+                             f"mean gap: tabletop {df.gap_tabletop.mean():.3f} -> simulated {df.gap_simulated.mean():.3f}",
+                             "photos per fold (simulated / real handheld): "
+                             + ", ".join(f"fold {f} {ns} / {nr}" for f, ns, nr in counts)]
+            df.to_csv(stale, index=False)
+            written.append("fit_report.csv")
+        if diag:
+            z = diag["zoom"].numpy()
+            lo = float(prof.params["disc_margin"][0])
+            pushed = float(prof.params["zoom"]) + 0.35            # past the clearance band: a dark FOV edge
+            nv = len(z)
+            prof.report["field"] = {"zoom_p10_median_p90": [float(np.percentile(z, q)) for q in (10, 50, 90)],
+                                    "fov_read": float(diag["reliable"].mean()), "not_cleared": float(1 - diag["clear"].mean()),
+                                    "zoom_pushed": float((z > pushed).mean()),
+                                    "disc_ambiguous": float((diag["disc_margin"] < lo).float().mean())}
+            report_lines += ["", f"FIELD on the {nv} validation renders: zoom median {np.median(z):.3f} (p10 "
+                             f"{np.percentile(z, 10):.3f}, p90 {np.percentile(z, 90):.3f}) against the fitted angular "
+                             f"scale {float(prof.params['zoom']):.3f} -- a truncated tabletop frame needs more for the "
+                             f"aperture to clear its flat top and bottom; FOV ellipse read on "
+                             f"{int(diag['reliable'].sum())}/{nv}; zoom pushed past {pushed:.2f} (a dark FOV edge "
+                             f"shrinks the field kept) on {int((z > pushed).sum())}/{nv}, no zoom up to 1.8 cleared "
+                             f"the FOV (black edge crescents) on {int((diag['clear'] < 0.5).sum())}/{nv}; disc pick "
+                             f"ambiguous (margin < {lo}: no bloom, disc shift or mirroring) on "
+                             f"{int((diag['disc_margin'] < lo).sum())}/{nv}"]
+        k = min(8, len(X_lo), len(R))
+        save_rows(os.path.join(out_dir, "fit_grid.jpg"), [X_lo[:k], Y[:k], R[:k]],
+                  ["tabletop", "simulated", "real handheld"])
+        written.append("fit_grid.jpg")
     report_lines.insert(1, "parameters: " + json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                                                         for k, v in prof.params.items() if k != "src_illum"}))
-    prof.save(a.out)
+    prof.save(a.out)                              # again: grain calibration and the report updated it
     txt = "\n".join(report_lines)
     print(txt)
     with open(os.path.join(out_dir, "fit_report.txt"), "w") as f:
         f.write(txt + "\n")
-    print(f"[fit] wrote {a.out}, fit_report.txt" + (", fit_report.csv, fit_grid.jpg" if a.validate else ""))
+    written.insert(1, "fit_report.txt")
+    print(f"[fit] wrote {', '.join(written)}")
     return 0
 
 
@@ -1577,14 +1828,16 @@ def cmd_render(a) -> int:
     prof = PhoneProfile.load(a.profile)
     S = prof.image_size
     S_hi = int(round(S * float(prof.params.get("supersample", 1.5))))
-    src = _subset(_source(a, S_hi, "test"), a.n, a.seed)
+    # dataset roots: the --part split (default val: looking at the simulator and tuning it
+    # by eye never touches the test patients); folders: every photo in them
+    src = _subset(_source(a, S_hi, a.part), a.n, a.seed)
     X = torch.cat(list(batches(src, a.batch_size, a.num_workers, dev)))
     sim = PhoneSimulator(prof, strength=a.strength, out_size=S)
     Y = sim(X, torch.Generator().manual_seed(a.seed))
     X_lo = F.interpolate(X, size=(S, S), mode="bilinear", antialias=True, align_corners=False)
     rows, labels = [X_lo, Y], ["tabletop", "simulated"]
     if a.target_dir or a.target_root:
-        R = torch.cat(list(batches(_subset(_target(a, S, "test"), a.n, a.seed), a.batch_size, a.num_workers, dev)))
+        R = torch.cat(list(batches(_subset(_target(a, S, a.part), a.n, a.seed), a.batch_size, a.num_workers, dev)))
         rows.append(R); labels.append("real handheld")
     os.makedirs(a.out, exist_ok=True)
     save_rows(os.path.join(a.out, "grid.jpg"), rows, labels)
@@ -1599,8 +1852,8 @@ def cmd_render(a) -> int:
     save_rows(os.path.join(a.out, "stages.jpg"), [tiles[i] for i in range(k)])
     with open(os.path.join(a.out, "stages.txt"), "w") as f:
         f.write("columns, left to right: " + ", ".join(names) + "\n")
-    print(f"[render] {len(X)} photos -> {a.out}/grid.jpg (rows: {labels}); {a.out}/stages.jpg "
-          f"(columns: {names})")
+    print(f"[render] {len(X)} photos ({'folders' if a.source_dir else a.part + ' split'}) -> {a.out}/grid.jpg "
+          f"(rows: {labels}); {a.out}/stages.jpg (columns: {names})")
     return 0
 
 
@@ -1608,7 +1861,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Tabletop -> handheld fundus photo simulator.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def data(q, need_target: bool):
+    def data(q):
         q.add_argument("--source-root", default=None, help="tabletop dataset root (BRSET)")
         q.add_argument("--source-dataset", default="brset", choices=["brset", "mbrset"])
         q.add_argument("--source-camera", default=None, help="one BRSET camera, e.g. 'Canon CR'")
@@ -1616,19 +1869,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         q.add_argument("--target-root", default=None, help="handheld dataset root (mBRSET)")
         q.add_argument("--target-dataset", default="mbrset", choices=["brset", "mbrset"])
         q.add_argument("--target-dir", default=None, help="or a folder of handheld photos")
-        q.add_argument("--split-seed", type=int, default=42)
+        q.add_argument("--split-seed", type=int, default=42, help="the trainer's --split-seed")
+        q.add_argument("--strat-target", default="dr_referable",
+                       help="the trainer's first --source-targets entry (its split is stratified on it)")
         q.add_argument("--batch-size", type=int, default=16)
         q.add_argument("--num-workers", type=int, default=4)
         q.add_argument("--seed", type=int, default=0)
         q.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
 
     q = sub.add_parser("fit", help="measure the handheld camera into a profile")
-    data(q, True)
+    data(q)
     q.add_argument("--image-size", type=int, default=384, help="the model's image size")
     q.add_argument("--supersample", type=float, default=1.5,
                    help="training renders from a view this much larger than the model's")
     q.add_argument("--select", default="all", choices=["all", "icdr0"],
-                   help="handheld photos: all of the train split (no label read) or grade 0 only")
+                   help="handheld photos: all of the train split (no label enters the bank; the split is "
+                        "stratified on referable DR, as the trainer's) or grade 0 only (chosen by grade)")
+    q.add_argument("--colour-mode", default="coupled", choices=list(COLOUR_MODES),
+                   help="ablation only: mk (3x3 optimal transport) and affine make lesions 1.4-2x more "
+                        "conspicuous than on the tabletop photo")
     q.add_argument("--max-target", type=int, default=2000, help="bank rows at most (0 = all)")
     q.add_argument("--max-source", type=int, default=600)
     q.add_argument("--validate", type=int, default=120,
@@ -1637,12 +1896,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     q.set_defaults(fn=cmd_fit)
 
     q = sub.add_parser("render", help="tabletop -> simulated (-> real handheld) grid and a per-stage strip")
-    data(q, False)
+    data(q)
     q.add_argument("--profile", required=True)
+    q.add_argument("--part", default="val", choices=["train", "val", "test"],
+                   help="with dataset roots, the split the photos come from")
     q.add_argument("--n", type=int, default=8)
     q.add_argument("--stage-rows", type=int, default=4)
-    q.add_argument("--strength", type=float, default=1.0)
-    q.add_argument("--out", default="exp_phone_sim/render")
+    q.add_argument("--strength", type=float, default=1.0, help="0-1")
+    q.add_argument("--out", default="ck_phone_sim/render",
+                   help="grids of dataset photos: keep them in a git-ignored ck_* folder")
     q.set_defaults(fn=cmd_render)
 
     a = p.parse_args(argv)
@@ -1650,6 +1912,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.error("give --source-root or --source-dir")
     if a.cmd == "fit" and not (a.target_dir or a.target_root):
         p.error("fit needs --target-root or --target-dir (the handheld photos)")
+    if a.source_dir and a.source_camera:
+        p.error("--source-camera filters a dataset root, not a folder (--source-dir)")
+    if a.cmd == "fit" and a.target_dir and a.select != "all":
+        p.error("--select icdr0 reads grades from a dataset root, not a folder (--target-dir)")
+    if a.cmd == "render" and not 0.0 <= a.strength <= 1.0:
+        p.error("--strength must be in [0, 1]")
     return a.fn(a)
 
 

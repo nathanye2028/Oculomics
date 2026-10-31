@@ -76,8 +76,9 @@ def line_kernels(W: int, n_angles: int = 12) -> Dict[int, torch.Tensor]:
 
 
 def fov_mask(x01: torch.Tensor) -> torch.Tensor:
-    """[B,1,H,W] bool: max(R,G,B) > 12/255 (fundus_utils.fov_bbox's rule, per pixel)."""
-    return x01.max(dim=1, keepdim=True).values > FOV_TOL
+    """[B,1,H,W] bool: max(R,G,B) > 12/255 (fundus_utils.fov_bbox's rule, per pixel).
+    ``amax``: the values-and-indices ``max`` takes up to a second per batch on MPS."""
+    return x01.amax(dim=1, keepdim=True) > FOV_TOL
 
 
 def _standardise(r: torch.Tensor, m: torch.Tensor) -> torch.Tensor:

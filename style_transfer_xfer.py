@@ -103,15 +103,16 @@ SIMULATED = ("phone_sim",)
 # Data
 # --------------------------------------------------------------------------- #
 def load_device(root: str, dataset: str, size: int, split_seed: int,
-                targets: Sequence[str] = (PRIMARY,), camera: Optional[str] = None) -> Dict[str, object]:
-    """The trainer's own patient split (``multitask_split`` on referable DR, after
-    the run's ``--source-camera`` filter when it had one), so 'train' here is
-    'train' there and the test patients are untouched."""
+                targets: Sequence[str] = (PRIMARY,), camera: Optional[str] = None,
+                strat: str = PRIMARY) -> Dict[str, object]:
+    """The trainer's own patient split (``multitask_split`` on its first source
+    target ``strat``, after the run's ``--source-camera`` filter when it had one),
+    so 'train' here is 'train' there and the test patients are untouched."""
     df, csv = load_table(root, dataset)
     if camera:
         from brset_dataset import filter_camera
         df = filter_camera(df, camera.strip())
-    split = multitask_split(df, PRIMARY, seed=split_seed)
+    split = multitask_split(df, strat, seed=split_seed)
     img = load_any(root, dataset)["images_dir"]
     out: Dict[str, object] = {"csv": csv, "images_dir": img}
     for part in ("train", "val", "test"):
@@ -265,6 +266,15 @@ def supersample_of(phone_profile: Optional[str]) -> float:
     return float(PhoneProfile.load(phone_profile).params.get("supersample", 1.5))
 
 
+def _check_phone_profile(phone_profile: str, size: int) -> None:
+    """The profile loads and was measured at the model's size, or a clean exit."""
+    from phone_sim import PhoneProfile, PhoneSimulator
+    try:
+        PhoneSimulator(PhoneProfile.load(phone_profile)).check_size(size)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"[fatal] --phone-profile: {e}")
+
+
 # --------------------------------------------------------------------------- #
 # check
 # --------------------------------------------------------------------------- #
@@ -372,6 +382,8 @@ def cmd_check(a) -> int:
     args = ck["args"]
     S, T = args["source_name"], args["target_name"]
     size, seed = int(ck["config"].get("image_size", 384)), int(args.get("seed", 0))
+    if a.phone_profile:                           # a size mismatch fails now, not after every other method
+        _check_phone_profile(a.phone_profile, size)
     rng = np.random.default_rng(seed)
     net = build_from_checkpoint(ck)
     k = net.targets.index(PRIMARY)
@@ -382,10 +394,11 @@ def cmd_check(a) -> int:
         set_bn_stats(m, stats_from_lists(ck["profiles"][dname]["bn_stats"]))
         models[name] = m.to(dev).eval()
     camera = args.get("source_camera")
+    strat = (args.get("source_targets") or [PRIMARY])[0]          # the run's split was stratified on it
     src = load_device(a.source_root or args["source_root"], args["source_dataset"], size,
-                      int(args["split_seed"]), camera=camera)
+                      int(args["split_seed"]), camera=camera, strat=strat)
     tgt = load_device(a.target_root or args["target_root"], args["target_dataset"], size,
-                      int(args["split_seed"]))
+                      int(args["split_seed"]), strat=strat)
     translators = parse_named(a.translator)
     methods = ["identity"] + [m for m in a.methods if m != "identity"] + sorted(translators)
     if a.phone_profile and "phone_sim" not in methods:
@@ -393,7 +406,7 @@ def cmd_check(a) -> int:
     # phone_sim renders from a supersampled view of the same test rows (as in training)
     src_hi = (load_device(a.source_root or args["source_root"], args["source_dataset"],
                           int(round(size * supersample_of(a.phone_profile))), int(args["split_seed"]),
-                          camera=camera) if any(m in SIMULATED for m in methods) else src)
+                          camera=camera, strat=strat) if any(m in SIMULATED for m in methods) else src)
     bank = reference_bank(tgt["train"], a.bank, seed, a.num_workers)
     print(f"[check] {a.ckpt} (seed {seed}, {size}px) on {dev}; methods {methods}; "
           f"{len(bank)} handheld references; shipped threshold {thr:.3f}")
@@ -537,6 +550,8 @@ def summarise_check(df: pd.DataFrame, judge_ref: Dict[str, float], judge_thr: fl
 def cmd_export(a) -> int:
     from PIL import Image
     dev = pick_device() if a.device == "auto" else torch.device(a.device)
+    if a.method in SIMULATED:
+        _check_phone_profile(a.phone_profile, a.image_size)
     df, csv = load_table(a.source_root, a.source_dataset)
     img_dir = load_any(a.source_root, a.source_dataset)["images_dir"]
     size_in = (int(round(a.image_size * supersample_of(a.phone_profile))) if a.method in SIMULATED
@@ -584,12 +599,14 @@ def cmd_score(a) -> int:
         size, seed = int(ck["config"].get("image_size", 384)), int(args.get("seed", 0))
         net = build_from_checkpoint(ck).to(dev).eval()
         k = net.targets.index(PRIMARY)
+        strat = (args.get("source_targets") or [PRIMARY])[0]
         for cam_name, root, dset in (("tabletop", a.source_root, args["source_dataset"]),
                                      ("handheld", a.target_root, args["target_dataset"])):
             camera = args.get("source_camera") if cam_name == "tabletop" else None
-            key = (root, dset, size, int(args["split_seed"]), camera)
+            key = (root, dset, size, int(args["split_seed"]), camera, strat, a.part)
             if key not in cache:
-                cache[key] = load_device(root, dset, size, int(args["split_seed"]), camera=camera)["test"]
+                cache[key] = load_device(root, dset, size, int(args["split_seed"]), camera=camera,
+                                         strat=strat)[a.part]
             ds = cache[key]
             y = ds.label_array()[:, 0]
             profile = args["source_name"] if cam_name == "tabletop" else args["target_name"]
@@ -604,12 +621,20 @@ def cmd_score(a) -> int:
                 fin = np.isfinite(y)
                 yy, pp = y[fin].astype(int), p[fin]
                 orc = threshold_at_sensitivity(yy, pp, a.target_sens)
+                # tabletop val chose the epoch and fixed the threshold: there sensitivity at
+                # the threshold is >= the target and specificity == oracle_spec by construction
+                in_sample = cam_name == "tabletop" and a.part == "val"
+                at_thr = thr is not None and not in_sample
+                sim = ck.get("phone_sim_profile") or {}
                 rows.append({"arm": arm, "seed": seed, "camera": cam_name, "protocol": proto,
-                             "ckpt": os.path.basename(path), "n": int(fin.sum()),
+                             "ckpt": path, "n": int(fin.sum()), "in_sample": in_sample,
+                             "phone_sim_p": args.get("phone_sim_p") if args.get("phone_sim") else None,
+                             "phone_sim_strength": args.get("phone_sim_strength") if args.get("phone_sim") else None,
+                             "phone_sim_sha256": sim.get("sha256"),
                              "auroc": _auc(yy, pp), "threshold": thr,
-                             "sensitivity": float((pp[yy == 1] >= thr).mean()) if thr is not None else np.nan,
-                             "specificity": float((pp[yy == 0] < thr).mean()) if thr is not None else np.nan,
-                             "flagged": float((pp >= thr).mean()) if thr is not None else np.nan,
+                             "sensitivity": float((pp[yy == 1] >= thr).mean()) if at_thr else np.nan,
+                             "specificity": float((pp[yy == 0] < thr).mean()) if at_thr else np.nan,
+                             "flagged": float((pp >= thr).mean()) if at_thr else np.nan,
                              "oracle_spec": float((pp[yy == 0] < orc).mean()) if orc == orc else np.nan,
                              "prevalence": float(yy.mean())})
         print(f"  scored {arm} seed {seed}")
@@ -619,9 +644,26 @@ def cmd_score(a) -> int:
                                                      "oracle_spec"]]
          .agg(["mean", "min", "max"]).round(3))
     txt = ("\nRETRAINED ON A TRANSLATED / SIMULATED TABLETOP SET, SCORED ON THE REAL CAMERAS "
-           f"(referable DR, seeds {sorted(df.seed.unique().tolist())}; threshold fixed on the "
-           f"arm's own tabletop validation split; oracle_spec = specificity where the test ROC "
-           f"crosses sensitivity {a.target_sens})\n" + g.to_string())
+           f"(referable DR, {a.part} split, seeds {sorted(df.seed.unique().tolist())}; threshold fixed on "
+           f"the arm's own tabletop validation split; oracle_spec = specificity where this split's ROC "
+           f"crosses sensitivity {a.target_sens})\n"
+           + ("IN-SAMPLE: the tabletop rows are the split that chose each arm's epoch and fixed its threshold, so "
+              "their AUROC and oracle_spec are optimistic and their threshold columns are left empty; the "
+              "handheld rows are out of sample.\n" if a.part == "val" else "")
+           + "arms: " + "; ".join(f"{r.arm} = {os.path.dirname(r.ckpt) or '.'} ("
+                                  + (f"phone_sim p {r.phone_sim_p}, strength {r.phone_sim_strength}, profile "
+                                     f"{r.phone_sim_sha256[:12]}" if isinstance(r.phone_sim_sha256, str) else "no phone_sim")
+                                  + ")" for r in df.drop_duplicates("arm").itertuples()) + "\n"
+           + g.to_string())
+    arms = list(dict.fromkeys(df.arm))
+    if len(arms) == 2:                            # the second arm minus the first, seed by seed
+        cols = ["auroc", "sensitivity", "specificity", "oracle_spec"]
+        key = ["camera", "protocol", "seed"]
+        d = (df[df.arm == arms[1]].set_index(key)[cols] - df[df.arm == arms[0]].set_index(key)[cols]).dropna(how="all")
+        if len(d):
+            pd_ = d.groupby(level=["camera", "protocol"]).agg(["mean", "min", "max", "count"]).round(3)
+            txt += (f"\n\nPAIRED: {arms[1]} minus {arms[0]}, same seed and rows (count = seeds with both)\n"
+                    + pd_.to_string())
     print(txt)
     with open(os.path.join(a.out, "score_summary.txt"), "w") as f:
         f.write(txt + "\n")
@@ -656,7 +698,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         q.add_argument("--zoom", type=float, default=1.15, help="fda_geo centre zoom")
         q.add_argument("--phone-profile", default=None,
                        help="phone_sim.py profile; adds the phone_sim method to check")
-        q.add_argument("--phone-strength", type=float, default=1.0)
+        q.add_argument("--phone-strength", type=float, default=1.0, help="0-1")
 
     q = sub.add_parser("fit", help="train one CycleGAN translator")
     common(q)
@@ -697,6 +739,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     common(q)
     q.add_argument("--ckpt", nargs="+", required=True, metavar="ARM=CKPT")
     q.add_argument("--target-sens", type=float, default=0.85, help="the oracle operating point")
+    q.add_argument("--part", default="test", choices=["val", "test"],
+                   help="test: the pre-specified decision read; val: choosing among ablation arms "
+                        "(the decision split is then read once, for the chosen arm)")
     q.add_argument("--out", default="exp_style/score")
     q.set_defaults(fn=cmd_score)
 
@@ -709,6 +754,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.error(f"--method {a.method} needs --phone-profile")
     if a.cmd == "check" and any(m in SIMULATED for m in a.methods) and not a.phone_profile:
         p.error("--methods phone_sim needs --phone-profile")
+    if a.cmd in ("check", "export") and not 0.0 <= a.phone_strength <= 1.0:
+        p.error("--phone-strength must be in [0, 1]")
     return a.fn(a)
 
 

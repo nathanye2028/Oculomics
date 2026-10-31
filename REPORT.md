@@ -882,7 +882,7 @@ python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --weights int8
     --swift-cli app/RetinaReachKit/.build/release/retinareach-cli
 ```
 
-### 10.11 Simulated phone photos for training (built 30 October; measured on the 16 + 16 samples, not yet run on the box)
+### 10.11 Simulated phone photos for training (built 30 October, reviewed and fixed 31 October; measured on the 16 + 16 samples, not yet run on the box)
 
 **Why.** The phone-ceiling run (seed 0) split the phone gap: the Canon model ranks phone
 photos almost as well as a phone-trained one once AdaBN re-estimates its statistics
@@ -899,11 +899,11 @@ at 384 px; AUROC 0.5 = the cameras cannot be told apart by the statistic; every 
 | | tabletop (BRSET) | handheld (mBRSET) | |
 |---|---|---|---|
 | FOV in model view | circle cut top and bottom, then squashed into the square: aspect 0.80, 88 % fill, Canon's orientation tab | exact digital circle: aspect 1.00, 79 % fill | the loader, not the optics, squashes Canon retinas ~20 % |
-| field of view | | ~1.15x narrower (disc-fovea distance 0.67 vs 0.58 FOV radii); disc at 0.45 vs 0.58 of the radius | |
+| field of view | | ~1.10x narrower (disc-fovea distance 0.67 vs 0.61 FOV radii; the disc radius ratio, 1.15, is an upper bound: phone discs bloom); disc at 0.45 vs 0.58 of the radius | |
 | colour | orange, even | darker brick red; disc blown out to white in 14/16 | |
-| illumination | even (log-field SD 0.15) | tilted (0.40 vs 0.18 log/radius, bright toward the bottom), blotchy (residual 0.15 vs 0.06), redder at the rim (B/R x0.52), bluish haze crescent at the bottom rim in 7-13/16, dark crescents in 7/16 | AUROC 0.90-0.98 |
+| illumination | even (log-field SD 0.15) | tilted (0.62 vs 0.17 log per frame half-width, bright toward the bottom), blotchy (residual 0.16 vs 0.04), redder at the rim (B/R x0.52), bluish haze crescent at the bottom rim in 7-13/16, dark crescents in 7/16 | AUROC 0.95 (tilt), 1.00 (blotch) |
 | sharpness | vessel edge 2.29 px | 2.34 px: not blurrier | the extra high-frequency power is grain |
-| grain | ~0.3 % | 0.86 / 255 at 384, luma-only (R-G 0.89), nearly white | AUROC 0.94-0.99 |
+| grain | ~0.3 % | 0.86 / 255 at 384, luma-only (R-G 0.89), nearly white | AUROC 0.87 |
 | channel structure | R-G 0.61, B-G 0.56 | R-G 0.84, B-G 0.88 (the phone ISP) | AUROC 1.0 |
 | none at 384 | | phone JPEG blocks, chroma subsampling, chromatic aberration, veiling haze | |
 
@@ -921,8 +921,9 @@ disc, aperture), light, colour (green untouched; red and blue pulled toward gree
 structure -- the phone ISP's fingerprint and the strongest single cue a frozen ImageNet network
 found -- then ratio-preserving gains), disc bloom, detail (blur only, <= 0.8 px), grain (size
 and channel correlation calibrated by simulation), rim. A drawn photo's horizontal light and rim are
-mirrored when its disc sits on the other side. Training renders from a 1.5x supersampled view
-so the zoom costs no detail.
+mirrored when its disc sits on the other side. Training renders from the photo's whole FOV,
+1.5x supersampled so the zoom costs no detail -- the view `fit` and `check` measure it on; the
+photos it leaves alone keep the ordinary training crop.
 
 **Label safety, measured not assumed.** Lesion contrast, on dots planted in the real tabletop
 samples (green-channel depth / height against a 6-10 px ring, before vs after): the chosen
@@ -930,28 +931,64 @@ colour stage x0.97 / x0.96; a 3x3 optimal-transport colour map x1.72 / x1.44; a 
 map x1.97 / x1.96; real phones vs tabletop ~x1.1-1.2 (colour measurement). The moment-matching
 maps closed more of the statistical gap (mean 0.17 vs 0.21) but would teach the model that
 phone lesions are MORE conspicuous than tabletop ones, the opposite of what it will meet, so
-they are kept only as ablation modes. Five other candidate designs drew lesion-like structure
+they are kept only as ablation modes. Green is the channel the colour stage leaves alone; red
+and blue take on green's structure, so a small red lesion's luminance contrast rises (planted
+microaneurysm-sized dots, whole chain, medians: luminance x1.4, red x2.2, blue x1.8). Real
+phones move the same way -- their vessel contrast over the tabletop's is x1.65 in luminance,
+x1.9 in red, x6.0 in blue -- and small dark spots' luminance / green contrast reads 0.45
+tabletop, 0.54 real phone, 0.62 simulated: the simulator goes ~15 % further than the phone.
+Five other candidate designs drew lesion-like structure
 on the samples and were dropped (CHANGELOG 2026-10-30): per-channel histogram matching (red
 blotches, purple foveal rings), per-channel illumination gains (a magenta rim ring), a
 luminance-wide highlight curve (white specks on rim reflections), unsharp masking, and
-blotches at half the measured scale (haemorrhage-sized dark patches). The tests check that
-the non-grain stages add no lesion-scale spot to a clean fundus, that planted haemorrhages
-and exudates keep their sign and >= 30 % of their contrast, and that grain lands at the drawn
-photo's level. What the simulator can still remove, as the phone itself does: peripheral
-lesions outside the narrower field (the zoom keeps r < ~0.80 of the Canon FOV), detail on a
-blown-out disc (new vessels on the disc), and faint microaneurysms under grain.
+blotches at half the measured scale (haemorrhage-sized dark patches). The tests (synthetic
+fundi) check that haemorrhages and exudates planted on a tabletop photo keep their sign and
+0.7-1.3x of their relative contrast in red, green and luminance (0.65 at the 0.8 px blur cap;
+both moment-matching maps fail it, as do an unsharp mask and a blur past the cap), that the
+disc bloom changes nothing beyond 1.1 disc radii and leaves a lesion centred at 1.25 radii
+alone, that no stage but the grain adds a lesion-scale spot to a clean fundus more than 2 disc
+radii from the disc (also at the model's size with the field and the bloom on, where 3 %-deep
+microaneurysm-sized dots are found), and that grain lands at the drawn photo's level. At the
+disc's margin (0.9-1.1 radii) a few bright flecks remain on real photos: 4-6 in 48 renders of
+the samples, against 14-20 before the review. What the simulator can still remove: peripheral
+lesions outside its field -- renders keep ~65 % of the Canon FOV's area (r < ~0.76 FOV radii);
+the phone's narrower field alone would keep ~86 %, the rest is the extra zoom the aperture
+needs to clear the truncated Canon frame (median 1.31 on the samples against the fitted 1.10),
+and a dark tabletop FOV edge can push the zoom up to 1.8 (not seen on the samples; the fit
+report counts it) --, detail on a blown-out disc (new vessels on the disc, median x0.5-0.7),
+faint microaneurysms under grain, and the red part of lesions where red saturates (~4 % of the
+simulated retina against ~0.6 % on real phones, mostly where the transferred light brightens a
+Canon photo's already high red; green still carries them).
 
-**Realism on the samples** (cross-fitted, `phone_sim.py fit --validate`): mean
-|AUROC - 0.5| x 2 over 21 statistics falls from 0.59 (tabletop vs real phone) to 0.16
-(simulated vs real phone). Channel-structure fingerprint B-G 0.99 -> 0.29 and R-G 0.75 ->
-0.11, grain 0.86 -> 0.10, disc whiteout (clipped) 0.13 -> 0.10, tilt 0.91 -> 0.23, shadowed
-area 0.59 -> 0.03, blotchiness 0.91 -> 0.44 (kept on the low side on purpose: finer or
-stronger blotch fields drew banding and haemorrhage-like patches). Through a frozen ImageNet ResNet-18 (camera classifier on
+**Review (31 October).** A review (geometry, photometry, integration and leakage, label
+safety, GPU cost, tests), every finding above nit level reproduced by a second check, found
+these problems, now fixed (CHANGELOG 2026-10-31): (1) training never used the view the
+simulator had been measured on -- the trainer handed it the random-resized training crop,
+which cuts a Canon frame's FOV on all four sides, so the FOV ellipse could not be read and
+simulated training retinas came out ~14 % wide (now: the whole-FOV view, from the same
+decode); (2) the disc bloom reached 1.3 disc radii and made peripapillary haemorrhages and
+exudates up to 2-4x more conspicuous, and on a PDR eye a laser-scar patch took the disc's
+place on every training view and was bloomed white (now: the disc only, and no disc-keyed
+step when the pick is ambiguous); (3) `fit` crashed on any GPU; (4) the 576 -> 384 warp
+aliased texture into crisper, microaneurysm-like dots; (5) nothing stopped a profile fitted on
+another split, or holding handheld test photos, from reaching training (now refused), and
+ablations could only be chosen on the decision split (now `PART=val`). The fixes cost
+the sample realism a little (below): the bloom now stops at the disc, so the simulated photos
+clip less than the phone's, and the warp no longer manufactures mid-band detail.
+
+**Realism on the samples** (cross-fitted, `phone_sim.py fit --validate`, refitted after the
+review): mean |AUROC - 0.5| x 2 over 21 statistics falls from 0.59 (tabletop vs real phone)
+to 0.18 (simulated vs real phone; 0.16 before the review's fixes). Channel-structure
+fingerprint B-G 1.00 -> 0.30 and R-G 0.80 -> 0.16, grain 0.74 -> 0.09, tilt 0.91 -> 0.15,
+shadowed area 0.59 -> 0.02, blotchiness 0.99 -> 0.46 (kept on the low side on purpose: finer
+or stronger blotch fields drew banding and haemorrhage-like patches), disc whiteout (clipped)
+0.13 -> 0.16 (the simulated photos now clip less than the phone's: 1.3 % vs 2.1 % of the FOV).
+Through a frozen ImageNet ResNet-18 (camera classifier on
 whole-view and interior-patch embeddings, bank and classifier cross-fitted on disjoint phone
 halves): p(phone) 0.06 tabletop -> 0.61 simulated (real phone held out 0.84), embedding MMD^2
-to the phone 0.114 -> 0.058 (phone-vs-phone floor 0.027) -- about 70 % and 64 % of the gap;
-the colour stage does most of it (MMD^2 0.117 -> 0.083), then the disc bloom, grain and field.
-The fixed classifier still scores simulated below real (AUROC 0.20 against 0.5 for
+to the phone 0.114 -> 0.063 (phone-vs-phone floor 0.027) -- about 70 % and 58 % of the gap;
+the colour stage does most of it (MMD^2 0.116 -> 0.084), then the disc bloom, grain and field.
+The fixed classifier still scores simulated below real (AUROC 0.19 against 0.5 for
 indistinguishable): the simulator is closer, not identical. With 8-row half banks and 16 tabletop photos this is a
 smoke test of the machinery, not a result; the real reading is `fit_report.txt` from the full
 train split and `style_transfer_xfer.py check` (the trunk's own camera probe and BN-statistics
@@ -960,13 +997,21 @@ distance).
 **Next run (lab box).**
 
 ```bash
-B=<BRSET root> M=<mBRSET root> bash run_phone_sim.sh 0                   # fit, check, train, score
-B=<BRSET root> M=<mBRSET root> STAGES="train score" bash run_phone_sim.sh 1 2 3 4
+cd ~/Oculomics && git pull && mkdir -p exp_phone_sim
+B=<BRSET root> M=<mBRSET root> bash run_phone_sim.sh 0 2>&1 | tee -a exp_phone_sim/run.log                      # fit, check, train, score
+B=<BRSET root> M=<mBRSET root> STAGES="train score" bash run_phone_sim.sh 1 2 3 4 2>&1 | tee -a exp_phone_sim/run.log
 ```
 
 Decision rule, read on `exp_phone_sim/score/score_summary.txt` (phone test, `calibrated`
-protocol, mean over seeds, paired with the Canon sweep): Canon + simulated phone photos
+protocol, mean over seeds and the per-seed difference paired with the Canon sweep; the score
+stage scores every seed both sweeps have): Canon + simulated phone photos
 reaching oracle specificity >= 0.825 at 0.85 sensitivity (the IDx-DR line; Canon-only ~0.79,
 mixed with real phone photos 0.86) means the gap is learnable from the tabletop photos alone;
 no gain means the simulator misses what matters (check the camera probe in `check`), and a
-drop on the Canon test means p is too high.
+drop on the Canon test means p is too high. Ablations (`P` 0.25 / 0.75, `STRENGTH` 0.5,
+`FIT_EXTRA="--colour-mode mk"`, `FIT_EXTRA="--select icdr0"`, each with a fresh `ARM_OUT` /
+`ARM_CK`, and a fresh `CK` for a profile) are compared on the validation split with `PART=val`
+(the commands are in `run_phone_sim.sh`'s header); there the tabletop rows are in-sample --
+that split chose each arm's epoch and threshold -- so the Canon side of a choice is a guard
+only. The chosen arm is then read on test once (`FINAL=1 STAGES=score`); the trainer's own
+handheld test numbers for each arm are not consulted while choosing.
