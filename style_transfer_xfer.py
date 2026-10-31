@@ -25,6 +25,8 @@ colour        per-channel mean / SD matched to a random unlabelled handheld imag
 fda           Fourier low-frequency amplitude from that image (3x3 block by default)
 fda_sharp     + blur until the Laplacian variance matches that reference
 fda_geo       + the handheld field of view (centre zoom, full circular aperture)
+phone_sim     the measured handheld imaging chain (``phone_sim.py``, ``--phone-profile``),
+              rendered from a supersampled view as in training
 cyc_naive     CycleGAN, all tabletop train images vs all handheld train images
 cyc_matched   CycleGAN, pairs drawn at the SAME ICDR grade, tabletop side
               restricted to diabetic patients, both sides at the handheld set's
@@ -54,7 +56,14 @@ Label preservation (did the translation edit the disease?):
   vessel_r     correlation of the vessel line-detector response before and after.
 
 ``score`` (after retraining on a translated copy): the retrained model on the
-REAL handheld and REAL tabletop test splits, at its own shipped threshold.
+REAL handheld and REAL tabletop test splits, at its own shipped threshold, and the
+test-oracle specificity at ``--target-sens`` (``train_phone_ceiling.py``'s reading:
+where the ROC curve itself crosses the target sensitivity).
+
+A checkpoint trained on one tabletop camera (``--source-camera``) is checked and
+scored on that camera's own split: the table is filtered before it is split, as
+the trainer did, so its tabletop test rows hold neither the other camera nor any
+of its own training patients.
 """
 from __future__ import annotations
 
@@ -87,16 +96,21 @@ from vessel_ablation import fov_mask, vessel_response, window_for  # noqa: E402
 
 PRIMARY = "dr_referable"
 STYLE_ONLY = ("colour", "fda", "fda_sharp", "fda_geo")
+SIMULATED = ("phone_sim",)
 
 
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
 def load_device(root: str, dataset: str, size: int, split_seed: int,
-                targets: Sequence[str] = (PRIMARY,)) -> Dict[str, object]:
-    """The trainer's own patient split (``multitask_split`` on referable DR), so
-    'train' here is 'train' there and the test patients are untouched."""
+                targets: Sequence[str] = (PRIMARY,), camera: Optional[str] = None) -> Dict[str, object]:
+    """The trainer's own patient split (``multitask_split`` on referable DR, after
+    the run's ``--source-camera`` filter when it had one), so 'train' here is
+    'train' there and the test patients are untouched."""
     df, csv = load_table(root, dataset)
+    if camera:
+        from brset_dataset import filter_camera
+        df = filter_camera(df, camera.strip())
     split = multitask_split(df, PRIMARY, seed=split_seed)
     img = load_any(root, dataset)["images_dir"]
     out: Dict[str, object] = {"csv": csv, "images_dir": img}
@@ -222,7 +236,8 @@ def parse_named(items: Sequence[str]) -> Dict[str, str]:
 
 
 def build_stylizer(name: str, bank: Optional[ReferenceBank], translators: Dict[str, str],
-                   dev: torch.device, beta: float, zoom: float) -> Stylizer:
+                   dev: torch.device, beta: float, zoom: float, phone_profile: Optional[str] = None,
+                   phone_strength: float = 1.0, out_size: Optional[int] = None) -> Stylizer:
     if name == "identity":
         return Stylizer()
     if name in STYLE_ONLY:
@@ -230,11 +245,24 @@ def build_stylizer(name: str, bank: Optional[ReferenceBank], translators: Dict[s
             raise ValueError(f"{name} needs handheld reference images (--target-root)")
         return FDAStylizer(bank, beta, sharp=name in ("fda_sharp", "fda_geo"),
                            zoom=zoom if name == "fda_geo" else 0.0, colour_only=name == "colour")
+    if name in SIMULATED:
+        if not phone_profile:
+            raise ValueError(f"{name} needs --phone-profile (phone_sim.py fit)")
+        from phone_sim import PhoneProfile, PhoneSimulator
+        return PhoneSimulator(PhoneProfile.load(phone_profile), strength=phone_strength, out_size=out_size)
     if name in translators:
         state = torch.load(translators[name], map_location="cpu", weights_only=False)
         return CycleStylizer(generator_from_state(state).to(dev), name)
-    raise ValueError(f"unknown method {name!r}; style-only: {STYLE_ONLY}; translators given: "
-                     f"{sorted(translators)}")
+    raise ValueError(f"unknown method {name!r}; style-only: {STYLE_ONLY}; simulated: {SIMULATED}; "
+                     f"translators given: {sorted(translators)}")
+
+
+def supersample_of(phone_profile: Optional[str]) -> float:
+    """How much larger a view ``phone_sim`` renders from (the profile's; 1 without one)."""
+    if not phone_profile:
+        return 1.0
+    from phone_sim import PhoneProfile
+    return float(PhoneProfile.load(phone_profile).params.get("supersample", 1.5))
 
 
 # --------------------------------------------------------------------------- #
@@ -353,12 +381,19 @@ def cmd_check(a) -> int:
         m = build_from_checkpoint(ck)
         set_bn_stats(m, stats_from_lists(ck["profiles"][dname]["bn_stats"]))
         models[name] = m.to(dev).eval()
+    camera = args.get("source_camera")
     src = load_device(a.source_root or args["source_root"], args["source_dataset"], size,
-                      int(args["split_seed"]))
+                      int(args["split_seed"]), camera=camera)
     tgt = load_device(a.target_root or args["target_root"], args["target_dataset"], size,
                       int(args["split_seed"]))
     translators = parse_named(a.translator)
     methods = ["identity"] + [m for m in a.methods if m != "identity"] + sorted(translators)
+    if a.phone_profile and "phone_sim" not in methods:
+        methods.append("phone_sim")
+    # phone_sim renders from a supersampled view of the same test rows (as in training)
+    src_hi = (load_device(a.source_root or args["source_root"], args["source_dataset"],
+                          int(round(size * supersample_of(a.phone_profile))), int(args["split_seed"]),
+                          camera=camera) if any(m in SIMULATED for m in methods) else src)
     bank = reference_bank(tgt["train"], a.bank, seed, a.num_workers)
     print(f"[check] {a.ckpt} (seed {seed}, {size}px) on {dev}; methods {methods}; "
           f"{len(bank)} handheld references; shipped threshold {thr:.3f}")
@@ -437,13 +472,14 @@ def cmd_check(a) -> int:
     grid: Dict[str, torch.Tensor] = {}
     show = np.concatenate([np.flatnonzero(g_ste == 0)[:a.grid_n // 2],
                            np.flatnonzero(y_ste == 1)[:a.grid_n - a.grid_n // 2]])
-    show_x = torch.stack([src["test"][int(i_ste[j])]["image"] for j in show]) if len(show) else None
     for name in methods:
-        sty = build_stylizer(name, bank, translators, dev, a.beta, a.zoom)
-        R = run(s_te, sty)
+        sty = build_stylizer(name, bank, translators, dev, a.beta, a.zoom, a.phone_profile, a.phone_strength,
+                             out_size=size)
+        ds_te = (src_hi if name in SIMULATED else src)["test"]
+        R = run(Subset(ds_te, s_te.indices) if isinstance(s_te, Subset) else ds_te, sty)
         extra = {}
         if n_cal >= 2:
-            st = _stats_of(models["tab"], src["test"], i_ste[z0s_cal], sty, dev, a, seed)
+            st = _stats_of(models["tab"], ds_te, i_ste[z0s_cal], sty, dev, a, seed)
             extra["cam_dist"] = camera_distance(st, hh_a)
         if base is None:
             base = R
@@ -452,9 +488,10 @@ def cmd_check(a) -> int:
         extra["dlogit_referable"] = float(d[y_ste == 1].mean()) if (y_ste == 1).any() else np.nan
         rows.append({"method": name, **summarise(R, y_ste, g_ste, dm_ste, extra)})
         print(f"  {name}: done")
-        if show_x is not None:
+        if len(show):
+            show_x = torch.stack([ds_te[int(i_ste[j])]["image"] for j in show])
             grid[name] = sty(denorm(show_x.to(dev)), torch.Generator().manual_seed(seed))
-    if show_x is not None:
+    if len(show):
         tt = np.concatenate([np.flatnonzero(g_tte == 0)[:a.grid_n // 2],
                              np.flatnonzero(y_tte == 1)[:a.grid_n - a.grid_n // 2]])
         if len(tt) == len(show):
@@ -502,13 +539,16 @@ def cmd_export(a) -> int:
     dev = pick_device() if a.device == "auto" else torch.device(a.device)
     df, csv = load_table(a.source_root, a.source_dataset)
     img_dir = load_any(a.source_root, a.source_dataset)["images_dir"]
-    ds = MultiTargetDataset(df, img_dir, [PRIMARY], "val", a.image_size)
+    size_in = (int(round(a.image_size * supersample_of(a.phone_profile))) if a.method in SIMULATED
+               else a.image_size)
+    ds = MultiTargetDataset(df, img_dir, [PRIMARY], "val", size_in)
     translators = parse_named(a.translator)
     bank = None
     if a.method in STYLE_ONLY:
         tgt = load_device(a.target_root, a.target_dataset, a.image_size, a.split_seed)
         bank = reference_bank(tgt["train"], a.bank, a.seed, a.num_workers)     # train patients only
-    sty = build_stylizer(a.method, bank, translators, dev, a.beta, a.zoom)
+    sty = build_stylizer(a.method, bank, translators, dev, a.beta, a.zoom, a.phone_profile, a.phone_strength,
+                         out_size=a.image_size)
     out_img = os.path.join(a.out_root, os.path.basename(img_dir.rstrip("/")))
     os.makedirs(out_img, exist_ok=True)
     shutil.copy(csv, os.path.join(a.out_root, os.path.basename(csv)))
@@ -524,6 +564,7 @@ def cmd_export(a) -> int:
     with open(os.path.join(a.out_root, "style_transfer.json"), "w") as f:
         json.dump({"method": a.method, "n_images": n, "image_size": a.image_size, "source_csv": csv,
                    "translator": translators.get(a.method), "beta": a.beta, "zoom": a.zoom,
+                   "phone_profile": a.phone_profile, "phone_strength": a.phone_strength,
                    "seed": a.seed}, f, indent=2)
     print(f"[export:{a.method}] {n} images -> {out_img} (labels: {os.path.basename(csv)})")
     return 0
@@ -545,9 +586,10 @@ def cmd_score(a) -> int:
         k = net.targets.index(PRIMARY)
         for cam_name, root, dset in (("tabletop", a.source_root, args["source_dataset"]),
                                      ("handheld", a.target_root, args["target_dataset"])):
-            key = (root, dset, size, int(args["split_seed"]))
+            camera = args.get("source_camera") if cam_name == "tabletop" else None
+            key = (root, dset, size, int(args["split_seed"]), camera)
             if key not in cache:
-                cache[key] = load_device(root, dset, size, int(args["split_seed"]))["test"]
+                cache[key] = load_device(root, dset, size, int(args["split_seed"]), camera=camera)["test"]
             ds = cache[key]
             y = ds.label_array()[:, 0]
             profile = args["source_name"] if cam_name == "tabletop" else args["target_name"]
@@ -561,21 +603,25 @@ def cmd_score(a) -> int:
                 thr = ck["thresholds"][proto].get(PRIMARY)
                 fin = np.isfinite(y)
                 yy, pp = y[fin].astype(int), p[fin]
+                orc = threshold_at_sensitivity(yy, pp, a.target_sens)
                 rows.append({"arm": arm, "seed": seed, "camera": cam_name, "protocol": proto,
                              "ckpt": os.path.basename(path), "n": int(fin.sum()),
                              "auroc": _auc(yy, pp), "threshold": thr,
                              "sensitivity": float((pp[yy == 1] >= thr).mean()) if thr is not None else np.nan,
                              "specificity": float((pp[yy == 0] < thr).mean()) if thr is not None else np.nan,
                              "flagged": float((pp >= thr).mean()) if thr is not None else np.nan,
+                             "oracle_spec": float((pp[yy == 0] < orc).mean()) if orc == orc else np.nan,
                              "prevalence": float(yy.mean())})
         print(f"  scored {arm} seed {seed}")
     df = pd.DataFrame(rows)
     df.to_csv(os.path.join(a.out, "score.csv"), index=False)
-    g = (df.groupby(["camera", "protocol", "arm"])[["auroc", "sensitivity", "specificity", "flagged"]]
+    g = (df.groupby(["camera", "protocol", "arm"])[["auroc", "sensitivity", "specificity", "flagged",
+                                                     "oracle_spec"]]
          .agg(["mean", "min", "max"]).round(3))
-    txt = ("\nRETRAINED ON A TRANSLATED TABLETOP SET, SCORED ON THE REAL CAMERAS "
+    txt = ("\nRETRAINED ON A TRANSLATED / SIMULATED TABLETOP SET, SCORED ON THE REAL CAMERAS "
            f"(referable DR, seeds {sorted(df.seed.unique().tolist())}; threshold fixed on the "
-           "arm's own tabletop validation split)\n" + g.to_string())
+           f"arm's own tabletop validation split; oracle_spec = specificity where the test ROC "
+           f"crosses sensitivity {a.target_sens})\n" + g.to_string())
     print(txt)
     with open(os.path.join(a.out, "score_summary.txt"), "w") as f:
         f.write(txt + "\n")
@@ -608,6 +654,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         q.add_argument("--beta", type=float, default=0.003,
                        help="FDA low-frequency window, fraction of the side (0.01 blotches at 384 px)")
         q.add_argument("--zoom", type=float, default=1.15, help="fda_geo centre zoom")
+        q.add_argument("--phone-profile", default=None,
+                       help="phone_sim.py profile; adds the phone_sim method to check")
+        q.add_argument("--phone-strength", type=float, default=1.0)
 
     q = sub.add_parser("fit", help="train one CycleGAN translator")
     common(q)
@@ -647,6 +696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     q = sub.add_parser("score", help="retrained checkpoints on the real test splits")
     common(q)
     q.add_argument("--ckpt", nargs="+", required=True, metavar="ARM=CKPT")
+    q.add_argument("--target-sens", type=float, default=0.85, help="the oracle operating point")
     q.add_argument("--out", default="exp_style/score")
     q.set_defaults(fn=cmd_score)
 
@@ -655,6 +705,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.error(f"{a.cmd} needs --target-root")
     if a.cmd == "export" and a.method in STYLE_ONLY and not a.target_root:
         p.error(f"export --method {a.method} needs --target-root (handheld reference images)")
+    if a.cmd in ("check", "export") and getattr(a, "method", None) in SIMULATED and not a.phone_profile:
+        p.error(f"--method {a.method} needs --phone-profile")
+    if a.cmd == "check" and any(m in SIMULATED for m in a.methods) and not a.phone_profile:
+        p.error("--methods phone_sim needs --phone-profile")
     return a.fn(a)
 
 

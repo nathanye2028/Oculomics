@@ -83,6 +83,13 @@ Pipeline (one seed)
    so no held-out patient was ever in training. Messidor-2 is refused as
    ``--unfamiliar``: it is the once-only external test, scored by the frozen
    checkpoint after the analysis freeze, never inside a training run.
+13. **Simulated phone photos** (``--phone-sim <profile.json>``, ``phone_sim.py``):
+   in stage 1, each source training photo is re-rendered as a handheld one with
+   probability ``--phone-sim-p`` (default 0.5) at ``--phone-sim-strength``, from a
+   view ``supersample`` times the image size (the profile's), before the
+   device-side augmentation; the device-side path is switched on for it. No
+   handheld photo or label enters training: the profile holds statistics of
+   unlabelled handheld train-split photos only.
 
 Outputs (``--out``): ``results.json``, ``capability.csv``,
 ``calibration_sweep.csv``, ``operating_point.csv``, ``quality_strata.csv``,
@@ -273,7 +280,7 @@ def sensitivity_ci(y: np.ndarray, p: np.ndarray, groups: np.ndarray, thr: float,
 
 
 def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict], audits,
-                  targets: Sequence[str], nS: int, holdout=None) -> int:
+                  targets: Sequence[str], nS: int, holdout=None, phone_sim=None) -> int:
     """Minutes, not hours: everything the full run depends on, checked before the
     GPU time is spent. Data (roots, encodings, images on disk, test-split power
     per target and device, unfamiliar cameras incl. a held-out source camera), the
@@ -316,13 +323,22 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
     dev_aug = DeviceAug() if (a.gpu_aug if a.gpu_aug is not None else dev.type == "cuda") else None
     cuda = dev.type == "cuda"
-    losses, t_steps = [], []
+    losses, t_steps, t_sim = [], [], []
     it = iter(train_loader)
+    psim_gen = torch.Generator().manual_seed(a.seed + 7919)
     for step in range(3):
         b = next(it)
         t0 = time.time()
         x = b["image"].to(dev, non_blocking=cuda)
         y = b["label"][:, :nS].contiguous().to(dev, non_blocking=cuda)
+        if phone_sim is not None:
+            ts = time.time()
+            x = phone_sim.augment(x, a.phone_sim_p, psim_gen, out_size=a.image_size)
+            if cuda:
+                torch.cuda.synchronize()
+            t_sim.append(time.time() - ts)
+            if not torch.isfinite(x).all() or tuple(x.shape[-2:]) != (a.image_size, a.image_size):
+                problems.append(f"phone_sim produced {tuple(x.shape)} / non-finite pixels")
         if dev_aug is not None:
             x = dev_aug(x)
         opt.zero_grad(set_to_none=True)
@@ -341,6 +357,9 @@ def run_preflight(a, model, dev, train_loader, loaders, datasets: Dict[str, dict
     bad = [v for v in losses if not (0.0 <= v < 20.0)]
     print(f"  training steps on {dev}: losses {[round(v, 3) for v in losses]}  "
           f"({a.batch_size / np.mean(t_steps[1:]):.0f} img/s after warm-up, incl. transfer)")
+    if t_sim:
+        print(f"  phone_sim: {1000 * np.mean(t_sim[1:]):.0f} ms per batch of {a.batch_size} "
+              f"(p {a.phone_sim_p}) of the step time above")
     if bad:
         problems.append(f"implausible training loss {bad} on {dev}: labels or inputs are corrupted")
     model.eval()
@@ -476,6 +495,13 @@ def main(argv: Sequence[str] = None) -> int:
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--gpu-aug", dest="gpu_aug", action="store_true", default=None)
     p.add_argument("--no-gpu-aug", dest="gpu_aug", action="store_false")
+    p.add_argument("--phone-sim", default=None, metavar="PROFILE",
+                   help="phone_sim.py profile: re-render source training photos as handheld ones "
+                        "(switches the device-side augmentation path on)")
+    p.add_argument("--phone-sim-p", type=float, default=0.5,
+                   help="fraction of source training photos re-rendered, per draw")
+    p.add_argument("--phone-sim-strength", type=float, default=1.0,
+                   help="0 = handheld aperture only, 1 = the measured handheld camera")
     p.add_argument("--nondeterministic", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -543,6 +569,21 @@ def main(argv: Sequence[str] = None) -> int:
         raise SystemExit("[fatal] --source-root and --target-root are the same directory")
     if a.calib_batch < 2:
         raise SystemExit("[fatal] --calib-batch must be >= 2 (train-mode BN needs a batch)")
+    phone_sim = None
+    if a.phone_sim:
+        if not 0.0 < a.phone_sim_p <= 1.0:
+            raise SystemExit("[fatal] --phone-sim-p must be in (0, 1]")
+        from phone_sim import PhoneProfile, PhoneSimulator
+        try:
+            phone_sim = PhoneSimulator(PhoneProfile.load(a.phone_sim), strength=a.phone_sim_strength,
+                                       out_size=a.image_size)
+            phone_sim.check_size(a.image_size)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"[fatal] --phone-sim: {e}")
+        if a.gpu_aug is False:
+            print("[phone-sim] --no-gpu-aug overridden: the simulator runs before the device-side "
+                  "augmentation (on any device)")
+        a.gpu_aug = True
     if a.holdout_camera and not a.source_camera:
         raise SystemExit("[fatal] --holdout-camera needs --source-camera: without it the held-out "
                          "camera's images are in the training split")
@@ -617,9 +658,16 @@ def main(argv: Sequence[str] = None) -> int:
     targets = list(a.source_targets) + list(a.probe_targets)
 
     gpu_aug = a.gpu_aug if a.gpu_aug is not None else dev.type == "cuda"
+    # the simulator zooms into the photo: it renders from a supersampled training view
+    train_size = (int(round(a.image_size * float(phone_sim.profile.params["supersample"])))
+                  if phone_sim is not None else a.image_size)
     mk = lambda name, part, split: MultiTargetDataset(
-        splits[name][part], img_dirs[name], targets, split, a.image_size,
-        device_aug=gpu_aug and split == "train")
+        splits[name][part], img_dirs[name], targets, split,
+        train_size if split == "train" else a.image_size, device_aug=gpu_aug and split == "train")
+    if phone_sim is not None:
+        print(f"[phone-sim] {a.phone_sim}: {len(phone_sim.profile)} handheld photos in the bank; "
+              f"p {a.phone_sim_p}, strength {a.phone_sim_strength}; training views {train_size} px -> "
+              f"{a.image_size} px")
     src_train, src_val, src_test = mk(S, "train", "train"), mk(S, "val", "val"), mk(S, "test", "val")
     tgt_train, tgt_val, tgt_test = mk(T, "train", "val"), mk(T, "val", "val"), mk(T, "test", "val")
     src_pool = torch.utils.data.ConcatDataset([mk(S, "train", "val"), src_val])
@@ -665,7 +713,8 @@ def main(argv: Sequence[str] = None) -> int:
         return run_preflight(a, model, dev, train_loader, loaders,
                              {S: {"pool": src_pool, "test": src_test, "val": src_val},
                               T: {"pool": tgt_pool, "test": tgt_test, "val": tgt_val}},
-                             audits, targets, nS, holdout=holdout)
+                             audits, targets, nS, holdout=holdout, phone_sim=phone_sim)
+    psim_gen = torch.Generator().manual_seed(a.seed + 7919)
     ema = ModelEMA(model, a.ema_decay) if a.ema_decay > 0 else None
     use_amp = a.amp if a.amp is not None else dev.type == "cuda"
     amp_dtype = torch.float16 if dev.type == "cuda" else torch.bfloat16
@@ -696,6 +745,8 @@ def main(argv: Sequence[str] = None) -> int:
             x = b["image"].to(dev, non_blocking=cuda)
             # the label slice is strided: never a non-blocking copy off CUDA (see predict)
             y = b["label"][:, :nS].contiguous().to(dev, non_blocking=cuda)
+            if phone_sim is not None:
+                x = phone_sim.augment(x, a.phone_sim_p, psim_gen, out_size=a.image_size)
             if dev_aug is not None:
                 x = dev_aug(x)
             opt.zero_grad(set_to_none=True)
