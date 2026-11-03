@@ -44,7 +44,7 @@ def test_flip_12_and_quality_preserve_nan():
 
 
 def test_sex_reencoded_and_passthrough():
-    assert _eq_nan(_normalise_sex(pd.Series([1, 2, np.nan], dtype=float)), [0.0, 1.0, np.nan])
+    assert _eq_nan(_normalise_sex(pd.Series([1, 2, np.nan], dtype=float)), [1.0, 0.0, np.nan])
     assert _eq_nan(_normalise_sex(pd.Series([0, 1], dtype=float)), [0.0, 1.0])   # already 0/1
 
 

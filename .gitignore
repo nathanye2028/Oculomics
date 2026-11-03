@@ -17,6 +17,10 @@ exp_ceiling*/
 exp_kd*/
 exp_precision/
 exp_xfer*/
+# every sweep output dir (exp_systemic, exp_ophthalmic, exp_glaucoma, ...). Git has no
+# inline comments: a comment on the pattern's line becomes part of the pattern. Files
+# already tracked stay tracked; a new summary worth keeping needs `git add -f`.
+exp_*/
 results/
 deploy/
 runs/
@@ -37,6 +41,12 @@ slurm-*.out
 # Datasets — never commit. FGADR is ~4 GB zipped and its licence forbids
 # redistribution (non-commercial research use only; see data/fgadr/Readme.txt).
 data/
+# style_transfer_xfer.py export: a re-rendered copy of the tabletop set and its labels
+data_style/
 *.zip
 *.tar
 *.tar.gz
+
+# Swift package build products (app/RetinaReachKit)
+.build/
+.swiftpm/
