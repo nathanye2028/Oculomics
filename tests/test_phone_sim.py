@@ -444,6 +444,71 @@ def test_the_aperture_shows_no_black_from_outside_the_tabletop_fov():
         assert int(((y.amax(dim=1, keepdim=True) < 1e-3) & inner).sum()) == 0
 
 
+def test_the_whole_field_keeps_the_lesions_the_phone_field_crops():
+    """FIELD whole (the ablation): zoom 1 and no framing shift, so a blot at the edge
+    of the tabletop FOV survives where the phone field's clearing zoom (~1.25 on the
+    fixture) crops it; at strength 0 both are pure geometry, so with and without the
+    blot differ only where the blot lands."""
+    size = 96
+    prof = _profile_at(size)
+    blot = [(-0.88, 0.0, 3.0, (-0.25, -0.12, -0.04))]                      # inside the FOV, near its left edge
+    clean, les = _fundus(2, int(1.5 * size), seed=3), _fundus(2, int(1.5 * size), seed=3, lesions=blot)
+    shown = {}
+    for field in ps.FIELDS:
+        sim = ps.PhoneSimulator(prof, strength=0.0, out_size=size, field=field)
+        y_c = sim(clean, torch.Generator().manual_seed(4))
+        y_l = sim(les, torch.Generator().manual_seed(4))
+        shown[field] = float((y_c - y_l).abs().amax())
+        zoom = sim._last["zoom"]
+        assert (zoom == 1).all() if field == "whole" else (zoom >= 1.2).all()
+    assert shown["whole"] > 0.1 and shown["phone"] < 0.01
+    with pytest.raises(ValueError, match="field"):
+        ps.PhoneSimulator(prof, field="wide")
+
+
+def test_the_whole_field_keeps_outside_the_fov_black_and_the_bloom_on():
+    """Inside the aperture, what lies outside a truncated tabletop FOV (its flat top and
+    bottom: |y| > 0.8 in the fixture once un-squashed) stays black through the colour
+    map and the rim haze, at full strength; the disc is still found and bloomed."""
+    size = 96
+    prof = _bloomed(_profile_at(size))
+    x = _fundus(4, int(1.5 * size), seed=11)
+    sim = ps.PhoneSimulator(prof, out_size=size, field="whole")
+    y = sim(x, torch.Generator().manual_seed(5))
+    xx, yy = ps.frame_coords(4, size, size, "cpu")
+    chord = ((yy.abs() > 0.9) & (xx.abs() < 0.2) & (xx ** 2 + yy ** 2 < 0.97 ** 2)).unsqueeze(1)
+    assert int(chord.sum()) > 0 and float(y.amax(dim=1, keepdim=True)[chord].max()) < 1e-3
+    inner = (xx ** 2 + yy ** 2 < 0.5 ** 2).unsqueeze(1)
+    assert float(y.amax(dim=1, keepdim=True)[inner].min()) > 0.02             # the retina itself is there
+    assert (sim._last["disc_conf"] > 0).all() and not sim._last["clear"].any()
+    no_bloom = ps.PhoneSimulator(prof, out_size=size, field="whole",
+                                 stages=[s for s in ps.STAGES if s != "bloom"])
+    assert (y - no_bloom(x, torch.Generator().manual_seed(5))).abs().max() > 0.1
+
+
+def test_the_trainer_hands_the_field_to_the_simulator(tmp_path, monkeypatch):
+    from train_retinareach import main as train
+    prof_path = tmp_path / "profile.json"
+    _profile_at(64).save(str(prof_path))
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def init(self, *args, **kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(ps.PhoneSimulator, "__init__", init)
+    roots = ["--source-root", str(tmp_path / "b"), "--target-root", str(tmp_path / "m"), "--phone-sim", str(prof_path)]
+    for extra, want in (([], "phone"), (["--phone-sim-field", "whole"], "whole")):
+        with pytest.raises(Stop):
+            train(roots + extra)
+        assert seen["field"] == want
+    with pytest.raises(SystemExit):
+        train(roots + ["--phone-sim-field", "wide"])
+
+
 def test_grain_lands_on_the_drawn_photos_noise_level():
     prof = _profile(size=96)
     sim = ps.PhoneSimulator(prof, stages=("noise",), out_size=96)
@@ -624,6 +689,7 @@ def test_trainer_check_and_score_with_phone_sim(tmp_path, monkeypatch):
     res = json.loads((tmp_path / "out_arm" / "results.json").read_text())
     assert res["args"]["phone_sim"] == str(prof_path) and res["args"]["gpu_aug"] is True
     assert res["phone_sim_profile"]["train_size"] == 96 and len(res["phone_sim_profile"]["sha256"]) == 64
+    assert res["args"]["phone_sim_field"] == "phone" and res["phone_sim_profile"]["field"] == "phone"
 
     # a profile from another split, holding a handheld val / test photo, or naming a photo
     # this run's handheld train split does not have, is refused
@@ -644,6 +710,13 @@ def test_trainer_check_and_score_with_phone_sim(tmp_path, monkeypatch):
     df = pd.read_csv(out / "check.csv").set_index("method")
     assert "phone_sim" in df.index and np.isfinite(df.loc["phone_sim", "tab_auroc"])
     assert 0 <= df.loc["phone_sim", "vessel_r"] <= 1 and (out / "grid.jpg").exists()
+    assert "strength 1.0, field phone" in (out / "check_summary.txt").read_text()
+    out_w = tmp_path / "check_whole"
+    assert xfer(["check", "--ckpt", str(base), "--methods", "colour", "--phone-profile", str(prof_path),
+                 "--phone-field", "whole", "--out", str(out_w), "--bank", "8", "--calib-n", "8", "--calib-batch", "4",
+                 "--grid-n", "4", "--num-workers", "0", "--batch-size", "8", "--device", "cpu"]) == 0
+    assert "field whole" in (out_w / "check_summary.txt").read_text()
+    assert np.isfinite(pd.read_csv(out_w / "check.csv").set_index("method").loc["phone_sim", "tab_auroc"])
 
     sc = tmp_path / "score"
     score = ["score", "--source-root", str(B), "--target-root", str(M), "--num-workers", "0", "--device", "cpu",
@@ -656,6 +729,7 @@ def test_trainer_check_and_score_with_phone_sim(tmp_path, monkeypatch):
     assert n_canon_test != len(load_device(str(B), "brset", 64, 42)["test"])
     summary = (sc / "score_summary.txt").read_text()
     assert "PAIRED: canon_phonesim minus canon_only" in summary and "phone_sim p 0.5, strength 1.0" in summary
+    assert "field phone" in summary and (s[s.arm == "canon_phonesim"].phone_sim_field == "phone").all()
     assert (s[s.arm == "canon_phonesim"].phone_sim_sha256 == res["phone_sim_profile"]["sha256"]).all()
     assert xfer(score + ["--part", "val", "--out", str(tmp_path / "score_val")]) == 0      # ablations choose here
     assert "val split" in (tmp_path / "score_val" / "score_summary.txt").read_text()

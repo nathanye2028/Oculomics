@@ -238,7 +238,8 @@ def parse_named(items: Sequence[str]) -> Dict[str, str]:
 
 def build_stylizer(name: str, bank: Optional[ReferenceBank], translators: Dict[str, str],
                    dev: torch.device, beta: float, zoom: float, phone_profile: Optional[str] = None,
-                   phone_strength: float = 1.0, out_size: Optional[int] = None) -> Stylizer:
+                   phone_strength: float = 1.0, out_size: Optional[int] = None,
+                   phone_field: str = "phone") -> Stylizer:
     if name == "identity":
         return Stylizer()
     if name in STYLE_ONLY:
@@ -250,7 +251,8 @@ def build_stylizer(name: str, bank: Optional[ReferenceBank], translators: Dict[s
         if not phone_profile:
             raise ValueError(f"{name} needs --phone-profile (phone_sim.py fit)")
         from phone_sim import PhoneProfile, PhoneSimulator
-        return PhoneSimulator(PhoneProfile.load(phone_profile), strength=phone_strength, out_size=out_size)
+        return PhoneSimulator(PhoneProfile.load(phone_profile), strength=phone_strength, out_size=out_size,
+                              field=phone_field)
     if name in translators:
         state = torch.load(translators[name], map_location="cpu", weights_only=False)
         return CycleStylizer(generator_from_state(state).to(dev), name)
@@ -487,7 +489,7 @@ def cmd_check(a) -> int:
                            np.flatnonzero(y_ste == 1)[:a.grid_n - a.grid_n // 2]])
     for name in methods:
         sty = build_stylizer(name, bank, translators, dev, a.beta, a.zoom, a.phone_profile, a.phone_strength,
-                             out_size=size)
+                             out_size=size, phone_field=a.phone_field)
         ds_te = (src_hi if name in SIMULATED else src)["test"]
         R = run(Subset(ds_te, s_te.indices) if isinstance(s_te, Subset) else ds_te, sty)
         extra = {}
@@ -516,6 +518,9 @@ def cmd_check(a) -> int:
     df.insert(0, "ckpt", os.path.basename(a.ckpt))
     df.to_csv(os.path.join(a.out, "check.csv"), index=False)
     txt = summarise_check(df, judge_ref, judge_thr, thr)
+    if "phone_sim" in methods:
+        txt = (f"\nphone_sim: profile {a.phone_profile}, strength {a.phone_strength}, field {a.phone_field}"
+               + txt)
     print(txt)
     with open(os.path.join(a.out, "check_summary.txt"), "w") as f:
         f.write(txt + "\n")
@@ -563,7 +568,7 @@ def cmd_export(a) -> int:
         tgt = load_device(a.target_root, a.target_dataset, a.image_size, a.split_seed)
         bank = reference_bank(tgt["train"], a.bank, a.seed, a.num_workers)     # train patients only
     sty = build_stylizer(a.method, bank, translators, dev, a.beta, a.zoom, a.phone_profile, a.phone_strength,
-                         out_size=a.image_size)
+                         out_size=a.image_size, phone_field=a.phone_field)
     out_img = os.path.join(a.out_root, os.path.basename(img_dir.rstrip("/")))
     os.makedirs(out_img, exist_ok=True)
     shutil.copy(csv, os.path.join(a.out_root, os.path.basename(csv)))
@@ -580,7 +585,7 @@ def cmd_export(a) -> int:
         json.dump({"method": a.method, "n_images": n, "image_size": a.image_size, "source_csv": csv,
                    "translator": translators.get(a.method), "beta": a.beta, "zoom": a.zoom,
                    "phone_profile": a.phone_profile, "phone_strength": a.phone_strength,
-                   "seed": a.seed}, f, indent=2)
+                   "phone_field": a.phone_field, "seed": a.seed}, f, indent=2)
     print(f"[export:{a.method}] {n} images -> {out_img} (labels: {os.path.basename(csv)})")
     return 0
 
@@ -630,6 +635,7 @@ def cmd_score(a) -> int:
                              "ckpt": path, "n": int(fin.sum()), "in_sample": in_sample,
                              "phone_sim_p": args.get("phone_sim_p") if args.get("phone_sim") else None,
                              "phone_sim_strength": args.get("phone_sim_strength") if args.get("phone_sim") else None,
+                             "phone_sim_field": args.get("phone_sim_field", "phone") if args.get("phone_sim") else None,
                              "phone_sim_sha256": sim.get("sha256"),
                              "auroc": _auc(yy, pp), "threshold": thr,
                              "sensitivity": float((pp[yy == 1] >= thr).mean()) if at_thr else np.nan,
@@ -651,8 +657,9 @@ def cmd_score(a) -> int:
               "their AUROC and oracle_spec are optimistic and their threshold columns are left empty; the "
               "handheld rows are out of sample.\n" if a.part == "val" else "")
            + "arms: " + "; ".join(f"{r.arm} = {os.path.dirname(r.ckpt) or '.'} ("
-                                  + (f"phone_sim p {r.phone_sim_p}, strength {r.phone_sim_strength}, profile "
-                                     f"{r.phone_sim_sha256[:12]}" if isinstance(r.phone_sim_sha256, str) else "no phone_sim")
+                                  + (f"phone_sim p {r.phone_sim_p}, strength {r.phone_sim_strength}, field "
+                                     f"{r.phone_sim_field}, profile {r.phone_sim_sha256[:12]}"
+                                     if isinstance(r.phone_sim_sha256, str) else "no phone_sim")
                                   + ")" for r in df.drop_duplicates("arm").itertuples()) + "\n"
            + g.to_string())
     arms = list(dict.fromkeys(df.arm))
@@ -699,6 +706,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         q.add_argument("--phone-profile", default=None,
                        help="phone_sim.py profile; adds the phone_sim method to check")
         q.add_argument("--phone-strength", type=float, default=1.0, help="0-1")
+        q.add_argument("--phone-field", default="phone", choices=["phone", "whole"],
+                       help="phone_sim framing: whole keeps the whole tabletop FOV (the training "
+                            "ablation --phone-sim-field whole)")
 
     q = sub.add_parser("fit", help="train one CycleGAN translator")
     common(q)

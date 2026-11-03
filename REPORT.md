@@ -882,7 +882,7 @@ python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --weights int8
     --swift-cli app/RetinaReachKit/.build/release/retinareach-cli
 ```
 
-### 10.11 Simulated phone photos for training (built 30 October, reviewed and fixed 31 October; measured on the 16 + 16 samples, not yet run on the box)
+### 10.11 Simulated phone photos for training (built 30 October, reviewed and fixed 31 October; first box results 2 November, one seed scored)
 
 **Why.** The phone-ceiling run (seed 0) split the phone gap: the Canon model ranks phone
 photos almost as well as a phone-trained one once AdaBN re-estimates its statistics
@@ -1013,5 +1013,54 @@ drop on the Canon test means p is too high. Ablations (`P` 0.25 / 0.75, `STRENGT
 `ARM_CK`, and a fresh `CK` for a profile) are compared on the validation split with `PART=val`
 (the commands are in `run_phone_sim.sh`'s header); there the tabletop rows are in-sample --
 that split chose each arm's epoch and threshold -- so the Canon side of a choice is a guard
-only. The chosen arm is then read on test once (`FINAL=1 STAGES=score`); the trainer's own
+only. The chosen arm is then read on test once (`FINAL=1 STAGES="score patient"`); the trainer's own
 handheld test numbers for each arm are not consulted while choosing.
+
+**First box results (2 November; the fit and check on all five Canon-only checkpoints, the
+score on seed 0 only -- provisional).** The fit on 2,000 mBRSET train-split photos: mean gap
+0.62 (tabletop vs real phone) -> 0.13 (simulated vs real phone), 120 training-split photos per
+side, cross-fitted; the renders' median zoom 1.32 against the fitted angular scale 1.18, the
+FOV ellipse read on 119 of 120, 2 zooms pushed by a dark FOV edge, 2 ambiguous disc picks.
+`check` (means over the five seeds): the trunk's own camera probe calls 0.85 of simulated
+ICDR-0 photos handheld (colour and FDA transfer <= 0.09, real phone 0.997) and the
+BN-statistics camera distance falls 0.015 -> 0.0025 (floor 0.0002); the handheld-trained judge
+flags 0.32 of simulated ICDR-0 eyes against 0.33 of the originals, so no disease is invented;
+but referable eyes lose signal -- the Canon model's sensitivity on simulated referable photos
+falls 0.87 -> 0.74 and the judge's AUROC 0.92 -> 0.86, more than under colour or FDA transfer.
+Part of that is the camera shift training should cover; part is label noise, since the field
+keeps ~65 % of the Canon FOV and a referable eye can lose its peripheral lesions while keeping
+its label (§10.12 tests it). Seed 0 on the phone test split, Canon only -> + simulated phone
+photos: calibrated oracle specificity at 0.85 sensitivity 0.788 -> 0.820 (AUROC 0.920 ->
+0.912); as trained, oracle specificity 0.787 -> 0.713 and, at the shipped threshold,
+sensitivity / specificity 0.70 / 0.94 -> 0.82 / 0.79 (flagged 16 % -> 31 %); Canon test
+unchanged (calibrated AUROC 0.978 -> 0.980, oracle specificity 0.964 -> 0.974). Seed 0's
+Canon-only baseline sits below the five-seed AdaBN mean of the phone-ceiling run (0.819), and a
+second seed-0 run ran beside the sweep on the same GPU and may have written that score, so the
+decision waits for the paired five-seed block. The simulator costs 932 ms per batch on the RTX
+A2000 (inflated by that concurrent run), about 7 h per seed.
+
+### 10.12 Per-patient referral rule and the whole-field arm (built 2 November; not yet run on the box)
+
+**Per patient.** The shipped threshold is fixed on single photos, and `referral_outcomes.py`
+refers a patient when any gradable photo reaches it. The maximum over a patient's photos lifts
+sensitivity above the image-level target and pulls specificity below it: no model meets the
+targets per patient, phone-trained ones included (phone-only, seed 0: 0.891 / 0.767 at its
+shipped threshold; its five-seed image-level oracle specificity is 0.868). `patient_rule.py` scores finished
+checkpoints (no retraining) and compares three rules, every threshold set on tabletop
+validation -- the camera the device ships from, so no handheld label sets one: `shipped` (the
+current rule, reproduced count for count), `any_patient` (the same score, its threshold re-set
+on tabletop-validation patients) and `eye_mean` (each eye's gradable photos averaged, the
+higher eye; the pre-specified new rule). Each also reports the scored split's own patient-level
+oracle specificity, a ranking ceiling rather than a device. Retakes, truth and gradability are
+`referral_outcomes.py`'s. `run_phone_sim.sh` runs it as stage `patient` on the same seed pairs
+as `score`; the Canon sweep alone is scored with `--ckpt canon_only=ck_rr_canon/seed<s>.pt ...`.
+
+**The whole field (ablation).** `FIELD=whole` (`--phone-sim-field whole`) keeps zoom 1 and no
+framing shift, so the whole tabletop FOV stays inside the aperture; the un-squash, rotation,
+aperture and disc bloom stay, and the truncated FOV's flat top and bottom stay black (a
+tabletop cue the phone field exists to remove). It answers one question: does the phone
+field's crop cost more, through label noise, than its realism buys? Its `check` stage needs no
+training (it reads the Canon-only checkpoints) and says first whether the referable signal comes
+back (`tab_sens` back toward 0.87); the arm is then trained and chosen on the validation split
+like any ablation (`PART=val`, `FINAL=1` for its single test read).
+

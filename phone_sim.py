@@ -139,6 +139,13 @@ from vessel_ablation import FOV_TOL, fov_mask  # noqa: E402
 FORMAT = "phone_sim/2"            # /2: blotch residual smoothed over the fitted cells only
 STAGES = ("field", "light", "colour", "bloom", "detail", "noise", "rim")
 COLOUR_MODES = ("coupled", "mk", "affine")
+# The field stage's framing. phone: the handheld's narrower field (zoomed until the
+# aperture clears a truncated tabletop FOV, ~1.32 on Canon frames: about 65 % of the
+# FOV area kept, so a referable eye can lose the lesions its label was graded on).
+# whole (ablation): no zoom past 1 and no framing shift, the whole tabletop FOV inside
+# the aperture -- un-squash, rotation, aperture and the disc bloom stay; a truncated
+# frame's flat top and bottom stay black inside the circle (a tabletop cue).
+FIELDS = ("phone", "whole")
 N_SECTORS = 16
 # The detail ladder: (a, r) with a > 0 = Gaussian blur of sigma a px, a = 0 = unchanged.
 # Blur only, capped at 0.8 px at 384: in the model's view the handheld is not blurrier
@@ -1044,11 +1051,12 @@ class PhoneSimulator(Stylizer):
     ``strength`` in [0, 1] scales every photometric change, the rotation and the
     framing shift; 0 still un-squashes, zooms as far as the aperture needs to
     clear a truncated tabletop FOV, and applies the aperture. ``stages`` picks a
-    subset of :data:`STAGES` (ablations)."""
+    subset of :data:`STAGES` (ablations); ``field`` the framing (:data:`FIELDS`:
+    ``whole`` keeps the whole tabletop FOV, an ablation)."""
     name = "phone_sim"
 
     def __init__(self, profile: PhoneProfile, strength: float = 1.0, stages: Sequence[str] = STAGES,
-                 out_size: Optional[int] = None) -> None:
+                 out_size: Optional[int] = None, field: str = "phone") -> None:
         bad = sorted(set(stages) - set(STAGES))
         if bad:
             raise ValueError(f"unknown phone_sim stages {bad}; known: {STAGES}")
@@ -1056,7 +1064,10 @@ class PhoneSimulator(Stylizer):
             # above 1 the colour stage extrapolates a channel past zero and the bloom past
             # the disc colour (whole channels and discs clipped)
             raise ValueError(f"phone_sim strength {strength} outside [0, 1]")
+        if field not in FIELDS:
+            raise ValueError(f"phone_sim field {field!r}; known: {FIELDS}")
         self.profile, self.strength, self.stages, self.out_size = profile, float(strength), tuple(stages), out_size
+        self.field = field
         self.p = profile.params
         self._bank = {k: torch.from_numpy(np.asarray(v)) for k, v in profile.bank.items()}
         self._bank_dev: Optional[Tuple[torch.device, Dict[str, torch.Tensor]]] = None
@@ -1106,17 +1117,24 @@ class PhoneSimulator(Stylizer):
         centre = torch.stack([torch.zeros_like(aspect), torch.where(rel, shape["yc"], torch.zeros_like(aspect))], 1)
         rot = s * prm["rot"].to(dev)
         fov = fov_mask(x01)
-        z, clear = min_zoom(fov, 1 + s * (prm["zoom"].to(dev) - 1), a_f, b_f, centre, rot, return_ok=True)
         d = find_disc(x01)
         lo, hi = (float(v) for v in self.p["disc_margin"])
         conf = disc_confidence(d, float(self.p["disc_prom"])) * disc_gate(d, lo, hi)
         ab = torch.stack([a_f, b_f], dim=1)
-        dv = (torch.stack([d["cx"], d["cy"]], dim=1) - centre) / ab                    # FOV units
-        tgt = torch.where(torch.isfinite(T["disc_dist"]), T["disc_dist"], torch.full_like(z, self.disc_dist))
-        lam = (tgt / (z * dv.norm(dim=1)).clamp_min(1e-6)).clamp(max=1.0)
-        want = s * (torch.where((conf > 0).view(B, 1), dv * (1 - lam).view(B, 1), torch.zeros_like(dv))
-                    + prm["jit"].to(dev)) * ab
-        offset = centre + safe_shift(fov, want, z, a_f, b_f, centre, rot)
+        if self.field == "whole":
+            # the whole FOV at its own scale: no shift either (any shift at zoom 1 moves
+            # retina out of the circle); "clear" = the circle already fits inside the FOV
+            one = torch.ones_like(aspect)
+            zc, ok = min_zoom(fov, one, a_f, b_f, centre, rot, return_ok=True)
+            z, clear, offset = one, ok & (zc <= 1.0 + 1e-4), centre
+        else:
+            z, clear = min_zoom(fov, 1 + s * (prm["zoom"].to(dev) - 1), a_f, b_f, centre, rot, return_ok=True)
+            dv = (torch.stack([d["cx"], d["cy"]], dim=1) - centre) / ab                # FOV units
+            tgt = torch.where(torch.isfinite(T["disc_dist"]), T["disc_dist"], torch.full_like(z, self.disc_dist))
+            lam = (tgt / (z * dv.norm(dim=1)).clamp_min(1e-6)).clamp(max=1.0)
+            want = s * (torch.where((conf > 0).view(B, 1), dv * (1 - lam).view(B, 1), torch.zeros_like(dv))
+                        + prm["jit"].to(dev)) * ab
+            offset = centre + safe_shift(fov, want, z, a_f, b_f, centre, rot)
         p = z.view(B, 1) * (torch.stack([d["cx"], d["cy"]], dim=1) - offset) / ab        # disc, rotated frame
         cr, sr = torch.cos(-rot), torch.sin(-rot)
         disc_xy = torch.stack([cr * p[:, 0] - sr * p[:, 1], sr * p[:, 0] + cr * p[:, 1]], dim=1)
@@ -1146,6 +1164,10 @@ class PhoneSimulator(Stylizer):
             self._last_key = _batch_key(x01)
             y = warp(x01, geo["zoom"], geo["a_f"], geo["b_f"], geo["offset"], geo["rot"], (H, W))
             A = aperture(geo["radius"], float(p["rim_width"]), H, W)
+            if self.field == "whole":
+                # what lies outside the tabletop FOV stays black through every stage (the
+                # colour map would lift it, the rim haze tint it)
+                A = A * fov_mask(y).float()
             y = y * A
         else:
             y = x01 if Hin == H else F.interpolate(x01, size=(H, W), mode="bilinear", antialias=True,
@@ -1832,7 +1854,7 @@ def cmd_render(a) -> int:
     # by eye never touches the test patients); folders: every photo in them
     src = _subset(_source(a, S_hi, a.part), a.n, a.seed)
     X = torch.cat(list(batches(src, a.batch_size, a.num_workers, dev)))
-    sim = PhoneSimulator(prof, strength=a.strength, out_size=S)
+    sim = PhoneSimulator(prof, strength=a.strength, out_size=S, field=a.field)
     Y = sim(X, torch.Generator().manual_seed(a.seed))
     X_lo = F.interpolate(X, size=(S, S), mode="bilinear", antialias=True, align_corners=False)
     rows, labels = [X_lo, Y], ["tabletop", "simulated"]
@@ -1845,7 +1867,7 @@ def cmd_render(a) -> int:
     k = min(a.stage_rows, len(X))
     strip, names = [X_lo[:k]], ["tabletop"]
     for i in range(1, len(STAGES) + 1):
-        st = PhoneSimulator(prof, strength=a.strength, stages=STAGES[:i], out_size=S)
+        st = PhoneSimulator(prof, strength=a.strength, stages=STAGES[:i], out_size=S, field=a.field)
         strip.append(st(X[:k], torch.Generator().manual_seed(a.seed)))
         names.append("+" + STAGES[i - 1])
     tiles = torch.stack(strip, dim=1)                                  # [k, stages, 3, S, S]
@@ -1903,6 +1925,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     q.add_argument("--n", type=int, default=8)
     q.add_argument("--stage-rows", type=int, default=4)
     q.add_argument("--strength", type=float, default=1.0, help="0-1")
+    q.add_argument("--field", default="phone", choices=list(FIELDS),
+                   help="whole: keep the whole tabletop FOV (the training ablation --phone-sim-field whole)")
     q.add_argument("--out", default="ck_phone_sim/render",
                    help="grids of dataset photos: keep them in a git-ignored ck_* folder")
     q.set_defaults(fn=cmd_render)

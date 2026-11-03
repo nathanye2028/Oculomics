@@ -86,7 +86,9 @@ Pipeline (one seed)
 13. **Simulated phone photos** (``--phone-sim <profile.json>``, ``phone_sim.py``):
    in stage 1, each source training photo is re-rendered as a handheld one with
    probability ``--phone-sim-p`` (default 0.5) at ``--phone-sim-strength``, before
-   the device-side augmentation (switched on for it). It renders from the photo's
+   the device-side augmentation (switched on for it). ``--phone-sim-field whole``
+   (ablation) keeps the whole tabletop FOV instead of the handheld's narrower field,
+   so no lesion the label was graded on is cropped away. It renders from the photo's
    whole FOV at ``supersample`` times the image size (the profile's), the view
    ``phone_sim.py fit`` and ``check`` measure it on; the photos left alone keep
    the ordinary training crop (``phone_sim.TrainViews``; one decode, drafted for
@@ -534,6 +536,10 @@ def main(argv: Sequence[str] = None) -> int:
                    help="0-1: scales the simulated camera's photometric changes, rotation and framing "
                         "shift; 0 keeps the un-squash, the zoom that clears a truncated FOV and the "
                         "handheld aperture")
+    p.add_argument("--phone-sim-field", default="phone", choices=["phone", "whole"],
+                   help="phone: the handheld's narrower field (zoomed until the aperture clears the "
+                        "tabletop FOV, ~65 %% of a Canon FOV kept); whole (ablation): the whole tabletop "
+                        "FOV, its flat top and bottom left black")
     p.add_argument("--nondeterministic", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -608,7 +614,7 @@ def main(argv: Sequence[str] = None) -> int:
         from phone_sim import PhoneProfile, PhoneSimulator
         try:
             phone_sim = PhoneSimulator(PhoneProfile.load(a.phone_sim), strength=a.phone_sim_strength,
-                                       out_size=a.image_size)
+                                       out_size=a.image_size, field=a.phone_sim_field)
             phone_sim.check_size(a.image_size)
         except (OSError, ValueError) as e:
             raise SystemExit(f"[fatal] --phone-sim: {e}")
@@ -635,6 +641,7 @@ def main(argv: Sequence[str] = None) -> int:
         with open(a.phone_sim, "rb") as f:
             sha = hashlib.sha256(f.read()).hexdigest()
         phone_sim_info = {"path": a.phone_sim, "sha256": sha, "n_bank": len(phone_sim.profile),
+                          "field": a.phone_sim_field,
                           "source": {k: v for k, v in src_p.items() if k != "files"},
                           "params": {k: v for k, v in phone_sim.p.items() if k != "src_illum"}}
         if a.gpu_aug is False:
@@ -738,7 +745,8 @@ def main(argv: Sequence[str] = None) -> int:
                                        transform=TrainViews(a.image_size, train_size))
         phone_sim_info["train_size"] = train_size
         print(f"[phone-sim] {a.phone_sim}: {len(phone_sim.profile)} handheld photos in the bank; "
-              f"p {a.phone_sim_p}, strength {a.phone_sim_strength}; renders from the whole FOV at {train_size} px, "
+              f"p {a.phone_sim_p}, strength {a.phone_sim_strength}, field {a.phone_sim_field}; renders from the "
+              f"whole FOV at {train_size} px, "
               f"the other photos keep the {a.image_size} px training crop")
     else:
         src_train = mk(S, "train", "train")

@@ -15,35 +15,46 @@
 #   check  style_transfer_xfer.py check on the Canon sweep's checkpoint: realism among
 #          ICDR-0 eyes (camera distance, camera probe) and label preservation (judge,
 #          logit shifts, vessel_r) for phone_sim next to colour / fda_sharp ->
-#          $CK/check_seed<s>/ (check_seed<s>_strength<x>/ at another STRENGTH;
-#          check_summary.txt; grid.jpg is dataset photos, so ck_*).
+#          $CK/check_seed<s>/ (check_seed<s>_strength<x>/ at another STRENGTH,
+#          check_seed<s>_field-whole/ with FIELD=whole; check_summary.txt; grid.jpg is
+#          dataset photos, so ck_*).
 #   train  the Canon sweep again, identical except --phone-sim (run_retinareach.sh with
 #          SOURCE_CAMERA / HOLDOUT_CAMERA, so the Nikon rung and every output exist too).
 #          Its preflight prints "phone_sim: N ms per batch" and the loader's own img/s.
-#          Refuses an ARM_OUT whose seeds were trained with another P, STRENGTH or profile.
+#          Refuses an ARM_OUT whose seeds were trained with another P, STRENGTH, FIELD or profile.
 #   score  style_transfer_xfer.py score, Canon-only vs Canon + simulated phone photos, on
 #          the same real phone and Canon rows (PART: test by default), for EVERY seed with
 #          both checkpoints (a seed missing on one side is left out of both): AUROC,
 #          sensitivity / specificity at the shipped threshold, oracle specificity at 0.85
 #          sensitivity, the per-seed paired difference, and each arm's settings ->
 #          $OUT/score/ for the pre-specified arm on test, $OUT/score_<ARM_CK>_<PART>/ else.
+#   patient patient_rule.py on the same seed pairs: referral per patient, every threshold
+#          from Canon validation -- the shipped image threshold on the highest photo, the
+#          same score with a per-patient threshold, and each eye's photos averaged (the
+#          higher eye) with a per-patient threshold -> $OUT/patient/ for the pre-specified
+#          arm on test, $OUT/patient_<ARM_CK>_<PART>/ else (patient_rule_summary.txt;
+#          predictions.csv reruns the rules without a GPU).
 #
-# Ablation arms (P, STRENGTH or the profile changed) are chosen on the handheld VALIDATION
+# Ablation arms (P, STRENGTH, FIELD or the profile changed) are chosen on the handheld VALIDATION
 # split and need a fresh ARM_OUT / ARM_CK each (and a fresh CK for another profile):
 #   P=0.25 ARM_OUT=exp_rr_p025 ARM_CK=ck_rr_p025 PART=val STAGES="train score" bash run_phone_sim.sh 0 1 2 3 4
 #   STRENGTH=0.5 ARM_OUT=exp_rr_s05 ARM_CK=ck_rr_s05 PART=val STAGES="check train score" bash run_phone_sim.sh 0 1 2 3 4
+#   FIELD=whole ARM_OUT=exp_rr_whole ARM_CK=ck_rr_whole PART=val STAGES="check train score patient" bash run_phone_sim.sh 0 1 2 3 4
+#     (the whole tabletop FOV instead of the handheld's narrower field: no lesion cropped away;
+#     its check stage needs no training and says first whether the referable signal comes back)
 #   CK=ck_phone_sim_mk FIT_EXTRA="--colour-mode mk" ARM_OUT=exp_rr_mk ARM_CK=ck_rr_mk PART=val bash run_phone_sim.sh 0 1 2 3 4
 #   CK=ck_phone_sim_icdr0 FIT_EXTRA="--select icdr0" ARM_OUT=exp_rr_icdr0 ARM_CK=ck_rr_icdr0 PART=val bash run_phone_sim.sh 0 1 2 3 4
 # On val the tabletop rows are in-sample (that split chose the epoch and the threshold), so
 # the Canon side of a choice is only a guard there. The chosen arm is then read on test once,
-# with its own knobs plus FINAL=1 STAGES=score. Scoring an ablation arm on test without
+# with its own knobs plus FINAL=1 STAGES="score patient". Scoring an ablation arm on test without
 # FINAL=1 is refused. The trainer prints and writes every arm's handheld test numbers too:
 # do not read them while choosing.
 #
-# Knobs (environment): B, M (required); STAGES (default "fit check train score");
+# Knobs (environment): B, M (required); STAGES (default "fit check train score patient");
 # CAM="Canon CR", HOLD="NIKON NF5050"; P=0.5 (share of Canon training photos simulated);
-# STRENGTH=1.0 (0-1); CK=ck_phone_sim (profile); FIT_EXTRA (more fit flags: --colour-mode,
-# --select); PART=test|val (score); FINAL (1: an ablation arm on test); OUT=exp_phone_sim;
+# STRENGTH=1.0 (0-1); FIELD=phone|whole (the simulated framing); CK=ck_phone_sim (profile);
+# FIT_EXTRA (more fit flags: --colour-mode, --select); PART=test|val (score, patient); FINAL
+# (1: an ablation arm on test); OUT=exp_phone_sim;
 # ARM_OUT=exp_rr_phonesim, ARM_CK=ck_rr_phonesim (the retrained sweep); BASE_CK=ck_rr_canon
 # (the Canon-only sweep the arm is compared with); SIZE=384; DEVICE=auto; WORKERS=5 (the arm
 # decodes larger views: raise it when the preflight says the loader sets the pace and no
@@ -54,11 +65,12 @@ cd "$(dirname "$0")"
 export PYTHONUNBUFFERED=1
 : "${B:?set B=<BRSET root>}"
 : "${M:?set M=<mBRSET root>}"
-STAGES=${STAGES:-fit check train score}
+STAGES=${STAGES:-fit check train score patient}
 CAM=${CAM:-Canon CR}
 HOLD=${HOLD:-NIKON NF5050}
 P=${P:-0.5}
 STRENGTH=${STRENGTH:-1.0}
+FIELD=${FIELD:-phone}
 CK=${CK:-ck_phone_sim}
 FIT_EXTRA=${FIT_EXTRA:-}
 PART=${PART:-test}
@@ -74,24 +86,28 @@ EXTRA=${EXTRA:---ema-decay 0.999}
 PY=.venv/bin/python
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0)
 for st in $STAGES; do
-  case $st in fit|check|train|score) ;; *) echo "[fatal] unknown stage '$st' (fit check train score)"; exit 1;; esac
+  case $st in fit|check|train|score|patient) ;; *) echo "[fatal] unknown stage '$st' (fit check train score patient)"; exit 1;; esac
 done
 case $PART in test|val) ;; *) echo "[fatal] PART must be test or val, not '$PART'"; exit 1;; esac
+case $FIELD in phone|whole) ;; *) echo "[fatal] FIELD must be phone or whole, not '$FIELD'"; exit 1;; esac
 [ -x "$PY" ] || { echo "[fatal] no .venv — see README Quick start"; exit 1; }
 for v in B M; do [ -d "${!v}" ] || { echo "[fatal] $v root not found: ${!v}"; exit 1; }; done
 [ -n "${GPUS:-}" ] && export CUDA_VISIBLE_DEVICES=$GPUS
 PROFILE="$CK/profile.json"
 has() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
 ST=$(printf %g "$STRENGTH")
-# the pre-specified arm: p 0.5, strength 1, the default profile; anything else is an ablation
+# the pre-specified arm: p 0.5, strength 1, the phone field, the default profile; anything
+# else is an ablation
 PRIMARY=0
-if [ "$(printf %g "$P")" = 0.5 ] && [ "$ST" = 1 ] && [ "$CK" = ck_phone_sim ] && [ -z "$FIT_EXTRA" ]; then PRIMARY=1; fi
-if has score && [ "$PART" = test ] && [ $PRIMARY = 0 ] && [ "$FINAL" != 1 ]; then
-  echo "[fatal] an ablation arm (P $P, STRENGTH $STRENGTH, CK $CK${FIT_EXTRA:+, FIT_EXTRA $FIT_EXTRA}) is chosen on" \
+if [ "$(printf %g "$P")" = 0.5 ] && [ "$ST" = 1 ] && [ "$FIELD" = phone ] && [ "$CK" = ck_phone_sim ] \
+   && [ -z "$FIT_EXTRA" ]; then PRIMARY=1; fi
+if { has score || has patient; } && [ "$PART" = test ] && [ $PRIMARY = 0 ] && [ "$FINAL" != 1 ]; then
+  echo "[fatal] an ablation arm (P $P, STRENGTH $STRENGTH, FIELD $FIELD, CK $CK${FIT_EXTRA:+, FIT_EXTRA $FIT_EXTRA}) is chosen on" \
        "the validation split: PART=val. FINAL=1 reads the chosen arm on test, once."; exit 1
 fi
 ARM_TAG=${ARM_CK%/}; ARM_TAG=${ARM_TAG##*/}
-if [ "$PART" = test ] && [ $PRIMARY = 1 ]; then SCORE_OUT="$OUT/score"; else SCORE_OUT="$OUT/score_${ARM_TAG}_$PART"; fi
+if [ "$PART" = test ] && [ $PRIMARY = 1 ]; then SCORE_OUT="$OUT/score"; PATIENT_OUT="$OUT/patient"
+else SCORE_OUT="$OUT/score_${ARM_TAG}_$PART"; PATIENT_OUT="$OUT/patient_${ARM_TAG}_$PART"; fi
 mkdir -p "$OUT" "$CK"
 
 if has fit; then
@@ -121,18 +137,20 @@ if has check; then
     if [ ! -f "$base" ]; then echo "[check] no $base, skipping seed $s"; continue; fi
     d="$CK/check_seed$s"                   # its grid.jpg holds dataset photos: a git-ignored ck_* folder
     [ "$ST" = 1 ] || d="${d}_strength$ST"
+    [ "$FIELD" = phone ] || d="${d}_field-$FIELD"
     if [ -f "$d/check_summary.txt" ]; then echo "[check] $d exists, skipping"; continue; fi
     $PY style_transfer_xfer.py check --device "$DEVICE" --ckpt "$base" --source-root "$B" --target-root "$M" \
-      --methods colour fda_sharp --phone-profile "$PROFILE" --phone-strength "$STRENGTH" \
+      --methods colour fda_sharp --phone-profile "$PROFILE" --phone-strength "$STRENGTH" --phone-field "$FIELD" \
       --num-workers "$WORKERS" --out "$d"
   done
 fi
 
 if has train; then
   # a seed already trained in ARM_OUT is skipped by run_retinareach.sh: it must be this arm's
-  $PY - "$ARM_OUT" "$PROFILE" "$P" "$STRENGTH" "${SEEDS[@]}" <<'EOF' || exit 1
+  $PY - "$ARM_OUT" "$PROFILE" "$P" "$STRENGTH" "$FIELD" "${SEEDS[@]}" <<'EOF' || exit 1
 import hashlib, json, os, sys
-arm_out, profile, p, strength, seeds = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]), sys.argv[5:]
+arm_out, profile, p, strength, field = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+seeds = sys.argv[6:]
 sha = hashlib.sha256(open(profile, "rb").read()).hexdigest()
 for s in seeds:
     path = os.path.join(arm_out, f"seed{s}", "results.json")
@@ -140,19 +158,21 @@ for s in seeds:
         continue
     r = json.load(open(path))
     a, prof = r.get("args", {}), r.get("phone_sim_profile") or {}
-    got = (a.get("phone_sim_p"), a.get("phone_sim_strength"), prof.get("sha256"))
-    if not a.get("phone_sim") or abs(got[0] - p) > 1e-9 or abs(got[1] - strength) > 1e-9 or got[2] != sha:
-        sys.exit(f"[fatal] {path} was trained with phone_sim p {got[0]}, strength {got[1]}, profile "
-                 f"{(got[2] or 'none')[:12]}, not this arm's (p {p}, strength {strength}, {sha[:12]}): "
-                 f"give the arm a fresh ARM_OUT and ARM_CK")
+    # runs from before the field option all had the phone field
+    got = (a.get("phone_sim_p"), a.get("phone_sim_strength"), prof.get("sha256"), a.get("phone_sim_field", "phone"))
+    if (not a.get("phone_sim") or abs(got[0] - p) > 1e-9 or abs(got[1] - strength) > 1e-9 or got[2] != sha
+            or got[3] != field):
+        sys.exit(f"[fatal] {path} was trained with phone_sim p {got[0]}, strength {got[1]}, field {got[3]}, "
+                 f"profile {(got[2] or 'none')[:12]}, not this arm's (p {p}, strength {strength}, field {field}, "
+                 f"{sha[:12]}): give the arm a fresh ARM_OUT and ARM_CK")
 EOF
   # the Canon sweep's own pipeline, one flag different
   B="$B" M="$M" SOURCE_CAMERA="$CAM" HOLDOUT_CAMERA="$HOLD" OUT="$ARM_OUT" CK="$ARM_CK" SIZE="$SIZE" \
-    WORKERS="$WORKERS" EXTRA="$EXTRA --phone-sim $PROFILE --phone-sim-p $P --phone-sim-strength $STRENGTH" \
+    WORKERS="$WORKERS" EXTRA="$EXTRA --phone-sim $PROFILE --phone-sim-p $P --phone-sim-strength $STRENGTH --phone-sim-field $FIELD" \
     bash run_retinareach.sh "${SEEDS[@]}"
 fi
 
-if has score; then
+if has score || has patient; then
   # every seed trained on both sides, whatever seeds this call was given: the decision
   # reads a mean over seeds paired with the Canon sweep
   cks=()
@@ -168,11 +188,18 @@ if has score; then
     if [ ! -f "$BASE_CK/seed$s.pt" ]; then echo "[score] seed $s: no $BASE_CK/seed$s.pt, left out of both arms"; fi
   done
   [ ${#cks[@]} -gt 0 ] || { echo "[score] no seed has a checkpoint in both $BASE_CK and $ARM_CK"; exit 1; }
+fi
+if has score; then
   $PY style_transfer_xfer.py score --device "$DEVICE" --source-root "$B" --target-root "$M" --ckpt "${cks[@]}" \
     --part "$PART" --num-workers "$WORKERS" --out "$SCORE_OUT"
 fi
+if has patient; then
+  $PY patient_rule.py --device "$DEVICE" --source-root "$B" --target-root "$M" --ckpt "${cks[@]}" \
+    --part "$PART" --num-workers "$WORKERS" --out "$PATIENT_OUT"
+fi
 wrote=()
-for f in "$CK/fit_report.txt" "$CK/fit_grid.jpg" "$CK"/check_seed*/check_summary.txt "$SCORE_OUT/score_summary.txt"; do
+for f in "$CK/fit_report.txt" "$CK/fit_grid.jpg" "$CK"/check_seed*/check_summary.txt "$SCORE_OUT/score_summary.txt" \
+         "$PATIENT_OUT/patient_rule_summary.txt"; do
   if [ -f "$f" ]; then wrote+=("$f"); fi
 done
 echo "[done] ${wrote[*]:-no output files yet}"
