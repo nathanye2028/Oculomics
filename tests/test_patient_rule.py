@@ -1,11 +1,13 @@
 """patient_rule.py: photos -> patients (eye means, ungradable photos, retakes), every
 threshold from tabletop validation and none from handheld labels, the shipped rule
-equal to referral_outcomes.py's, and the run end to end on the synthetic camera pair."""
+equal to referral_outcomes.py's, the seed ensemble (photo by photo, the trainer's
+threshold rule), and the run end to end on the synthetic camera pair."""
 import numpy as np
 import pandas as pd
 import pytest
 
 import patient_rule as pr
+from metadata_model import threshold_at_sensitivity
 from referral_outcomes import patient_outcomes
 
 
@@ -111,6 +113,55 @@ def test_val_marks_tabletop_in_sample_and_two_arms_are_paired():
         pr.evaluate(pred[~((pred.camera == "tabletop") & (pred.part == "val"))], "val", n_boot=5)
 
 
+def test_ensemble_averages_each_photo_over_the_seeds():
+    rng = np.random.default_rng(3)
+    pred = _pred(rng, arms=("a", "b"), seeds=(0, 1, 2), n=24)
+    pred = pred[~((pred.arm == "b") & (pred.seed > 0))]                 # b: one seed, no ensemble
+    ens = pr.ensemble(pred, 0.85)
+    assert set(ens.arm) == {"a"} and (ens.seed == pr.ENSEMBLE_SEED).all() and (ens.members == 3).all()
+    a = pred[pred.arm == "a"]
+    assert len(ens) == len(a) // 3
+    want = a.groupby(pr.PHOTO)["p"].mean().sort_index()
+    assert np.allclose(ens.set_index(pr.PHOTO)["p"].sort_index(), want)
+    for proto, q in ens.groupby("protocol"):                             # the trainer's rule, on the averages
+        v = q[(q.camera == "tabletop") & (q.part == "val")]
+        y, s = v.truth.to_numpy().astype(int), v.p.to_numpy()
+        thr = q.shipped_threshold.iloc[0]
+        assert (q.shipped_threshold == thr).all() and thr == threshold_at_sensitivity(y, s, 0.85)
+        assert (s[y == 1] >= thr).mean() >= 0.85
+    with pytest.raises(ValueError, match="same photos"):
+        pr.ensemble(a.drop(a.index[a.seed == 1][:1]), 0.85)
+    with pytest.raises(ValueError, match="repeat an arm and seed"):
+        pr.ensemble(pd.concat([a, a.iloc[:3]]), 0.85)
+
+
+def test_ensemble_ranks_better_than_its_seeds_from_saved_predictions(tmp_path):
+    rng = np.random.default_rng(4)
+    pred = _pred(rng, arms=("base", "arm"), seeds=(0, 1, 2, 3, 4), n=40)
+    img = pr.image_metrics(pd.concat([pred, pr.ensemble(pred)], ignore_index=True), "test")
+    h = img[img.camera == "handheld"]
+    e = h[h.seed == pr.ENSEMBLE_SEED].set_index(["arm", "protocol"]).auroc
+    s = h[h.seed != pr.ENSEMBLE_SEED].groupby(["arm", "protocol"]).auroc.mean()
+    assert len(e) == 4 and (e > s.reindex(e.index)).all()               # independent seed noise averages out
+    # two saved files pooled, as two score runs would leave them
+    files = []
+    for arm in ("base", "arm"):
+        files.append(str(tmp_path / f"{arm}.csv"))
+        pred[pred.arm == arm].to_csv(files[-1], index=False)
+    out, plain = tmp_path / "ens", tmp_path / "plain"
+    assert pr.main(["--from-predictions", *files, "--ensemble", "--n-boot", "20", "--out", str(out)]) == 0
+    assert pr.main(["--from-predictions", *files, "--n-boot", "20", "--out", str(plain)]) == 0
+    txt = (out / "patient_rule_summary.txt").read_text()
+    assert "ENSEMBLE OF SEEDS" in txt and "ENSEMBLE PAIRED: arm minus base" in txt and "PAIRED: arm minus base" in txt
+    res_e = pd.read_csv(out / "patient_rule_ensemble.csv")
+    assert set(res_e.seed) == {pr.ENSEMBLE_SEED} and len(res_e) == 2 * 2 * 2 * len(pr.RULES)
+    assert set(pd.read_csv(out / "image_level.csv").seed) == {0, 1, 2, 3, 4, pr.ENSEMBLE_SEED}
+    # the seeds' own rows are what they are without the ensemble
+    pd.testing.assert_frame_equal(pd.read_csv(out / "patient_rule.csv"), pd.read_csv(plain / "patient_rule.csv"))
+    with pytest.raises(SystemExit, match="repeat an arm and seed"):
+        pr.main(["--from-predictions", files[0], files[0], "--n-boot", "5", "--out", str(tmp_path / "dup")])
+
+
 def test_end_to_end_on_a_checkpoint(tmp_path):
     from referral_outcomes import run as referral
     from style_transfer_xfer import load_device
@@ -136,6 +187,8 @@ def test_end_to_end_on_a_checkpoint(tmp_path):
     assert len(res) == 2 * 2 * len(pr.RULES) and set(res.part) == {"test"}
     pred = pd.read_csv(out / "predictions.csv")
     assert set(zip(pred.camera, pred.part)) == {("tabletop", "val"), ("tabletop", "test"), ("handheld", "test")}
+    for proto, d in pred.groupby("protocol"):                             # the ensemble's threshold rule is the trainer's
+        assert pr.image_threshold(d, 0.85) == pytest.approx(d.shipped_threshold.iloc[0], abs=1e-6)
     n_test = load_device(str(B), "brset", 64, 42)["test"].df["patient"].nunique()
     assert (res[res.camera == "tabletop"].patients == n_test).all()
     # the shipped rule on this script's photo scores = referral_outcomes on the trainer's own
@@ -149,6 +202,10 @@ def test_end_to_end_on_a_checkpoint(tmp_path):
     again = tmp_path / "again"
     assert pr.main(["--from-predictions", str(out / "predictions.csv"), "--n-boot", "10", "--out", str(again)]) == 0
     pd.testing.assert_frame_equal(pd.read_csv(again / "patient_rule.csv"), res)
+    one = tmp_path / "one"
+    assert pr.main(["--from-predictions", str(out / "predictions.csv"), "--ensemble", "--n-boot", "10",
+                    "--out", str(one)]) == 0
+    assert "no arm has two or more seeds" in (one / "patient_rule_summary.txt").read_text()
     with pytest.raises(SystemExit, match="handheld val"):
         pr.main(["--from-predictions", str(out / "predictions.csv"), "--part", "val", "--out", str(again)])
     with pytest.raises(SystemExit):

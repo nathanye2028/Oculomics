@@ -33,7 +33,8 @@
 #          same score with a per-patient threshold, and each eye's photos averaged (the
 #          higher eye) with a per-patient threshold -> $OUT/patient/ for the pre-specified
 #          arm on test, $OUT/patient_<ARM_CK>_<PART>/ else (patient_rule_summary.txt;
-#          predictions.csv reruns the rules without a GPU).
+#          predictions.csv reruns the rules without a GPU). Each arm's seeds are also
+#          averaged photo by photo and scored as an ensemble, against the seeds it averages.
 #
 # Ablation arms (P, STRENGTH, FIELD or the profile changed) are chosen on the handheld VALIDATION
 # split and need a fresh ARM_OUT / ARM_CK each (and a fresh CK for another profile):
@@ -195,7 +196,7 @@ if has score; then
 fi
 if has patient; then
   $PY patient_rule.py --device "$DEVICE" --source-root "$B" --target-root "$M" --ckpt "${cks[@]}" \
-    --part "$PART" --num-workers "$WORKERS" --out "$PATIENT_OUT"
+    --part "$PART" --num-workers "$WORKERS" --ensemble --out "$PATIENT_OUT"
 fi
 wrote=()
 for f in "$CK/fit_report.txt" "$CK/fit_grid.jpg" "$CK"/check_seed*/check_summary.txt "$SCORE_OUT/score_summary.txt" \

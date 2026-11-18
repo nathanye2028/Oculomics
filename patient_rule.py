@@ -47,11 +47,24 @@ scored on that camera's own split (``style_transfer_xfer.load_device``).
 ``--part val`` scores the handheld VALIDATION split, for choosing between arms; there
 the tabletop rows are in-sample (that split set every threshold) and are marked so.
 
+Ensemble (``--ensemble``)
+-------------------------
+Each arm's seeds averaged photo by photo (the mean probability, per camera, split and
+protocol; every seed must have scored the same photos), then scored like one more seed:
+its shipped threshold re-set the trainer's way on the averaged scores (the highest
+threshold at which tabletop-validation photos reach ``--target-sens``), the patient
+rules as above. On the phone the ensemble runs every seed's network on each photo.
+Also reported, for every seed and the ensemble: image-level AUROC and oracle specificity
+over the graded photos (``style_transfer_xfer.py score``'s reading), so the ensemble can
+be set against the seeds it averages. No GPU: ``--from-predictions ... --ensemble``.
+
 Outputs: ``<out>/predictions.csv`` (one row per photo x protocol x split x checkpoint;
-``--from-predictions`` reruns the rules from it without a GPU), ``patient_rule.csv``
-(one row per arm x seed x camera x protocol x rule) and ``patient_rule_summary.txt``
-(mean over seeds, seeds meeting the targets, and the paired difference when two arms
-are given).
+``--from-predictions`` reruns the rules from it, or from several such files together,
+without a GPU), ``patient_rule.csv`` (one row per arm x seed x camera x protocol x rule)
+and ``patient_rule_summary.txt`` (mean over seeds, seeds meeting the targets, and the
+paired difference when two arms are given); with ``--ensemble`` also
+``patient_rule_ensemble.csv`` (the ensemble's rows, seed -1), ``image_level.csv`` and an
+ensemble section in the summary.
 """
 from __future__ import annotations
 
@@ -64,13 +77,15 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from metadata_model import target_vector, threshold_at_sensitivity  # noqa: E402
+from metadata_model import _auc, target_vector, threshold_at_sensitivity  # noqa: E402
 from referral_outcomes import patient_outcomes  # noqa: E402
 
 PRIMARY = "dr_referable"
 AGGREGATIONS = ("any", "eye_mean")
 RULES = (("shipped", "any"), ("any_patient", "any"), ("eye_mean", "eye_mean"))
 CAMERAS = ("tabletop", "handheld")
+ENSEMBLE_SEED = -1                     # the seed column's mark for an arm's seed ensemble
+PHOTO = ["camera", "part", "protocol", "file"]
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +169,7 @@ def evaluate(pred: pd.DataFrame, part: str, target_sens: float = 0.85, target_sp
             per = {agg: patient_scores(ev, agg) for agg in AGGREGATIONS}
             for rule, agg in RULES:
                 t = shipped if rule == "shipped" else thr[agg]
-                o = refer(per[agg], t, n_boot, int(seed)) if t == t else {}
+                o = refer(per[agg], t, n_boot, max(int(seed), 0)) if t == t else {}
                 sens, spec = o.get("sensitivity", float("nan")), o.get("specificity", float("nan"))
                 rows.append({"arm": arm, "seed": int(seed), "camera": cam, "protocol": proto, "rule": rule,
                              "aggregation": agg, "part": part, "threshold": t,
@@ -200,6 +215,119 @@ def summarise(res: pd.DataFrame, target_sens: float, target_spec: float) -> str:
             pd_ = d.groupby(level=key, sort=False).agg(["mean", "min", "max", "count"]).round(3)
             txt += (f"\n\nPAIRED: {arms[1]} minus {arms[0]}, same seed and patients (count = seeds with both)\n"
                     + pd_.to_string())
+    return txt
+
+
+# --------------------------------------------------------------------------- #
+# Seed ensemble
+# --------------------------------------------------------------------------- #
+def image_threshold(d: pd.DataFrame, target_sens: float) -> float:
+    """The trainer's shipped threshold, from ``d``'s tabletop-validation photos (one
+    protocol): the highest at which the photos with a DR grade reach ``target_sens``."""
+    v = d[(d["camera"] == "tabletop") & (d["part"] == "val") & d["truth"].notna()]
+    return threshold_at_sensitivity(v["truth"].astype(int).to_numpy(), v["p"].to_numpy(), target_sens)
+
+
+def check_unique(pred: pd.DataFrame) -> None:
+    """Refuse a photo scored twice under one arm and seed (two checkpoints given the same
+    arm and seed, or one predictions file given twice): the rules would pool both
+    checkpoints' photos and the ensemble would count them twice."""
+    dup = pred.duplicated(["arm", "seed"] + PHOTO)
+    if dup.any():
+        r = pred[dup].iloc[0]
+        raise ValueError(f"{int(dup.sum())} photo rows repeat an arm and seed (first: {r['arm']} seed {r['seed']} "
+                         f"{r['camera']} {r['part']} {r['protocol']} {r['file']})")
+
+
+def ensemble(pred: pd.DataFrame, target_sens: float = 0.85) -> pd.DataFrame:
+    """Per arm with two or more seeds, its ensemble as one more seed (``ENSEMBLE_SEED``):
+    each photo's probability averaged over the seeds, per camera, split and protocol, and
+    the shipped threshold re-set on the averaged scores (:func:`image_threshold`). Every
+    seed must have scored the same photos; arms with one seed are left out."""
+    check_unique(pred)
+    keys = PHOTO + ["patient", "eye", "gradable", "truth"]
+    out = []
+    for arm, d in pred.groupby("arm", sort=False):
+        seeds = sorted(d["seed"].unique().tolist())
+        if len(seeds) < 2:
+            print(f"  [ensemble] {arm}: one seed ({seeds[0]}), no ensemble")
+            continue
+        n = d.groupby(keys, dropna=False, sort=False)["seed"].nunique()
+        short = n[n != len(seeds)]
+        if len(short):
+            raise ValueError(f"{arm}: seeds {seeds} did not all score the same photos (e.g. "
+                             f"{dict(zip(keys, short.index[0]))} has {short.iloc[0]} of {len(seeds)})")
+        e = d.groupby(keys, dropna=False, sort=False)["p"].mean().reset_index()
+        thr = {proto: image_threshold(q, target_sens) for proto, q in e.groupby("protocol")}
+        e["shipped_threshold"] = e["protocol"].map(thr)
+        e.insert(0, "seed", ENSEMBLE_SEED)
+        e.insert(0, "arm", arm)
+        e["members"] = len(seeds)
+        out.append(e)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=list(pred.columns) + ["members"])
+
+
+def image_metrics(pred: pd.DataFrame, part: str, target_sens: float = 0.85) -> pd.DataFrame:
+    """Per arm x seed x camera x protocol on ``part``: AUROC and oracle specificity over
+    the photos with a DR grade, gradable or not -- ``style_transfer_xfer.py score``'s
+    reading, so a seed's numbers match its score stage."""
+    rows = []
+    for (arm, seed, cam, proto), d in pred[pred["part"] == part].groupby(["arm", "seed", "camera", "protocol"],
+                                                                          sort=False):
+        d = d[d["truth"].notna()]
+        y, p = d["truth"].astype(int).to_numpy(), d["p"].to_numpy()
+        orc = threshold_at_sensitivity(y, p, target_sens)
+        rows.append({"arm": arm, "seed": int(seed), "camera": cam, "protocol": proto, "part": part,
+                     "in_sample": cam == "tabletop" and part == "val", "photos": len(y), "auroc": _auc(y, p),
+                     "oracle_spec": float((p[y == 0] < orc).mean()) if orc == orc and (y == 0).any()
+                     else float("nan")})
+    return pd.DataFrame(rows)
+
+
+def summarise_ensemble(res_e: pd.DataFrame, res: pd.DataFrame, img: pd.DataFrame, target_sens: float,
+                       target_spec: float) -> str:
+    """The ensemble against the seeds it averages: image level, then per patient."""
+    part = res_e["part"].iloc[0]
+    fmt = lambda v: f"{v:.3f}"
+    order = {r: i for i, (r, _) in enumerate(RULES)}
+    single, ens = img[img["seed"] != ENSEMBLE_SEED], img[img["seed"] == ENSEMBLE_SEED]
+    ki, kp = ["camera", "protocol"], ["camera", "protocol", "rule"]
+    lines = []
+    for arm, r in res_e.groupby("arm", sort=False):
+        seeds = sorted(res.loc[res["arm"] == arm, "seed"].unique().tolist())
+        s = single[single["arm"] == arm].groupby(ki, sort=False)[["auroc", "oracle_spec"]]
+        e = ens[ens["arm"] == arm].set_index(ki)[["auroc", "oracle_spec"]]
+        it = pd.DataFrame({"auroc_ens": e["auroc"], "auroc_seeds": s.mean()["auroc"], "auroc_best": s.max()["auroc"],
+                           "oracle_ens": e["oracle_spec"], "oracle_seeds": s.mean()["oracle_spec"],
+                           "oracle_best": s.max()["oracle_spec"]}).reset_index()
+        mean = res[res["arm"] == arm].groupby(kp, sort=False)[["specificity", "oracle_spec"]].mean()
+        t = r.set_index(kp)[["sensitivity", "specificity", "referred", "oracle_spec"]].copy()
+        t["d_spec"] = t["specificity"] - mean["specificity"]
+        t["d_oracle"] = t["oracle_spec"] - mean["oracle_spec"]
+        t["meet"] = r.set_index(kp)["meets_targets"].map({True: "yes", False: "no"})
+        t = t.reset_index().sort_values(kp, key=lambda c: c.map(order) if c.name == "rule" else c)
+        lines += [f"\n--- {arm}: ensemble of seeds {seeds} ---", "image level",
+                  it.to_string(index=False, float_format=fmt), "per patient",
+                  t.to_string(index=False, float_format=fmt)]
+    txt = (f"\n\nENSEMBLE OF SEEDS ({part} split): each photo's probability averaged over an arm's seeds (per "
+           "camera, split and protocol), scored like one more seed -- its shipped threshold re-set the trainer's "
+           f"way on the averaged tabletop-validation photos (sensitivity {target_sens}), the patient rules as "
+           "above. On the phone it runs every seed's network on each photo.\n"
+           "image level: photos with a DR grade (the score stage's reading); ens = the ensemble, seeds = the mean "
+           "over its seeds, best = the best seed on this split (picked on it, so optimistic); oracle = "
+           f"specificity at sensitivity {target_sens} on this split's own labels.\n"
+           "per patient: d_spec / d_oracle = the ensemble minus the mean over its seeds; meet = sensitivity >= "
+           f"{target_sens} and specificity >= {target_spec}.\n"
+           + ("IN-SAMPLE: on the val split the tabletop rows are the patients that set every threshold.\n"
+              if part == "val" else "")
+           + "\n".join(lines))
+    arms = list(dict.fromkeys(res_e["arm"]))
+    if len(arms) == 2:
+        i0, i1 = (ens[ens["arm"] == a].set_index(ki)[["auroc", "oracle_spec"]] for a in arms)
+        p0, p1 = (res_e[res_e["arm"] == a].set_index(kp)[["sensitivity", "specificity", "oracle_spec"]] for a in arms)
+        txt += (f"\n\nENSEMBLE PAIRED: {arms[1]} minus {arms[0]}, same patients\nimage level\n"
+                + (i1 - i0).to_string(float_format=fmt) + "\nper patient\n"
+                + (p1 - p0).dropna(how="all").to_string(float_format=fmt))
     return txt
 
 
@@ -259,8 +387,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Per-patient referral, threshold chosen per patient on tabletop "
                                             "validation, from finished checkpoints.")
     p.add_argument("--ckpt", nargs="+", default=[], metavar="ARM=CKPT")
-    p.add_argument("--from-predictions", default=None, metavar="CSV",
-                   help="an earlier run's predictions.csv: the rules again, no GPU")
+    p.add_argument("--from-predictions", nargs="+", default=None, metavar="CSV",
+                   help="earlier runs' predictions.csv (one or more, pooled): the rules again, no GPU")
+    p.add_argument("--ensemble", action="store_true",
+                   help="also average each arm's seeds photo by photo and score that ensemble")
     p.add_argument("--source-root", default=None, help="override the checkpoints' recorded tabletop root")
     p.add_argument("--target-root", default=None, help="override the recorded handheld root")
     p.add_argument("--part", default="test", choices=["val", "test"],
@@ -277,23 +407,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.error("give --ckpt ARM=CKPT ... or --from-predictions, not both")
     os.makedirs(a.out, exist_ok=True)
     if a.from_predictions:
-        pred = pd.read_csv(a.from_predictions, dtype={"patient": str, "eye": str, "file": str})
+        pred = pd.concat([pd.read_csv(f, dtype={"patient": str, "eye": str, "file": str})
+                          for f in a.from_predictions], ignore_index=True)
         have = set(zip(pred["camera"], pred["part"]))
         missing = [f"{c} {s}" for c, s in (("tabletop", "val"), ("handheld", a.part)) if (c, s) not in have]
         if missing:
-            raise SystemExit(f"[fatal] {a.from_predictions} holds no {' / '.join(missing)} rows: score the "
-                             f"checkpoints with --part {a.part}")
+            raise SystemExit(f"[fatal] {', '.join(a.from_predictions)} holds no {' / '.join(missing)} rows: score "
+                             f"the checkpoints with --part {a.part}")
     else:
         pred = predict(a.ckpt, a.source_root, a.target_root, a.part, a.device, a.batch_size, a.num_workers)
         pred.to_csv(os.path.join(a.out, "predictions.csv"), index=False)
+    try:
+        check_unique(pred)
+    except ValueError as e:
+        raise SystemExit(f"[fatal] {e}")
     res = evaluate(pred, a.part, a.target_sens, a.target_spec, a.n_boot)
     res.to_csv(os.path.join(a.out, "patient_rule.csv"), index=False)
     txt = summarise(res, a.target_sens, a.target_spec)
+    wrote = ["patient_rule.csv", "patient_rule_summary.txt"]
+    if a.ensemble:
+        ens = ensemble(pred, a.target_sens)
+        if ens.empty:
+            txt += "\n\nENSEMBLE: no arm has two or more seeds; nothing to average."
+        else:
+            res_e = evaluate(ens, a.part, a.target_sens, a.target_spec, a.n_boot)
+            img = image_metrics(pd.concat([pred, ens], ignore_index=True), a.part, a.target_sens)
+            res_e.to_csv(os.path.join(a.out, "patient_rule_ensemble.csv"), index=False)
+            img.to_csv(os.path.join(a.out, "image_level.csv"), index=False)
+            txt += summarise_ensemble(res_e, res, img, a.target_sens, a.target_spec)
+            wrote += ["patient_rule_ensemble.csv", "image_level.csv"]
     print(txt)
     with open(os.path.join(a.out, "patient_rule_summary.txt"), "w") as f:
         f.write(txt + "\n")
-    print(f"\nwrote {a.out}/patient_rule.csv and patient_rule_summary.txt"
-          + ("" if a.from_predictions else " (photo scores: predictions.csv)"))
+    print(f"\nwrote {a.out}/: {', '.join(wrote)}" + ("" if a.from_predictions else " (photo scores: predictions.csv)"))
     return 0
 
 

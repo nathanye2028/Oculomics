@@ -770,6 +770,15 @@ def test_one_source_camera_with_the_other_held_out(tmp_path):
              "per1000_correct_clear", "per1000_retakes"]
     assert np.allclose(ro[every].sum(1), 1000.0)
     assert {"per1000_missed_at_0.055", "per1000_unnecessary_at_0.156"} <= set(ro.columns)
+    # the score-distribution figure's table, from the same saved files
+    from plot_score_distributions import collect, panel_stats
+    sc = collect(str(out), res["args"]["seed"], "dr_referable", ["home", "phone", "phone recal"])
+    assert list(dict.fromkeys(sc["panel"])) == ["home", "phone", "phone recal"]
+    assert set(sc["truth"]) <= {0, 1} and sc["score"].between(0, 1).all()
+    assert len(sc[sc["panel"] == "home"]) == len(pd.read_csv(out / "predictions_tabletop_trained.csv"))
+    st = panel_stats(sc).set_index("panel")
+    trained = pd.read_csv(out / "predictions_handheld_trained.csv")
+    assert st.loc["phone", "threshold"] == pytest.approx(trained["threshold_dr_referable"].iloc[0])
 
     # redesign_calibration rebuilds the run's own cameras: Canon filtered, Nikon held
     # out, with the trainer's exact splits -- so no training patient is a test patient

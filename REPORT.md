@@ -1064,3 +1064,20 @@ training (it reads the Canon-only checkpoints) and says first whether the refera
 back (`tab_sens` back toward 0.87); the arm is then trained and chosen on the validation split
 like any ablation (`PART=val`, `FINAL=1` for its single test read).
 
+**Seed ensemble (built 6 November; not yet run on the box).** `patient_rule.py --ensemble`
+averages each arm's seeds photo by photo and scores the average like one more seed: its shipped
+threshold re-set the trainer's way on the averaged tabletop-validation photos, then the same three
+patient rules. Next to it, image-level AUROC and oracle specificity for every seed and the
+ensemble (the score stage's reading), so the ensemble is read against the mean and the best of
+the seeds it averages. It needs no GPU once `predictions.csv` exists; the `patient` stage runs it,
+and an earlier run is re-read with
+
+```bash
+python patient_rule.py --from-predictions exp_phone_sim/patient/predictions.csv --ensemble --out exp_phone_sim/patient_ens
+```
+
+On the phone the ensemble runs all five networks on each photo (~5 x 0.7 ms on the ANE for
+V4-Small at 384). The phone-ceiling arms (`train_phone_ceiling.py`) save checkpoints without
+per-camera BN statistics, so `patient_rule.py` cannot score them; only `train_retinareach.py`
+checkpoints (the Canon sweep, the simulator arms) can be ensembled here.
+

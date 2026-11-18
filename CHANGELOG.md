@@ -2,6 +2,23 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md. Every branch is covered here, each heading naming the branch the work lives on; the retinal-age results are in that branch's own REPORT.md.
 
+## [Unreleased] — 2026-11-17 Phone simulator: what each stage does to a trained model  (branch `retinareach`)
+
+Why: `check` says the whole simulator fools the camera probe and costs referable photos signal (sensitivity 0.87 -> 0.74), but not which stage does either. Built and tested on synthetic data only; not yet run on the box.
+
+- `phone_sim_effects.py` (new, no training): finished `train_retinareach.py` checkpoints score one tabletop split as it is, re-rendered by the whole simulator and by variants of it, next to the real handheld split. Variants: the simulator without one stage (`drop_<stage>`), one stage alone (`only_<stage>`, `field+bloom`), strength 0 / 0.25 / 0.5 / 0.75, and the whole field. Every variant draws the same bank rows and jitter for a photo. Per arm, seed and variant, under the tabletop and the handheld statistics: AUROC, sensitivity / specificity / flagged share at the shipped threshold, oracle specificity at 0.85 sensitivity, the mean logit shift against the unsimulated photo among ICDR-0 and referable photos, and the share of ICDR-0 photos the trunk's camera probe (ICDR-0 training photos of the two cameras) calls handheld. Default split: validation (`--part test` for the test split); `--max-n` for a quick look. Writes `effects.csv`, `effects_summary.txt`, `grid.jpg` (dataset photos: default folder `ck_phone_sim/effects`).
+- `.vscode/launch.json`: three run configurations (the simulator's unit tests; the effects table for seed 0 of both arms; a 300-photo quick look). The mBRSET root in them is assumed to sit beside BRSET's on the box.
+- Tests: `tests/test_phone_sim_effects.py` (the variant list; end to end on a one-epoch checkpoint: one checkpoint under two names gives the same rows, the unsimulated row is its own reference, dropping a stage moves the logits, the split and `--max-n` options).
+
+## [Unreleased] — 2026-11-06 Seed ensemble in the per-patient rule  (branch `retinareach`)
+
+Why: averaging an arm's five seeds is the cheapest ranking gain left to test: no training, scored from the saved photo scores, and on the phone five V4-Small networks cost ~5 x 0.7 ms on the ANE. REPORT.md §10.12.
+
+- `patient_rule.py --ensemble`: each arm's seeds averaged photo by photo (mean probability per camera, split and protocol; every seed must have scored the same photos, an arm with one seed is left out), then scored like one more seed (`seed` -1): its shipped threshold re-set the trainer's way on the averaged tabletop-validation photos (the highest threshold at which the photos with a DR grade reach `--target-sens`), the three patient rules as before. Writes `patient_rule_ensemble.csv`, `image_level.csv` (AUROC and oracle specificity per seed and for the ensemble, over the photos with a DR grade: the score stage's reading) and an ensemble section in `patient_rule_summary.txt` (image level: ensemble, mean of its seeds, best seed; per patient: the ensemble and its gain over the mean of its seeds; the ensembles' paired difference when two arms are given). The seeds' own rows are unchanged.
+- `--from-predictions` takes several files and pools them (two score runs, two sweeps). A photo scored twice under one arm and seed is refused in both modes: the rules would have pooled two checkpoints' photos.
+- `run_phone_sim.sh`: the `patient` stage passes `--ensemble`.
+- Tests (`tests/test_patient_rule.py`): the ensemble is the per-photo mean of its seeds, its threshold the trainer's rule on the averages, mismatched or repeated photos refused, a one-seed arm skipped; on synthetic seeds with independent noise the ensemble ranks above its seeds' mean; two saved files pooled give the ensemble and paired sections and leave the seeds' rows as a run without `--ensemble` writes them; end to end, the recomputed image threshold equals the checkpoint's shipped threshold under both protocols.
+
 ## [Unreleased] — 2026-11-02 Per-patient referral rule and the whole-field simulator arm  (branch `retinareach`)
 
 Why: on the first box run the simulator fooled the model's own camera probe (0.85 of simulated grade-0 photos called handheld) without inventing disease, but referable eyes lost signal (Canon model's sensitivity on simulated referable photos 0.87 -> 0.74), and the field stage keeps only ~65 % of a Canon FOV. Separately, no model meets the targets per patient at its shipped threshold, phone-trained ones included (phone-only, seed 0: 0.891 / 0.767). REPORT.md §10.11-10.12.
