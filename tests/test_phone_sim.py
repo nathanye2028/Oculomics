@@ -1,0 +1,1788 @@
+"""phone_sim.py: the tabletop -> handheld simulator's primitives, its label safety
+on synthetic fundi (no invented lesions, planted lesions kept, the disc bloom
+leaves lesions beside the disc alone), the trainer's views, the fit / render CLI,
+and the training / check / score wiring on the synthetic camera pair."""
+import copy
+import functools
+import json
+import math
+import os
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image
+
+import phone_sim as ps
+
+
+def _fundus(n, size=96, phone=False, seed=0, lesions=None, info=False, yc=0.0, b=None):
+    """Synthetic model-view fundi: a phone view is a full circle in the frame, a
+    tabletop view the loader's squashed, truncated circle (b/a = 1.25, or ``b``). Disc
+    with vessels converging on it, a darker fovea, shading, mild grain. ``lesions`` =
+    list of (x, y, radius_px, rgb_delta) in frame coordinates, drawn on every image.
+    ``yc`` moves the FOV and everything in it down the frame (a Canon frame's FOV sits
+    up to 0.06 off the centre, so its two cuts are not equally far out)."""
+    g = torch.Generator().manual_seed(seed)
+    xx, yy = ps.frame_coords(n, size, size, "cpu")
+    yy = yy - yc
+    a, b = (1.0, 1.0) if phone else (1.0, 1.25 if b is None else b)
+    fov = ((xx / a) ** 2 + (yy / b) ** 2 <= 1.0).float()
+    base = torch.tensor((0.55, 0.2, 0.07) if phone else (0.66, 0.30, 0.10)).view(1, 3, 1, 1)
+    r2 = (xx / a) ** 2 + (yy / b) ** 2
+    img = base * (1 - 0.25 * r2).unsqueeze(1)
+    side = torch.where(torch.rand(n, generator=g) < 0.5, -1.0, 1.0)
+    dx, dy = 0.5 * side * a, 0.05 * torch.randn(n, generator=g)
+    dd = torch.sqrt((xx - dx.view(n, 1, 1)) ** 2 + ((yy - dy.view(n, 1, 1)) * a / b) ** 2)
+    img = img + 0.45 * torch.exp(-(dd / 0.09) ** 4).unsqueeze(1) * torch.tensor((0.5, 0.7, 0.8)).view(1, 3, 1, 1)
+    ang = torch.atan2((yy - dy.view(n, 1, 1)), xx - dx.view(n, 1, 1))
+    for k in range(6):                                  # vessels: dark rays leaving the disc
+        th = k * math.pi / 3 + 0.3
+        line = torch.exp(-((torch.sin(ang - th) * dd) / 0.03) ** 2) * (dd > 0.07) * (torch.cos(ang - th) > 0)
+        img = img * (1 - 0.35 * line.unsqueeze(1))
+    fd = torch.sqrt((xx + 0.1 * side.view(n, 1, 1)) ** 2 + (yy * a / b) ** 2)
+    img = img * (1 - 0.25 * torch.exp(-(fd / 0.12) ** 2)).unsqueeze(1)
+    for (lx, ly, rad, rgb) in lesions or []:
+        d = torch.sqrt(((xx - lx) * size / 2) ** 2 + ((yy + yc - ly) * size / 2) ** 2)
+        img = img + torch.tensor(rgb).view(1, 3, 1, 1) * torch.exp(-(d / rad) ** 2).unsqueeze(1)
+    img = img + (0.012 if phone else 0.003) * torch.randn(img.shape, generator=g)
+    out = (img.clamp(0.0, 1.0) * fov.unsqueeze(1)).clamp(0, 1)
+    return (out, {"dx": dx, "dy": dy}) if info else out
+
+
+def _profile(size=64, n=12, seed=0):
+    src, phone = _fundus(n, size, seed=seed + 1), _fundus(n, size, phone=True, seed=seed)
+    prof, _ = ps.fit_profile([phone], [src], size, log=lambda s: None)
+    if not np.isfinite(prof.bank["edge"]).any():
+        # at the model's size the synthetic phone photos are grain on soft edges: more than
+        # half of the edges' fine band is noise (0.87 at 384 px; 0.05 on real handheld
+        # samples), a reading the bank refuses. Their reading without that limit stands in,
+        # so that the tests at this size still run by rank
+        g = phone.mean(dim=1, keepdim=True)
+        plain = ps.edge_sharpness(g, _vessel_edges(phone), ps.noise_level(g, ps.fov_mask(phone)))
+        prof.bank["edge"][:] = plain.numpy()[prof.report["kept"]]
+    # what ``fit`` adds from its own renders (detail_by rank)
+    ps.fit_detail(prof, src, size, log=lambda s: None)
+    assert prof.params["detail_by"] == "rank" and prof.params["edge_src"] is not None
+    return prof
+
+
+@functools.lru_cache(maxsize=None)
+def _profile_at(size, n=8):
+    """A profile at the model's size or near it, fitted once per session (read-only:
+    copy it before changing it)."""
+    return _profile(size=size, n=n)
+
+
+def _vessel_edges(x):
+    """Where the detail stage reads a photo's edges: its strongest mid-band structure
+    away from the disc."""
+    d = ps.find_disc(x)
+    return ps.edge_select(x.mean(dim=1, keepdim=True), ps.fov_mask(x),
+                          skip=ps.disc_zone(torch.stack([d["cx"], d["cy"]], dim=1), d["r"]))
+
+
+def _bloomed(prof):
+    """A copy whose every bank row blows the disc out to near-white (the synthetic
+    phone discs never clip, so the fitted bank's bloom is 0 and the stage idles)."""
+    p = copy.deepcopy(prof)
+    p.bank["bloom"][:] = 1.0
+    p.bank["hcol"][:] = np.array([0.95, 0.9, 0.85], dtype=np.float32)
+    return p
+
+
+class _FixedGeometry(ps.PhoneSimulator):
+    """The first render's geometry reused for the next (a lesion beside the disc can
+    move the detected disc, and the comparison must be pixel for pixel)."""
+    geo = None
+
+    def _field(self, x01, prm, T):
+        if self.geo is None:
+            self.geo = super()._field(x01, prm, T)
+        return self.geo
+
+
+# --------------------------------------------------------------------------- #
+# primitives
+# --------------------------------------------------------------------------- #
+def test_blur_warp_and_aperture_primitives():
+    x = torch.rand(3, 3, 40, 40)
+    s = torch.tensor([0.0, 0.8, 1.7])
+    y = ps.blur(x, s)
+    assert torch.equal(y[0], x[0])
+    for i in (1, 2):
+        r = int(math.ceil(3 * float(s.max())))
+        assert torch.allclose(y[i:i + 1], TF.gaussian_blur(x[i:i + 1], 2 * r + 1, float(s[i])), atol=1e-5)
+    one = torch.ones(3)
+    assert torch.allclose(ps.warp(x, one, one, one, torch.zeros(3, 2), torch.zeros(3), (40, 40)), x, atol=1e-6)
+    yy, xx = torch.meshgrid(torch.arange(96), torch.arange(96), indexing="ij")
+    cb = (((xx + yy) % 2).float() * 0.6 + 0.2).expand(1, 3, 96, 96).contiguous()      # a 2 px checkerboard
+    small = ps.warp(cb, one[:1], one[:1], one[:1], torch.zeros(1, 2), torch.zeros(1), (64, 64))
+    assert small[..., 4:-4, 4:-4].std() < 0.04          # prefiltered: no aliased pattern (0.075 unfiltered)
+    ap = ps.aperture(torch.ones(1), 0.0023, 41, 41)
+    assert ap[0, 0, 20, 20] > 0.99 and ap[0, 0, 0, 0] < 1e-3 and ap[0, 0, 0, 20] > 0.5
+    # one sigma per axis: the horizontal one first, the vertical one as sigma_y
+    sx, sy = torch.tensor([0.0, 0.5, 1.2]), torch.tensor([0.9, 0.0, 0.4])
+    y = ps.blur(x, sx, sy)
+    for i in range(3):
+        ref = x[i:i + 1]
+        if sx[i] > 0:
+            ref = ps.blur(ref.transpose(-1, -2), 0.0, sx[i:i + 1]).transpose(-1, -2)    # a horizontal pass only
+        if sy[i] > 0:
+            ref = ps.blur(ref, 0.0, sy[i:i + 1])
+        assert torch.allclose(y[i:i + 1], ref, atol=1e-6)
+    line = torch.zeros(1, 1, 41, 41); line[..., 20, :] = 1.0                           # a horizontal line
+    assert torch.equal(ps.blur(line, torch.tensor([1.5]), torch.tensor([0.0])), line)   # blurred along itself only
+    assert ps.blur(line, torch.tensor([0.0]), torch.tensor([1.5]))[0, 0, 18, 20] > 0.05
+    with pytest.raises(ValueError, match="prefilter"):
+        ps.warp(x, one, one, one, torch.zeros(3, 2), torch.zeros(3), (40, 40), "sharp")
+
+
+def test_the_matched_prefilter_blurs_each_axis_by_its_own_step():
+    """A Canon-like frame (vertical semi-axis 1.25 frame half-heights) shrinks 1.5x
+    1.25 = 1.9 source px per output px vertically and 1.5 horizontally: ``matched``
+    blurs sqrt((step^2 - 1) / 6) px on each axis, ``gauss`` 0.5 sqrt(1.9^2 - 1) = 0.8
+    px on both. Fine vertical lines (horizontal detail) keep more of their contrast."""
+    one, z2, z0 = torch.ones(1), torch.zeros(1, 2), torch.zeros(1)
+    b = 1.25 * one
+    x = torch.rand(1, 3, 96, 96, generator=torch.Generator().manual_seed(0))
+    tall = torch.rand(1, 3, 120, 96, generator=torch.Generator().manual_seed(1))    # a mirror-padded source
+    xx, yy = ps.frame_coords(1, 64, 64, "cpu")
+    for src, bf in ((x, b), (tall, b * 96 / 120)):                      # the padded frame's b_f shrinks with it
+        for zoom in (1.0, 1.2):                                         # a zoom shortens both steps
+            fx, fy = (96 / 64) / zoom, (src.shape[-2] / 64) * float(bf) / zoom
+            for pf, (sx, sy) in (("matched", (math.sqrt((fx ** 2 - 1) / 6), math.sqrt((fy ** 2 - 1) / 6))),
+                                 ("gauss", (0.5 * math.sqrt(max(fx, fy) ** 2 - 1),) * 2)):
+                gx, gy = ps._to_source(xx, yy, zoom * one, one, bf, z2, z0)
+                ref = F.grid_sample(ps.blur(src, torch.tensor([sx]), torch.tensor([sy])), torch.stack([gx, gy], dim=-1),
+                                    mode="bilinear", padding_mode="zeros", align_corners=False)
+                assert torch.allclose(ps.warp(src, zoom * one, one, bf, z2, z0, (64, 64), pf), ref, atol=1e-6), (pf, zoom)
+    # ``gauss`` takes the larger step, each axis from its own source size: a padded frame's
+    # extra rows alone (the same picture, the same step) change nothing
+    wide = 0.6 * one                                                    # a frame wider than the padding makes it tall
+    assert torch.allclose(ps.warp(F.pad(x, (0, 0, 12, 12)), one, one, wide * 96 / 120, z2, z0, (64, 64), "gauss"),
+                          ps.warp(x, one, one, wide, z2, z0, (64, 64), "gauss"), atol=1e-5)
+    cols = (torch.arange(96) % 4 < 2).float().view(1, 1, 1, 96).expand(1, 3, 96, 96).contiguous()   # 4 px period
+    amp = {pf: float(ps.warp(cols, one, one, b, z2, z0, (64, 64), pf)[0, 0, 32, 8:56].std()) for pf in ps.PREFILTERS}
+    assert amp["matched"] > 1.5 * amp["gauss"]
+    same = ps.warp(x, one, one, one, z2, z0, (96, 96), "matched")       # a step of 1: nothing to filter
+    assert torch.allclose(same, x, atol=1e-4)                           # (the sampling grid's own rounding)
+
+
+def test_mirror_fill_reflects_rows_past_a_truncated_fovs_cut():
+    fov = ps.fov_mask(_fundus(2, 96))                                    # cut top and bottom, 0.6 of the width
+    assert torch.equal(ps.chord_rows(fov), torch.tensor([[0.0, 95.0], [0.0, 95.0]]))
+    assert torch.isnan(ps.chord_rows(ps.fov_mask(_fundus(2, 96, phone=True)))).all()      # a whole circle: no cut
+    x = torch.arange(10.0).view(1, 1, 10, 1).expand(2, 1, 10, 3).contiguous()             # row r holds r
+    lines = torch.tensor([[1.0, 8.0], [float("nan"), 8.0]])
+    y = ps.mirror_fill(x, lines, torch.tensor([2.0, 3.0]), 4)[:, 0, :, 0]
+    #          rows -4 -3 -2 -1 | 0  1  2 ... 8 | 9 10 11 12 13     (line 1 mirrors row 0 to row 2; depth 2: to row -1)
+    assert y[0].tolist() == [0, 0, 0, 3, 2, 1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 0, 0, 0]
+    assert y[1].tolist() == [0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 0, 0]        # no top line: black above
+    assert torch.equal(ps.mirror_fill(x, torch.full((2, 2), float("nan")), torch.zeros(2), 0), x)
+    # one pair of lines per column: column 1 mirrors a row deeper (a notch in the cut)
+    per_col = torch.tensor([[[1.0, 3.0, 1.0], [8.0, 8.0, 8.0]], [[float("nan")] * 3, [8.0, 8.0, 8.0]]])
+    y = ps.mirror_fill(x, per_col, torch.tensor([2.0, 3.0]), 4)[0, 0]
+    assert y[:, 0].tolist() == [0, 0, 0, 3, 2, 1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 0, 0, 0]
+    assert y[:, 1].tolist() == [0, 0, 0, 0, 0, 5, 4, 3, 4, 5, 6, 7, 8, 7, 6, 0, 0, 0]     # rows 1-2 mirrored about 3
+
+
+def test_the_mirror_line_follows_a_notch_and_skips_the_edge_ramp():
+    """A Canon frame darkens over a few rows toward its cut, and a frame's edge there is
+    not one straight row (rounded corners, a notch): the mirror line sits past the ramp
+    (inside it, a dark seam crossed the render) and under a notch, column by column (one
+    line for the frame left it in the render as a dark dash); the render shows neither."""
+    x = _fundus(2, 288, seed=3)
+    ramp = torch.ones(288); ramp[:5] = torch.tensor([0.6, 0.7, 0.8, 0.88, 0.94])        # the samples' Canon frames
+    x = x * ramp.view(1, 1, 288, 1)
+    x[..., :1, 60:230:3] = 0.0                                                          # the cut's own row: ragged
+    x[..., :7, 150:160] = 0.0                                                           # a notch: 14 x 20 px at 576
+    fov = ps.fov_mask(x)
+    ch = ps.chord_rows(fov)
+    inset = ps.chord_inset(x, ch)
+    assert torch.equal(ch, torch.tensor([[1.0, 287.0], [1.0, 287.0]]))                  # row 0 is under half width
+    assert (inset[:, 0] >= 4).all() and (inset[:, 0] <= 5).all() and (inset[:, 1] == 1).all()
+    lines = ps.cut_lines(fov, ch, inset)
+    # past the ramp from the cut's row, whatever the column's own first row; under the notch
+    assert (lines[:, 0, 100:106] == 1 + inset[:, :1]).all() and (lines[:, 0, 155] == 7 + inset[:, 0]).all()
+    assert torch.isnan(lines[:, 0, 5]).all() and (lines[:, 1, 100] == 287 - 1).all()    # past the cut's end: none
+    # the render against the same fundus without ramp, tab or ragged row: row by row over the
+    # centre columns of the top of the circle (vessels average out), neither shows
+    clean = _fundus(2, 288, seed=3)
+    xx, yy = ps.frame_coords(2, 192, 192, "cpu")
+    mid = (xx.abs() < 0.3) & (yy < -0.6) & (xx ** 2 + yy ** 2 < 0.94 ** 2)
+    rows = lambda y: (y.mean(dim=1) * mid).sum(dim=2) / mid.sum(dim=2).clamp_min(1)       # [2,192]
+    used = mid.sum(dim=2) > 20
+
+    def top_rows(src, prof):
+        sim = ps.PhoneSimulator(prof, stages=("field",), strength=0.0, out_size=192)
+        return rows(sim(src, torch.Generator().manual_seed(0))), sim._last
+
+    prof = _profile_at(192)
+    (got, L), (want, _) = top_rows(x, prof), top_rows(clean, prof)
+    assert (L["mirrored"] > 0.01).all()
+    ratio = (got / want.clamp_min(1e-3))[used]
+    assert ratio.min() > 0.97 and ratio.max() < 1.03, (ratio.min(), ratio.max())
+    # one line a fixed two rows inside the cut (the first build) leaves both in the circle
+    class _EarlyLine(ps.PhoneSimulator):
+        def _field(self, x01, prm, T):
+            geo = super()._field(x01, prm, T)
+            c = ps.chord_rows(ps.fov_mask(x01))
+            geo["lines"] = torch.stack([c[:, 0] + 2, c[:, 1] - 2], dim=1).unsqueeze(-1)
+            return geo
+
+    early = rows(_EarlyLine(prof, stages=("field",), strength=0.0, out_size=192)(x, torch.Generator().manual_seed(0)))
+    assert (early / want.clamp_min(1e-3))[used].min() < 0.93
+
+
+def test_fov_shape_reads_the_loaders_squash():
+    tab, phone = ps.fov_shape(_fundus(4, 96)), ps.fov_shape(_fundus(4, 96, phone=True))
+    assert tab["reliable"].all() and phone["reliable"].all()
+    assert torch.allclose(tab["aspect"], torch.full((4,), 0.8), atol=0.03)
+    assert torch.allclose(phone["aspect"], torch.ones(4), atol=0.03)
+    assert torch.allclose(tab["a_f"], torch.ones(4), atol=0.05)
+
+
+def test_disc_finder_takes_the_vessel_hub_not_a_rim_reflection():
+    x, where = _fundus(4, 96, phone=True, seed=3, info=True)
+    xx, yy = ps.frame_coords(4, 96, 96, "cpu")
+    band = ((torch.sqrt(xx ** 2 + yy ** 2) > 0.8) & (torch.sqrt(xx ** 2 + yy ** 2) < 0.95) & (yy > 0.3)).float()
+    x = (x + 0.45 * band.unsqueeze(1)).clamp(0, 1) * ps.fov_mask(x)        # a bright reflection crescent
+    d = ps.find_disc(x)
+    assert ((d["cx"] - where["dx"]).abs() < 0.1).all() and ((d["cy"] - where["dy"]).abs() < 0.1).all()
+    assert (ps.disc_confidence(d) > 0).all() and (ps.disc_gate(d) == 1).all()
+
+
+def test_an_ambiguous_disc_pick_switches_the_disc_steps_off():
+    """Two equally disc-like candidates (on the samples a PDR eye's laser-scar patch
+    tied with its disc on every training view, and the bloom whitened the lesions
+    there): no bloom, no shift toward the drawn photo's disc position, no mirroring."""
+    assert torch.allclose(ps.disc_gate({"margin": torch.tensor([1.0, 1.2, 1.3, 1.4, 5.0])}),
+                          torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0]))
+    x = _fundus(2, 96, phone=True, seed=3)
+    pair = 0.5 * (x + x.flip(-1))                                       # a mirror-image twin of the disc
+    assert (ps.find_disc(pair)["margin"] < 1.05).all() and (ps.find_disc(x)["margin"] > 2).all()
+    prof = _profile()
+    sim = ps.PhoneSimulator(prof, out_size=64)
+    sim(pair, torch.Generator().manual_seed(0))
+    assert (sim._last["disc_conf"] == 0).all()
+    sim(x, torch.Generator().manual_seed(0))
+    assert (sim._last["disc_conf"] > 0).all()
+    # every disc-keyed step reads the gated confidence: a bank whose rows bloom the disc
+    # white, pull it to the centre and keep it on the other side renders the pair exactly
+    # as the plain bank does -- and does change the render of the unambiguous photo
+    keyed = _bloomed(prof)
+    keyed.bank["disc_x"] = -keyed.bank["disc_x"]
+    keyed.bank["disc_dist"][:] = 0.0
+    for seed in (0, 1, 2):
+        plain = ps.PhoneSimulator(prof, out_size=64)(pair, torch.Generator().manual_seed(seed))
+        assert torch.equal(ps.PhoneSimulator(keyed, out_size=64)(pair, torch.Generator().manual_seed(seed)), plain)
+    plain = ps.PhoneSimulator(prof, out_size=64)(x, torch.Generator().manual_seed(0))
+    assert (ps.PhoneSimulator(keyed, out_size=64)(x, torch.Generator().manual_seed(0)) - plain).abs().max() > 0.05
+
+
+def test_zoom_and_shift_keep_the_aperture_inside_a_truncated_field():
+    fov = ps.fov_mask(_fundus(2, 96))
+    one = torch.ones(2)
+    a_f, b_f, centre, rot = one, one * 1.25, torch.zeros(2, 2), torch.zeros(2)
+    z = ps.min_zoom(fov, torch.full((2,), 1.1), a_f, b_f, centre, rot)
+    # clears the flat top/bottom (1.25 here), within one step of the 48-step grid
+    assert (z >= 1.25).all() and (z <= 1.27).all()
+    want = torch.tensor([[0.6, 0.0], [0.05, 0.0]])
+    got = ps.safe_shift(fov, want, z, a_f, b_f, centre, rot)
+    assert got[0, 0] < 0.6 and torch.allclose(got[1], want[1])
+    inside = ps._rim_inside(fov, z.view(2, 1), a_f, b_f, (centre + got).view(2, 1, 2), rot, radius=1.0, n_pts=96)
+    assert (inside >= 0.98).all()                                           # at the aperture's own edge
+    z2, ok = ps.min_zoom(fov, torch.full((2,), 1.1), a_f, b_f, centre, rot, return_ok=True)
+    assert torch.equal(z2, z) and ok.all()
+    xx, yy = ps.frame_coords(2, 96, 96, "cpu")
+    tiny = fov & (xx ** 2 + yy ** 2 < 0.09).unsqueeze(1)                     # no zoom up to 1.8 fits in it
+    z3, ok3 = ps.min_zoom(tiny, torch.full((2,), 1.1), a_f, b_f, centre, rot, return_ok=True)
+    assert not ok3.any() and torch.allclose(z3, torch.full((2,), 1.8))
+
+
+# --------------------------------------------------------------------------- #
+# profile and render
+# --------------------------------------------------------------------------- #
+def test_profile_round_trip_and_guards(tmp_path):
+    prof = _profile()
+    path = tmp_path / "p.json"
+    prof.save(str(path))
+    back = ps.PhoneProfile.load(str(path))
+    assert len(back) == len(prof) and back.image_size == 64
+    assert all(np.allclose(back.bank[k], prof.bank[k], atol=1e-6, equal_nan=True) for k in ps.BANK_KEYS)
+    assert back.format == ps.FORMAT and back.params == prof.params
+    assert {k: back.params[k] for k in ps.RENDER_V3} == ps.RENDER_V3 and back.params["detail_by"] == "rank"
+    assert len(back.params["edge_src"]) >= 2 and back.params["edge_src"] == sorted(back.params["edge_src"])
+    blob = json.loads(path.read_text())
+    blob["format"] = "phone_sim/1"                     # an older format: its bank's estimators differ
+    path.write_text(json.dumps(blob))
+    with pytest.raises(ValueError, match="not a phone_sim/2 or phone_sim/3 profile"):
+        ps.PhoneProfile.load(str(path))
+    with pytest.raises(ValueError, match="missing"):
+        ps.PhoneProfile(64, {k: v for k, v in prof.bank.items() if k != "med"})
+    with pytest.raises(ValueError, match="measured at 64 px"):
+        ps.PhoneSimulator(prof, out_size=96).render(_fundus(2, 96), ps.PhoneSimulator(prof).sample(2, torch.Generator()))
+    with pytest.raises(ValueError, match="unknown phone_sim stages"):
+        ps.PhoneSimulator(prof, stages=("field", "sparkle"))
+    # a misspelt colour mode would silently run another ablation; reversed limits clamp every gain
+    for bad in ({"colour_mode": "coupld"}, {"light_lim": [2.5, 0.25]}, {"kappa": [0.4]}, {"disc_margin": [1.4, 1.2]},
+                {"prefilter": "sharp"}, {"fill": 0.5}, {"detail_by": "blur"}, {"edge_src": [0.4]},
+                {"edge_src_whole": [0.4]}, {"edge_src_whole": [0.4, float("nan")]}, {"edge_src_whole": "x"},
+                {"edge_src": [0.4, float("nan")]}):
+        with pytest.raises(ValueError):
+            ps.PhoneProfile(64, prof.bank, {**prof.params, **bad})
+    with pytest.raises(ValueError, match="edge_src"):                   # a fit that never read its renders
+        ps.PhoneSimulator(prof.with_params(edge_src=None))
+    with pytest.raises(ValueError, match="strength"):                   # above 1 a channel extrapolates past 0
+        ps.PhoneSimulator(prof, strength=1.2)
+
+
+def _as_v2_blob(prof):
+    """What ``fit`` wrote before format /3: no render options, no edge reading."""
+    blob = {"format": "phone_sim/2", "image_size": prof.image_size, "source": {}, "report": {},
+            "params": {k: v for k, v in prof.params.items() if k not in ps.LEGACY_PARAMS and k not in ps.EDGE_SRC.values()},
+            "bank": {k: np.asarray(v).tolist() for k, v in prof.bank.items() if k in ps.BANK_KEYS}}
+    return blob
+
+
+def test_a_format_2_profile_keeps_the_render_it_was_fitted_with(tmp_path):
+    """An arm trained with a /2 profile is re-read with the render it saw: the profile
+    loads with the old render's options, whatever the defaults are now; the new render
+    on its bank is asked for by name, and what the bank cannot serve is refused."""
+    prof = _profile()
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(_as_v2_blob(prof)))
+    old = ps.PhoneProfile.load(str(path))
+    assert old.format == "phone_sim/2" and {k: old.params[k] for k in ps.LEGACY_PARAMS} == ps.LEGACY_PARAMS
+    x = _fundus(4, 96, seed=5)
+    y_old = ps.PhoneSimulator(old, out_size=64)(x, torch.Generator().manual_seed(1))
+    as_v2 = ps.PhoneSimulator(prof.with_params(**ps.LEGACY_PARAMS), out_size=64)
+    assert torch.equal(y_old, as_v2(x, torch.Generator().manual_seed(1)))               # the options, not the format
+    assert (as_v2._last["mirrored"] == 0).all() and (as_v2._last["zoom"] >= 1.2).all()   # the clearing zoom
+    old.save(str(path))                                                               # saved as it was loaded
+    again = ps.PhoneProfile.load(str(path))
+    assert again.format == "phone_sim/2" and again.params == old.params
+    new = old.with_params(**ps.RENDER_V3)
+    assert new.format == ps.FORMAT and new.params["fill"] == ps.RENDER_V3["fill"] and new.params["detail_by"] == "band"
+    y_new = ps.PhoneSimulator(new, out_size=64)(x, torch.Generator().manual_seed(1))
+    assert (y_new - y_old).abs().max() > 0.05 and old.params["fill"] == 0.0             # the original untouched
+    for by in ("edge", "rank"):
+        with pytest.raises(ValueError, match="edge reading"):
+            ps.PhoneSimulator(old.with_params(detail_by=by))
+
+
+# what tests/fixtures/phone_sim_v2_reference.npz holds: the photos (8-bit), a phone_sim/2 profile
+# whose bank blows the disc out in most rows, and its renders at generator seed 1, 64 px, by
+# the code that fitted it
+V2_RENDERS = {"full": {}, "field": {"stages": ("field",)}, "half": {"strength": 0.5}, "whole": {"field": "whole"},
+              "no_field": {"stages": ("light", "colour", "bloom", "detail", "noise", "rim")}}
+
+
+def _stream_probe():
+    """A few draws of torch's CPU generator: the stored renders were drawn from this stream."""
+    g = torch.Generator().manual_seed(1)
+    return np.concatenate([torch.randn(4, generator=g).numpy(), torch.rand(4, generator=g).numpy(),
+                           torch.randint(0, 1000, (4,), generator=g).float().numpy()])
+
+
+def _old_render_moved(got, want):
+    """None when a /2 render is the stored one up to another build's rounding, else the
+    per-photo largest difference and the share of pixels 1e-4 or more off. Every pixel
+    within 1e-4 is inside the chain's own answer to rounding: the detail stage's target
+    (``robust_colour``'s lscale, about 0.01, after the illumination fit) moves by up to
+    6e-4 relative when one primitive rounds differently, and a photo whose blur is mixed
+    between two rungs answers with 1.3x that, on a few dozen pixels. A changed render is
+    off on every photo and most pixels."""
+    off = (got - want).abs()
+    share = float((off >= 1e-4).float().mean())
+    if float(off.max()) < 2e-3 and share < 0.02:
+        return None
+    return [round(float(v), 6) for v in off.flatten(1).amax(dim=1)], round(share, 4)
+
+
+def test_a_format_2_profile_renders_what_it_rendered_when_fitted(tmp_path):
+    """A phone_sim/2 profile renders what the code that fitted it rendered (stored: the
+    last commit before format /3, see tests/fixtures/make_phone_sim_v2_reference.py), so an
+    arm trained with one can be re-read. The test above compares two ways of asking
+    this code for the old render; this one would notice the old render itself moving
+    (a change to the code both generations share). The photos are stored with the
+    renders, so the synthetic fixture can change without switching this test off; it
+    skips only where torch draws other random numbers than it did for the stored renders.
+    If it fails on another machine with one photo a few 1e-4 off on a few pixels, that is
+    rounding; the stored file is only ever regenerated from commit 45d8b37."""
+    ref = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "phone_sim_v2_reference.npz"))
+    if not np.allclose(_stream_probe(), ref["stream"], atol=1e-6):
+        pytest.skip("torch's random stream differs here from the one the stored renders were drawn with")
+    x = torch.from_numpy(ref["x"]).float() / 255
+    path = tmp_path / "v2.json"
+    path.write_text(str(ref["profile"]))
+    old = ps.PhoneProfile.load(str(path))
+    assert old.format == "phone_sim/2" and {k: old.params[k] for k in ps.LEGACY_PARAMS} == ps.LEGACY_PARAMS
+    assert float(old.bank["bloom"].max()) == 1.0 and float(np.median(old.bank["bloom"])) > 0.4      # the bloom is on
+    for name, kw in V2_RENDERS.items():
+        y = ps.PhoneSimulator(old, out_size=64, **kw)(x, torch.Generator().manual_seed(1))
+        want = torch.from_numpy(ref[name].astype(np.float32)) / 65535          # (stored in 16 bits;
+        got = y if want.shape == y.shape else y[..., ::2, ::2]                 # the variants on every other pixel)
+        assert _old_render_moved(got, want) is None, (name, _old_render_moved(got, want))
+    # another build's rounding is not a change -- an average pooled in float64 and rounded
+    # back moves the full chain by a few 1e-4 on some pixels of the one photo whose detail
+    # blur is mixed between two rungs -- and a small real change still is one
+    full = lambda: ps.PhoneSimulator(old, out_size=64)(x, torch.Generator().manual_seed(1))
+    want = torch.from_numpy(ref["full"].astype(np.float32)) / 65535
+    pool, noise = F.adaptive_avg_pool2d, ps.noise_level
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ps.F, "adaptive_avg_pool2d", lambda t, grid: pool(t.double(), grid).to(t.dtype))
+        y = full()
+    assert _old_render_moved(y, want) is None, _old_render_moved(y, want)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ps, "noise_level", lambda g, m, flat_q=0.32, **kw: noise(g, m, flat_q, **kw))
+        assert _old_render_moved(full(), want) is not None
+
+
+def test_render_is_reproducible_bounded_and_phone_shaped():
+    prof = _profile()
+    sim = ps.PhoneSimulator(prof, out_size=64)
+    x = _fundus(4, 96, seed=5)                                            # supersampled tabletop view
+    y1 = sim(x, torch.Generator().manual_seed(1))
+    y2 = sim(x, torch.Generator().manual_seed(1))
+    y3 = sim(x, torch.Generator().manual_seed(2))
+    assert y1.shape == (4, 3, 64, 64) and torch.equal(y1, y2) and not torch.equal(y1, y3)
+    assert torch.isfinite(y1).all() and y1.min() >= 0 and y1.max() <= 1
+    assert y1[..., :3, :3].abs().max() == 0                               # corners outside the aperture
+    # the squash is undone: the fixture's FOV is 1.25x taller than wide in the loader's view
+    assert sim._last["reliable"].all()
+    assert torch.allclose(sim._last["b_f"] / sim._last["a_f"], torch.full((4,), 1.25), atol=0.05)
+    g = sim.geometry(x)
+    assert g.shape == y1.shape
+    with pytest.raises(ValueError, match="batch"):                        # another batch's warp is refused
+        sim.geometry(0.9 * x)
+    for k in range(1, len(ps.STAGES) + 1):                                 # every prefix of the chain runs
+        z = ps.PhoneSimulator(prof, stages=ps.STAGES[:k], out_size=64)(x, torch.Generator().manual_seed(1))
+        assert torch.isfinite(z).all()
+    # strength 0 ~ geometry only, against its own geometry (0.08 if strength were ignored)
+    weak_sim = ps.PhoneSimulator(prof, strength=0.0, out_size=64)
+    weak = weak_sim(x, torch.Generator().manual_seed(1))
+    inner = ps.erode(ps.fov_mask(weak), 9)
+    assert (weak_sim._last["mirrored"] > 0).all()
+    assert (weak - weak_sim.geometry(x)).abs().max() < 1e-4               # the mirrored caps included
+    # ... and where no mirrored cap is in view, a plain warp of the model-size view
+    ref = F.interpolate(x, size=(64, 64), mode="bilinear", antialias=True, align_corners=False)
+    ref = ps.warp(ref, *[weak_sim._last[k] for k in ("zoom", "a_f", "b_f", "offset", "rot")], (64, 64))
+    xx, yy = ps.frame_coords(4, 64, 64, "cpu")
+    mid = inner & (yy.abs() < 0.6).unsqueeze(1)
+    assert (weak - ref).abs()[mid.expand_as(weak)].mean() < 0.015
+
+
+def test_augment_resizes_everything_and_renders_a_share():
+    sim = ps.PhoneSimulator(_profile(), out_size=64)
+    x = _fundus(8, 96, seed=6)
+    plain = F.interpolate(x, size=(64, 64), mode="bilinear", antialias=True, align_corners=False)
+    assert torch.allclose(sim.augment(x, 0.0, torch.Generator().manual_seed(0), 64), plain)
+    y = sim.augment(x, 1.0, torch.Generator().manual_seed(0), 64)
+    assert y.shape == (8, 3, 64, 64) and all(not torch.allclose(y[i], plain[i]) for i in range(8))
+    y = sim.augment(x, 0.5, torch.Generator().manual_seed(0), 64)
+    pick = torch.rand(8, generator=torch.Generator().manual_seed(0)) < 0.5
+    assert [not torch.allclose(y[i], plain[i]) for i in range(8)] == pick.tolist()      # the picked slots
+
+
+def test_augment_views_puts_each_render_in_its_own_slot():
+    """Training at p 0.5: exactly the drawn photos are re-rendered, each from its own
+    whole-FOV view in its own slot (a mix-up would train a render under another photo's
+    label); the rest keep their crop."""
+    sim = ps.PhoneSimulator(_profile(), out_size=64)
+    full = torch.cat([_fundus(1, 96, seed=40 + i) for i in range(8)])               # 8 different photos
+    crop = F.interpolate(full, size=(64, 64), mode="bilinear", antialias=True, align_corners=False)
+    y = sim.augment_views(crop, full, 0.5, torch.Generator().manual_seed(0))
+    g = torch.Generator().manual_seed(0)
+    pick = torch.rand(8, generator=g) < 0.5
+    idx = pick.nonzero()[:, 0]
+    assert 0 < len(idx) < 8 and not torch.equal(idx, torch.arange(len(idx)))       # not a prefix
+    ref = sim.render(full[idx], sim.sample(len(idx), g), out_size=64)               # the same draws, one render
+    assert torch.equal(y[idx], ref) and torch.equal(y[~pick], crop[~pick])
+
+
+def _blob_aspect(y, xy, radius):
+    """Width / height of the brightest blob (above half its peak over the local
+    level) within ``radius`` of ``xy``, from its second moments."""
+    B, _, H, W = y.shape
+    xx, yy = ps.frame_coords(B, H, W, "cpu")
+    lum = y.mean(dim=1)
+    near = (xx - xy[:, 0].view(B, 1, 1)) ** 2 + (yy - xy[:, 1].view(B, 1, 1)) ** 2 <= radius.view(B, 1, 1) ** 2
+    lo = torch.stack([lum[b][near[b]].median() for b in range(B)]).view(B, 1, 1)
+    hi = torch.stack([lum[b][near[b]].max() for b in range(B)]).view(B, 1, 1)
+    w = ((lum > lo + 0.5 * (hi - lo)) & near).float()
+    n = w.sum(dim=(1, 2))
+    mx, my = (w * xx).sum(dim=(1, 2)) / n, (w * yy).sum(dim=(1, 2)) / n
+    vx = (w * (xx - mx.view(B, 1, 1)) ** 2).sum(dim=(1, 2)) / n
+    vy = (w * (yy - my.view(B, 1, 1)) ** 2).sum(dim=(1, 2)) / n
+    return torch.sqrt(vx / vy)
+
+
+def test_training_views_render_the_whole_fov_with_round_retinas():
+    """The trainer's views: a Canon-like frame's training crop (random resized crop,
+    width capped at 1.1x the height) cuts the FOV on all four sides and its ellipse
+    cannot be read -- un-squashed with the whole frame's aspect, simulated retinas came
+    out 14 % wide. TrainViews hands the simulator the whole FOV instead, where it
+    reads the squash; the photos it leaves alone keep the training crop. At 192 px,
+    where the disc has enough pixels for its shape to be measured (+-2 %)."""
+    frame = _fundus(1, 360, phone=True, seed=2)[..., 36:324, :]          # FOV cut top and bottom, W/H 1.25
+    img = Image.fromarray((frame[0].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8))
+    tv = ps.TrainViews(192, 288)
+    torch.manual_seed(0)
+    views = [tv(img) for _ in range(4)]
+    crop, full = torch.stack([v["crop"] for v in views]), torch.stack([v["full"] for v in views])
+    assert crop.shape == (4, 3, 192, 192) and full.shape == (4, 3, 288, 288)
+    sim = ps.PhoneSimulator(_profile_at(192), stages=("field",), out_size=192)
+    y = sim.augment_views(crop, full, 1.0, torch.Generator().manual_seed(0))
+    assert y.shape == crop.shape and sim._last["reliable"].all()
+    assert torch.allclose(sim._last["b_f"] / sim._last["a_f"], torch.full((4,), 1.25), atol=0.05)
+    asp = _blob_aspect(y, sim._last["disc_xy"], 2.5 * sim._last["disc_r"])
+    assert ((asp > 0.93) & (asp < 1.07)).all(), asp                        # the round disc stays round
+    assert torch.equal(sim.augment_views(crop, full, 0.0, torch.Generator().manual_seed(0)), crop)
+
+
+# --------------------------------------------------------------------------- #
+# label safety
+# --------------------------------------------------------------------------- #
+def _spots(x, frac=0.35, floor=0.02, r=3):
+    """Lesion-scale spots per image: green-channel points darker (or brighter) than
+    ALL eight neighbours ``r`` px away -- a dot, which a straight vessel never is --
+    by more than ``frac`` of the background's own spread (so a global contrast change
+    does not count) and than ``floor`` (microaneurysms are several percent deep),
+    inside the FOV, away from the rim and the optic disc."""
+    B, _, H, W = x.shape
+    g = ps.blur(x[:, 1:2], 0.7)
+    p = torch.nn.functional.pad(g, (r, r, r, r), mode="replicate")
+    ring = torch.stack([p[..., r + dy:r + dy + H, r + dx:r + dx + W]
+                        for dy in (-r, 0, r) for dx in (-r, 0, r) if (dy, dx) != (0, 0)])
+    depth = torch.maximum(ring.amin(dim=0) - g, g - ring.amax(dim=0))
+    m = ps.erode(ps.fov_mask(x), 9)
+    disc = ps.find_disc(x)
+    xx, yy = ps.frame_coords(B, H, W, "cpu")
+    far = (((xx - disc["cx"].view(B, 1, 1)) ** 2 + (yy - disc["cy"].view(B, 1, 1)) ** 2).sqrt()
+           > 2.0 * disc["r"].clamp_min(0.08).view(B, 1, 1)).unsqueeze(1)
+    spread = ps.robust_colour(x, m)["scale"][:, 1].view(B, 1, 1, 1)
+    peak = depth == torch.nn.functional.max_pool2d(depth, 5, 1, 2)
+    return ((depth > torch.clamp(frac * spread, min=floor)) & peak & m & far).sum(dim=(1, 2, 3))
+
+
+def test_no_lesion_like_spots_on_a_clean_fundus():
+    """Every stage but the field and the grain: illumination, colour, detail and rim
+    may not draw a lesion-scale spot the tabletop photo did not have (a strong unsharp
+    mask fails this). The bloom needs the field stage: see the tests below."""
+    prof = _profile(size=96)
+    x = _fundus(6, 96, seed=8)
+    stages = tuple(s for s in ps.STAGES if s not in ("field", "noise"))
+    for seed in (0, 1, 2):
+        y = ps.PhoneSimulator(prof, stages=stages, out_size=96)(x, torch.Generator().manual_seed(seed))
+        assert (_spots(y) <= _spots(x) + 1).all()
+
+
+def _with_dots(y, geo, depth=0.03, rad=1.5, n=5):
+    """``n`` microaneurysm-sized dark dots per image (green ``depth`` below the
+    background, red and blue less), on a ring half the aperture out, at least 3 disc
+    radii from the disc and apart from each other."""
+    B, _, H, W = y.shape
+    xx, yy = ps.frame_coords(B, H, W, "cpu")
+    out = y.clone()
+    for b in range(B):
+        ang = torch.linspace(0, 2 * math.pi, 24 + 1)[:-1]
+        px, py = 0.5 * torch.cos(ang), 0.5 * torch.sin(ang)
+        far = torch.sqrt((px - geo["disc_xy"][b, 0]) ** 2 + (py - geo["disc_xy"][b, 1]) ** 2) > 3 * geo["disc_r"][b]
+        for k in torch.nonzero(far)[:, 0][::3][:n].tolist():
+            d2 = ((xx[b] - px[k]) ** 2 + (yy[b] - py[k]) ** 2) * (W / 2) ** 2
+            out[b] = out[b] - depth * torch.exp(-d2 / (2 * rad ** 2)) * torch.tensor([0.8, 1.0, 0.3]).view(3, 1, 1)
+    return out.clamp(0, 1) * (y.amax(dim=1, keepdim=True) > 0)
+
+
+def test_no_lesion_like_spots_at_the_models_size():
+    """The whole chain but the grain, field and bloom included, at the model's size from
+    a supersampled view: no lesion-scale spot appears more than 2 disc radii from the
+    disc, and 3 %-deep microaneurysm-sized dots added to its output are found (the
+    detector can see what it guards against; at 96 px it cannot). Nearer the disc
+    _spots is blind: the bloom's reach is pinned down by the next test."""
+    prof = _bloomed(_profile_at(384))
+    x = _fundus(4, 576, seed=8)
+    kw = dict(frac=0.15, floor=0.01)
+    base = _spots(F.interpolate(x, size=(384, 384), mode="bilinear", antialias=True, align_corners=False), **kw)
+    sim = ps.PhoneSimulator(prof, stages=tuple(s for s in ps.STAGES if s != "noise"), out_size=384)
+    for seed in (0, 1):
+        y = sim(x, torch.Generator().manual_seed(seed))
+        s = _spots(y, **kw)
+        assert (s <= base + 1).all(), (s, base)
+        found = _spots(_with_dots(y, sim._last), **kw) - s
+        assert found.sum() >= 0.6 * 5 * len(y), found
+
+
+def _bloom_pair(prof, x, size, seed=7):
+    """The same fundi rendered through field, light and colour with and without the
+    bloom, one geometry, one set of draws: (bloom on, bloom off, geometry, draws)."""
+    on = _FixedGeometry(prof, stages=("field", "light", "colour", "bloom"), out_size=size)
+    off = _FixedGeometry(prof, stages=("field", "light", "colour"), out_size=size)
+    prm = on.sample(x.shape[0], torch.Generator().manual_seed(seed))
+    return on.render(x, prm), off.render(x, prm), on, off, prm
+
+
+def test_the_bloom_changes_nothing_beyond_the_disc():
+    """The disc bloom's support ends at 1.1 detected disc radii: bloom on vs off, same
+    draws and geometry, the green channel is identical beyond it. Reaching 1.3 radii
+    (and 1.15 or 1.2) it was not."""
+    prof = _bloomed(_profile())
+    for fseed in (21, 22, 23):
+        x = _fundus(4, 96, seed=fseed)
+        y_on, y_off, on, _, _ = _bloom_pair(prof, x, 64)
+        g = on.geo
+        assert (g["disc_conf"] > 0).all() and (y_on - y_off).abs().max() > 0.1           # the bloom acts
+        xx, yy = ps.frame_coords(4, 64, 64, "cpu")
+        dist = torch.sqrt((xx - g["disc_xy"][:, 0].view(4, 1, 1)) ** 2 + (yy - g["disc_xy"][:, 1].view(4, 1, 1)) ** 2)
+        beyond = (dist > 1.1 * g["disc_r"].view(4, 1, 1) * (1 + 1e-3)).unsqueeze(1)
+        assert (y_on - y_off)[:, 1:2][beyond].abs().max() == 0
+
+
+def test_the_bloom_leaves_lesions_beside_the_disc_alone():
+    """A dot haemorrhage or an exudate whose core lies wholly outside the bloom's 1.1
+    radii (centred at 1.25) keeps its contrast, bloom on vs off: at 192 px, where the
+    disc's radius is ~9 px and a lesion core 1.2 px. With a 1.3-radii region
+    and a weight steepest just above the FOV mean, such lesions came out up to 2x more
+    conspicuous."""
+    prof = _bloomed(_profile_at(192))
+    for fseed in (21, 22):
+        x = _fundus(4, 288, seed=fseed)
+        yc_on, yc_off, on, off, prm = _bloom_pair(prof, x, 192)
+        g = on.geo
+        assert (g["disc_conf"] > 0).all()
+        ang = torch.linspace(0, 2 * math.pi, 7)[:-1] + 0.3
+        px = g["disc_xy"][:, :1] + 1.25 * g["disc_r"].view(-1, 1) * torch.cos(ang)   # [4,6], output frame
+        py = g["disc_xy"][:, 1:] + 1.25 * g["disc_r"].view(-1, 1) * torch.sin(ang)
+        sx, sy = ps._to_source(px, py, g["zoom"], g["a_f"], g["b_f"], g["offset"], g["rot"])
+        xx, yy = ps.frame_coords(4, 288, 288, "cpu")
+        xl = x.clone()
+        for j in range(6):
+            rgb = torch.tensor((-0.12, -0.12, -0.03) if j % 2 == 0 else (0.15, 0.13, -0.02)).view(1, 3, 1, 1)
+            d = torch.sqrt(((xx - sx[:, j].view(4, 1, 1)) * 144) ** 2 + ((yy - sy[:, j].view(4, 1, 1)) * 144) ** 2)
+            xl = xl + rgb * torch.exp(-(d / 1.6) ** 2).unsqueeze(1)
+        xl = xl.clamp(0, 1) * ps.fov_mask(x)
+        yl_on, yl_off = on.render(xl, prm), off.render(xl, prm)
+        xo, yo = ps.frame_coords(4, 192, 192, "cpu")
+        n = 0
+        for j in range(6):
+            core = (torch.sqrt((xo - px[:, j].view(4, 1, 1)) ** 2 + (yo - py[:, j].view(4, 1, 1)) ** 2) * 96
+                    <= 1.2).unsqueeze(1)
+            weber = lambda yl, yc: (((yl - yc)[:, 1:2] * core).sum(dim=(1, 2, 3))
+                                    / (yc[:, 1:2] * core).sum(dim=(1, 2, 3)).clamp_min(1e-4))
+            w_on, w_off = weber(yl_on, yc_on), weber(yl_off, yc_off)
+            ok = (w_off.abs() > 0.02) & (torch.sqrt(px[:, j] ** 2 + py[:, j] ** 2) < 0.9)
+            r = w_on[ok] / w_off[ok]
+            n += int(ok.sum())
+            assert ((r > 0.9) & (r < 1.1)).all(), r
+        assert n >= 18                                                        # most lesions measured
+
+
+def test_the_aperture_shows_no_black_from_outside_the_tabletop_fov():
+    """At the model's size the aperture never reaches past the truncated tabletop FOV:
+    tested at 0.97 of its radius, the coverage check left black chords in the circle
+    (a simulator-only cue, kept through the whole chain)."""
+    sim = ps.PhoneSimulator(_profile_at(384), stages=("field",), out_size=384)
+    xx, yy = ps.frame_coords(4, 384, 384, "cpu")
+    inner = (xx ** 2 + yy ** 2 < 0.98 ** 2).unsqueeze(1)
+    for fseed, dseed in ((8, 0), (9, 1)):
+        y = sim(_fundus(4, 576, seed=fseed), torch.Generator().manual_seed(dseed))
+        assert int(((y.amax(dim=1, keepdim=True) < 1e-3) & inner).sum()) == 0
+
+
+def test_the_whole_field_keeps_the_lesions_the_phone_field_crops():
+    """FIELD whole (the ablation): zoom 1 and no framing shift, so a blot at the edge
+    of the tabletop FOV survives where the phone field's clearing zoom (~1.25 on the
+    fixture; ``fill`` 0, the render of the /2 profiles) crops it; at strength 0 both
+    are pure geometry, so with and without the blot differ only where the blot lands."""
+    size = 96
+    prof = _profile_at(size).with_params(fill=0.0)
+    blot = [(-0.88, 0.0, 3.0, (-0.25, -0.12, -0.04))]                      # inside the FOV, near its left edge
+    clean, les = _fundus(2, int(1.5 * size), seed=3), _fundus(2, int(1.5 * size), seed=3, lesions=blot)
+    shown = {}
+    for field in ps.FIELDS:
+        sim = ps.PhoneSimulator(prof, strength=0.0, out_size=size, field=field)
+        y_c = sim(clean, torch.Generator().manual_seed(4))
+        y_l = sim(les, torch.Generator().manual_seed(4))
+        shown[field] = float((y_c - y_l).abs().amax())
+        zoom = sim._last["zoom"]
+        assert (zoom == 1).all() if field == "whole" else (zoom >= 1.2).all()
+    assert shown["whole"] > 0.1 and shown["phone"] < 0.01
+    with pytest.raises(ValueError, match="field"):
+        ps.PhoneSimulator(prof, field="wide")
+
+
+def test_the_whole_field_keeps_outside_the_fov_black_and_the_bloom_on():
+    """Inside the aperture, what lies outside a truncated tabletop FOV (its flat top and
+    bottom: |y| > 0.8 in the fixture once un-squashed) stays black through the colour
+    map and the rim haze, at full strength; the disc is still found and bloomed."""
+    size = 96
+    prof = _bloomed(_profile_at(size))
+    x = _fundus(4, int(1.5 * size), seed=11)
+    sim = ps.PhoneSimulator(prof, out_size=size, field="whole")
+    y = sim(x, torch.Generator().manual_seed(5))
+    xx, yy = ps.frame_coords(4, size, size, "cpu")
+    chord = ((yy.abs() > 0.9) & (xx.abs() < 0.2) & (xx ** 2 + yy ** 2 < 0.97 ** 2)).unsqueeze(1)
+    assert int(chord.sum()) > 0 and float(y.amax(dim=1, keepdim=True)[chord].max()) < 1e-3
+    inner = (xx ** 2 + yy ** 2 < 0.5 ** 2).unsqueeze(1)
+    assert float(y.amax(dim=1, keepdim=True)[inner].min()) > 0.02             # the retina itself is there
+    assert (sim._last["disc_conf"] > 0).all() and not sim._last["clear"].any()
+    no_bloom = ps.PhoneSimulator(prof, out_size=size, field="whole",
+                                 stages=[s for s in ps.STAGES if s != "bloom"])
+    assert (y - no_bloom(x, torch.Generator().manual_seed(5))).abs().max() > 0.1
+
+
+def test_the_trainer_hands_the_field_to_the_simulator(tmp_path, monkeypatch):
+    from train_retinareach import main as train
+    prof_path = tmp_path / "profile.json"
+    _profile_at(64).save(str(prof_path))
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def init(self, *args, **kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(ps.PhoneSimulator, "__init__", init)
+    roots = ["--source-root", str(tmp_path / "b"), "--target-root", str(tmp_path / "m"), "--phone-sim", str(prof_path)]
+    for extra, want in (([], "phone"), (["--phone-sim-field", "whole"], "whole")):
+        with pytest.raises(Stop):
+            train(roots + extra)
+        assert seen["field"] == want
+    with pytest.raises(SystemExit):
+        train(roots + ["--phone-sim-field", "wide"])
+
+
+def test_grain_lands_on_the_drawn_photos_noise_level():
+    prof = _profile(size=96)
+    sim = ps.PhoneSimulator(prof, stages=("noise",), out_size=96)
+    x = ps.blur(_fundus(6, 96, seed=12), 1.5) * ps.fov_mask(_fundus(6, 96, seed=12))      # nearly grain-free
+    prm = sim.sample(6, torch.Generator().manual_seed(4))
+    y = sim.render(x, prm)
+    m = ps.fov_mask(x)
+    got = ps.noise_level(y.mean(dim=1, keepdim=True), m)
+    want = torch.from_numpy(prof.bank["noise"])[prm["idx"]]
+    have = ps.noise_level(x.mean(dim=1, keepdim=True), m)
+    ok = want > have * 1.2                                    # rows that ask for more grain than x has
+    r = got[ok] / want[ok]
+    assert ok.any() and (r.median() - 1).abs() < 0.1 and (r - 1).abs().max() < 0.2       # x0.8 or x1.25 fail
+
+
+def test_planted_lesions_keep_their_sign_and_contrast():
+    """Lesions planted on a TABLETOP photo (where the chain does act: it changes the
+    fixture's tabletop view ~25 %, its phone view ~3 %) keep their sign and their
+    contrast relative to the local level, within 0.7-1.3x, in R, G and luminance (0.65
+    when every row asks for the most blur, the 0.8 px cap: a soft phone photo softens
+    microaneurysms too). A 3x3 colour map (mk) or a per-channel one fails this; so
+    does an unsharp mask, or a blur past the cap."""
+    lesions = [(0.0, 0.35, 1.6, (-0.10, -0.12, -0.03)),                    # dot haemorrhage / MA
+               (-0.3, -0.35, 2.2, (-0.15, -0.16, -0.04)),
+               (0.25, -0.2, 1.8, (0.18, 0.15, -0.02))]                     # hard exudate (yellow)
+    prof = _profile(size=96)
+    soft = copy.deepcopy(prof)
+    soft.bank["edge"] = soft.bank["edge"] * 0.01
+    stages = tuple(s for s in ps.STAGES if s != "field")                    # positions stay put
+    xx, yy = ps.frame_coords(1, 96, 96, "cpu")
+
+    def rel(a, b, c):                     # mean relative contrast over the lesion core; c 3 = luminance
+        if c == 3:
+            a, b, c = a.mean(dim=1, keepdim=True), b.mean(dim=1, keepdim=True), 0
+        return ((a - b)[:, c][:, core] / b[:, c][:, core].clamp_min(1e-3)).mean(dim=1)
+
+    for p, lo in ((prof, 0.7), (soft, 0.65)):
+        sim = ps.PhoneSimulator(p, stages=stages, out_size=96)
+        for fseed, dseed in ((11, 3), (12, 4)):
+            clean = _fundus(4, 96, seed=fseed)
+            with_l = _fundus(4, 96, seed=fseed, lesions=lesions)
+            yc = sim.render(clean, sim.sample(4, torch.Generator().manual_seed(dseed)))
+            yl = sim.render(with_l, sim.sample(4, torch.Generator().manual_seed(dseed)))
+            for (lx, ly, rad, rgb) in lesions:
+                core = torch.sqrt(((xx - lx) * 48) ** 2 + ((yy - ly) * 48) ** 2)[0] <= rad
+                for c in (0, 1, 3):                                         # B: the tabletop's is nearly flat
+                    before, after = rel(with_l, clean, c), rel(yl, yc, c)
+                    if c < 3:
+                        assert (torch.sign(after) == torch.sign(before)).all()
+                    r = after / before
+                    assert ((r > lo) & (r < 1.3)).all(), (c, r)
+
+
+def test_blotch_reads_zero_on_an_evenly_lit_field():
+    """The residual blotchiness of a smoothly lit circle (every phone photo and every
+    render is one) is 0: smoothing it over cells outside the FOV read 0.10-0.13."""
+    xx, yy = ps.frame_coords(1, 96, 96, "cpu")
+    r2 = xx ** 2 + yy ** 2
+    x = torch.stack([0.4 * torch.ones_like(r2), 0.4 * (1 - 0.3 * r2), 0.1 * torch.ones_like(r2)], 1) \
+        * (r2 <= 0.96).unsqueeze(1)
+    assert ps.illum_coeffs(x, with_residual=True)[1].item() < 0.01
+
+
+def test_cross_fitted_report_uses_every_real_photo():
+    """Real handheld photos outside the bank go to alternate folds (they were dropped),
+    and a fold without one is left out instead of crashing on an empty batch."""
+    prof = _profile()
+    src_hi, real = _fundus(4, 96, seed=30), _fundus(6, 64, phone=True, seed=31)
+    for rows in (np.array([0, 2, 4, 6, -1, -1]), np.full(6, -1)):
+        df, y, diag, counts = ps.cross_fitted_report(prof, src_hi, real, rows, 0, 64, log=lambda s: None)
+        assert df is not None and sum(nr for _, _, nr in counts) == 6 and y.shape == (4, 3, 64, 64)
+        assert {"zoom", "clear", "reliable", "disc_margin"} <= set(diag)
+    df, *_ = ps.cross_fitted_report(prof, src_hi, real[:0], np.zeros(0, dtype=int), 0, 64, log=lambda s: None)
+    assert df is None
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+                    reason="no CUDA or MPS device")
+def test_fit_and_report_run_on_a_gpu_device():
+    """fit's measurements and report on a GPU device, as on the box (every other test
+    runs on the CPU, which missed a device mix-up that stopped the fit there)."""
+    dev = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    prof, _ = ps.fit_profile([_fundus(4, 192, phone=True, seed=1).to(dev)], [_fundus(4, 192, seed=2).to(dev)], 192,
+                             log=lambda s: None)
+    said = ps.fit_detail(prof, _fundus(4, 288, seed=3).to(dev), 192, log=lambda s: None)     # fit's step: both chains
+    assert prof.params["detail_by"] == "rank" and len(said) == 2
+    assert prof.params["edge_src"] and prof.params["edge_src_whole"] and prof.params["edge_src"] != prof.params["edge_src_whole"]
+    for field in ("phone", "whole"):
+        y = ps.PhoneSimulator(prof, out_size=192, field=field)(_fundus(2, 288, seed=5).to(dev), torch.Generator().manual_seed(0))
+        assert y.device.type == dev.type and bool(torch.isfinite(y).all()) and float(y.max()) > 0.1, field
+    df, y, _, _ = ps.cross_fitted_report(prof, _fundus(4, 288, seed=3).to(dev),
+                                         _fundus(4, 192, phone=True, seed=4).to(dev), np.arange(4), 0, 192,
+                                         log=lambda s: None)
+    assert df is not None and y.device.type == dev.type
+    assert set(ps.BANK_KEYS) <= set(ps.describe(_fundus(2, 64, phone=True).to(dev)))  # 64 px: MPS pools on the CPU
+
+
+# --------------------------------------------------------------------------- #
+# format /3: the handheld's scale, detail matched on edges
+# --------------------------------------------------------------------------- #
+def test_the_phone_field_renders_at_the_handhelds_scale_with_mirrored_caps():
+    """With ``fill`` the zoom is the drawn one (the handheld's angular scale), not the
+    ~1.25 that clears the fixture's truncated frame; the caps the aperture then reaches
+    past the cut show the mirror image of the retina beside it (a blot 0.06 frame
+    half-heights inside the cut appears a second time, as far outside it), nothing black;
+    and without ``fill`` the same draws zoom until the cut is cleared."""
+    size = 96
+    prof = _profile_at(size)
+    assert prof.params["fill"] == 0.18 and prof.params["zoom"] < 1.2
+    blot = [(0.0, -0.94, 2.5, (-0.25, -0.12, -0.04))]                      # just inside the top cut (y = -1)
+    clean, les = _fundus(4, int(1.5 * size), seed=3), _fundus(4, int(1.5 * size), seed=3, lesions=blot)
+    xx, yy = ps.frame_coords(4, size, size, "cpu")
+    for strength in (0.0, 1.0):
+        sim = ps.PhoneSimulator(prof, stages=("field",), strength=strength, out_size=size)
+        prm = sim.sample(4, torch.Generator().manual_seed(4))
+        prm["rot"], prm["jit"] = torch.zeros(4), torch.zeros(4, 2)         # the blot's place is then known
+        y_c, y_l = sim.render(clean, prm), sim.render(les, prm)
+        L = sim._last
+        want = (1 + strength * (prm["zoom"] - 1)).clamp_min(1 / 0.95)
+        # at strength 0 the zoom is what fits the filled FOV -- 1 / (0.8 + 0.18), less the mirror
+        # line's inset and the margin kept from the FOV's soft edge -- far from the cut's 1.25
+        assert ((L["zoom"] >= want - 1e-3) & (L["zoom"] <= want + 0.04)).all() and L["clear"].all()
+        assert (L["mirrored"] > 0.005).all() and (L["mirrored"] < 0.09).all()
+        inner = (xx ** 2 + yy ** 2 < 0.98 ** 2).unsqueeze(1)
+        assert int(((y_c.amax(dim=1, keepdim=True) < 1e-3) & inner).sum()) == 0      # no black in the circle
+        d = (y_c - y_l)[:, 1].abs()
+        seen = 0
+        for sy_src in (-0.94, -1.06):                                      # the blot, and its mirror image past the cut
+            y_out = (sy_src - L["offset"][:, 1]) * L["zoom"] / L["b_f"]
+            for b in torch.nonzero(y_out > -0.96)[:, 0].tolist():          # (a larger drawn zoom leaves it outside)
+                r = int(round((float(y_out[b]) + 1) / 2 * size - 0.5))
+                assert d[b, max(r - 2, 0):r + 3, size // 2 - 3:size // 2 + 3].max() > 0.05, (strength, sy_src, b)
+                seen += sy_src < -1
+        assert seen == 4 if strength == 0 else seen >= 1
+    old = ps.PhoneSimulator(prof.with_params(fill=0.0), stages=("field",), out_size=size)
+    y_c, y_l = old.render(clean, prm), old.render(les, prm)
+    assert (old._last["zoom"] >= 1.24).all() and (old._last["mirrored"] == 0).all()
+    assert (old._last["zoom"] > sim._last["zoom"] + 0.05).all()
+    # a whole-circle FOV has no cut: nothing to mirror, the drawn zoom as it is
+    sim = ps.PhoneSimulator(prof, stages=("field",), out_size=size)
+    sim(_fundus(4, int(1.5 * size), phone=True, seed=3), torch.Generator().manual_seed(4))
+    assert (sim._last["mirrored"] == 0).all() and torch.isnan(sim._last["lines"]).all()
+
+
+def _rim_on(mask, pad, zoom, a_f, b_f, offset, n=720):
+    """The share of an aperture's rim that lands on ``mask`` ([Hp,W] bool: a frame with
+    ``pad`` rows added above and below), from the geometry in the frame's own
+    coordinates -- pixel arithmetic, nothing rescaled to the padded frame."""
+    H, W = mask.shape[0] - 2 * pad, mask.shape[1]
+    th = torch.arange(n) * 2 * math.pi / n
+    gx, gy = a_f * torch.cos(th) / zoom + offset[0], b_f * torch.sin(th) / zoom + offset[1]
+    col, row = torch.round((gx + 1) / 2 * W - 0.5).long(), torch.round((gy + 1) / 2 * H - 0.5).long() + pad
+    ok = (col >= 0) & (col < W) & (row >= 0) & (row < mask.shape[0])
+    return float((mask[row.clamp(0, mask.shape[0] - 1), col.clamp(0, W - 1)] & ok).float().mean())
+
+
+def test_the_filled_field_keeps_its_bearings_on_an_off_centre_fov():
+    """A Canon frame's FOV sits off the frame's centre (so its two cuts are not equally
+    far out), and the mirror-filled frame is taller than the photo: the framing shift
+    asked for is the shift made; between the mirror lines the render is the photo's own
+    warp under the geometry it reports; the aperture stays on the filled FOV, inside the
+    circle its sides were fitted with, and at strength 0 the zoom is the smallest that
+    keeps it there. (A step that mixes the photo's frame with the padded one passes
+    every test on a centred FOV.)"""
+    size, S = 96, 144
+    prof = _profile_at(size).with_params(disc_margin=[50.0, 60.0])        # no disc pick passes: no disc shift
+    jit = torch.tensor([[0.0, 0.03], [0.0, -0.03], [0.02, 0.02], [0.0, 0.0]])
+    xx, yy = ps.frame_coords(4, size, size, "cpu")
+
+    def field(x, strength, zoom, shift=jit):
+        sim = ps.PhoneSimulator(prof, stages=("field",), strength=strength, out_size=size)
+        prm = sim.sample(4, torch.Generator().manual_seed(4))
+        prm["rot"], prm["zoom"], prm["jit"] = torch.zeros(4), torch.full((4,), zoom), shift
+        return sim.render(x, prm), sim, sim._last
+
+    def filled_fov(x, sim, L, sh):
+        """The FOV the aperture may show, built in the photo's own pixel rows: itself,
+        plus the mirrored caps inside the fitted circle, less the margin kept from its
+        soft edge."""
+        fov = ps.fov_mask(x)
+        full, _ = sim._filled(fov.float(), L["lines"], L["depth"])
+        pad = (full.shape[-2] - S) // 2
+        yn = ((torch.arange(full.shape[-2]).float() - pad + 0.5) / S * 2 - 1).view(1, -1, 1)
+        xn = ((torch.arange(S).float() + 0.5) / S * 2 - 1).view(1, 1, -1)
+        circle = (xn / sh["a_f"].view(4, 1, 1)) ** 2 + ((yn - sh["yc"].view(4, 1, 1)) / L["b_f"].view(4, 1, 1)) ** 2 <= 1
+        own = F.pad(fov.float(), (0, 0, pad, pad)) > 0.5
+        return ps.erode((full > 0.5) & (circle.unsqueeze(1) | own), 2 * round(S / 48) + 1)[:, 0], circle, pad
+
+    for yc in (0.06, -0.06, 0.15):
+        x = _fundus(4, S, seed=3, yc=yc)
+        sh = ps.fov_shape(x)
+        assert sh["reliable"].all() and torch.allclose(sh["yc"], torch.full((4,), yc), atol=0.005)
+        centre = torch.stack([torch.zeros(4), sh["yc"]], dim=1)
+        y, sim, L = field(x, 1.0, 1.3)
+        ab = torch.stack([L["a_f"], L["b_f"]], dim=1)
+        assert (L["disc_conf"] == 0).all() and torch.isfinite(L["lines"]).any()
+        # room for the whole shift at this zoom: the shift made is the shift asked for
+        assert torch.allclose(L["offset"], centre + jit * ab, atol=1e-4), yc
+        # between the mirror lines the render is the photo's own warp under that geometry
+        ref = ps.warp(x, L["zoom"], L["a_f"], L["b_f"], L["offset"], L["rot"], (size, size), "matched")
+        _, gy = ps._to_source(xx, yy, L["zoom"], L["a_f"], L["b_f"], L["offset"], L["rot"])
+        row = (gy + 1) / 2 * S - 0.5
+        top = torch.nan_to_num(L["lines"][:, 0], nan=-1e9).amax(dim=1).view(4, 1, 1)
+        bot = torch.nan_to_num(L["lines"][:, 1], nan=1e9).amin(dim=1).view(4, 1, 1)
+        own = ((row > top + 3) & (row < bot - 3) & (xx ** 2 + yy ** 2 < 0.95 ** 2)).unsqueeze(1).expand_as(y)
+        assert own.float().mean() > 0.5 and (y - ref)[own].abs().max() < 1e-3, yc
+        # strength 0: the smallest zoom whose aperture stays on the filled FOV (the simulator
+        # tries 48 zooms, 0.017 apart, with 96 rim points; this reads 720)
+        _, sim, L = field(x, 0.0, 1.3)
+        mask, circle, pad = filled_fov(x, sim, L, sh)
+        for b in range(4):
+            on = lambda z: _rim_on(mask[b], pad, z, L["a_f"][b], L["b_f"][b], L["offset"][b])
+            z = float(L["zoom"][b])
+            assert on(z) >= 0.97, (yc, b, on(z))
+            assert on(z - 0.035) < 0.97, (yc, b, z, on(z - 0.035))      # no smaller zoom would do
+            assert _rim_on(circle[b], pad, z, L["a_f"][b], L["b_f"][b], L["offset"][b]) >= 0.99
+        # a shift the filled FOV has no room for (a quarter of the radius, at a zoom that
+        # barely fits) is held back: the aperture stays on the filled FOV, inside the fitted
+        # circle, and shows no black
+        big = torch.tensor([[0.25, 0.0], [0.0, 0.2], [0.2, 0.15], [-0.25, -0.1]])
+        y, sim, L = field(x, 1.0, 1.02, big)
+        mask, circle, pad = filled_fov(x, sim, L, sh)
+        made = (L["offset"] - centre).norm(dim=1) / (big * ab).norm(dim=1)
+        assert (made < 0.7).all(), (yc, made)
+        for b in range(4):
+            geo = (float(L["zoom"][b]), L["a_f"][b], L["b_f"][b], L["offset"][b])
+            assert _rim_on(mask[b], pad, *geo) >= 0.97, (yc, b, _rim_on(mask[b], pad, *geo))
+            assert _rim_on(circle[b], pad, *geo) >= 0.99, (yc, b)
+        assert not ((y.amax(dim=1) < 1e-3) & (xx ** 2 + yy ** 2 < 0.97 ** 2)).any(), yc
+
+
+def test_fill_needs_the_fov_ellipse_and_the_aperture_stays_in_its_circle():
+    """Without the FOV's sides (a crop that cuts them) the ellipse is not read: nothing is
+    mirrored, and the zoom clears the cut as it did. With a shallow cut the mirrored caps
+    reach past the fitted circle beside them: that part is not FOV to the aperture."""
+    size, S = 96, 144
+    prof = _profile_at(size)
+    crop = _fundus(2, 192, seed=3)[..., 24:168, 24:168]                   # the FOV runs off both sides
+    assert not ps.fov_shape(crop)["reliable"].any() and torch.isfinite(ps.chord_rows(ps.fov_mask(crop))).all()
+    sim = ps.PhoneSimulator(prof, stages=("field",), out_size=size)
+    sim(crop, torch.Generator().manual_seed(1))
+    assert torch.isnan(sim._last["lines"]).all() and (sim._last["mirrored"] == 0).all()
+    assert (sim._last["zoom"] >= 1.24).all()
+    # a shallow cut (0.9 of the radius): the mirrored caps reach past the circle beside them;
+    # none of that counts as FOV, and what the FOV itself shows all does
+    x = _fundus(2, S, seed=3, b=1 / 0.9)
+    sh, fov = ps.fov_shape(x), ps.fov_mask(x)
+    ch = ps.chord_rows(fov)
+    lines = ps.cut_lines(fov, ch, ps.chord_inset(x, ch))
+    b_f = sh["a_f"] / sh["aspect"]
+    depth = 0.18 * b_f * S / 2
+    centre = torch.stack([torch.zeros(2), sh["yc"]], dim=1)
+    cov, ky = ps.PhoneSimulator._coverage(fov, lines, depth, sh["a_f"], b_f, centre)
+    full, _ = ps.PhoneSimulator._filled(fov.float(), lines, depth)
+    pad = (full.shape[-2] - S) // 2
+    assert sh["reliable"].all() and pad > 0 and ky == S / (S + 2 * pad)
+    yn = ((torch.arange(full.shape[-2]).float() - pad + 0.5) / S * 2 - 1).view(1, 1, -1, 1)      # the photo's own rows
+    xn = ((torch.arange(S).float() + 0.5) / S * 2 - 1).view(1, 1, 1, -1)
+    circle = (xn / sh["a_f"].view(2, 1, 1, 1)) ** 2 + ((yn - sh["yc"].view(2, 1, 1, 1)) / b_f.view(2, 1, 1, 1)) ** 2 <= 1
+    own = F.pad(fov.float(), (0, 0, pad, pad)) > 0.5
+    stray = (full > 0.5) & ~circle & ~own
+    assert stray.flatten(1).sum(dim=1).min() > 200 and not (cov & stray).any()
+    k = 2 * round(S / 48) + 1
+    assert torch.equal(cov, ps.erode(((full > 0.5) & circle) | own, k))
+
+    def coverage(x, shrink=1.0):
+        """_coverage and the mask it should be, built here in the photo's own rows:
+        the FOV, plus the mirrored caps inside the circle its sides were fitted with
+        (``shrink``: a circle fitted too small), less the soft-edge margin on cut frames."""
+        n = x.shape[0]
+        sh, fov = ps.fov_shape(x), ps.fov_mask(x)
+        ch = ps.chord_rows(fov)
+        lines = ps.cut_lines(fov, ch, ps.chord_inset(x, ch))
+        a_f, b_f = shrink * sh["a_f"], shrink * sh["a_f"] / sh["aspect"]
+        yc = torch.nan_to_num(sh["yc"])
+        depth = 0.18 * b_f * S / 2
+        cov, ky = ps.PhoneSimulator._coverage(fov, lines, depth, a_f, b_f, torch.stack([torch.zeros(n), yc], dim=1))
+        full, _ = ps.PhoneSimulator._filled(fov.float(), lines, depth)
+        pad = (full.shape[-2] - S) // 2
+        yn = ((torch.arange(full.shape[-2]).float() - pad + 0.5) / S * 2 - 1).view(1, 1, -1, 1)
+        xn = ((torch.arange(S).float() + 0.5) / S * 2 - 1).view(1, 1, 1, -1)
+        circle = (xn / a_f.view(n, 1, 1, 1)) ** 2 + ((yn - yc.view(n, 1, 1, 1)) / b_f.view(n, 1, 1, 1)) ** 2 <= 1
+        own = F.pad(fov.float(), (0, 0, pad, pad)) > 0.5
+        cut = torch.isfinite(lines).flatten(1).any(dim=1)
+        want = ((full > 0.5) & circle) | own
+        return cov, torch.where(cut.view(n, 1, 1, 1), ps.erode(want, k), want), circle, own, cut, yc, full > 0.5
+
+    # an off-centre FOV: the circle sits where the FOV does, not on the frame's centre
+    cov, want, circle, own, cut, yc, full = coverage(_fundus(2, S, seed=3, b=1 / 0.9, yc=0.08))
+    assert cut.all() and torch.allclose(yc, torch.full((2,), 0.08), atol=0.005) and torch.equal(cov, want)
+    centred = circle.roll(-round(0.08 * S / 2), dims=2)                    # the same circle on the frame's centre
+    assert (ps.erode((full & centred) | own, k) != want).flatten(1).sum(dim=1).min() > 50
+    # a circle fitted too small: the FOV's own pixels outside it still count
+    cov, want, circle, own, cut, _, _ = coverage(_fundus(2, S, seed=3, b=1 / 0.9), shrink=0.93)
+    assert (own & ~circle).flatten(1).sum(dim=1).min() > 200 and torch.equal(cov, want)
+    # a frame without a cut beside one with: only the cut frame keeps off its soft edge
+    mixed = torch.cat([_fundus(1, S, seed=3, b=1 / 0.9), _fundus(1, S, phone=True, seed=4)])
+    cov, want, circle, own, cut, _, _ = coverage(mixed)
+    assert cut.tolist() == [True, False] and torch.equal(cov, want) and torch.equal(cov[1], own[1])
+
+
+def test_edge_sharpness_ignores_contrast_and_falls_with_blur():
+    x = _fundus(4, 192, seed=14)
+    g, m = x.mean(dim=1, keepdim=True), ps.fov_mask(x)
+    sel = ps.edge_select(g, m)
+    assert 0.01 < float(sel.mean()) < 0.05
+    e = ps.edge_sharpness(g, sel)
+    assert torch.allclose(ps.edge_sharpness(0.4 * g, ps.edge_select(0.4 * g, m)), e, rtol=1e-4)      # contrast
+    soft = [ps.edge_sharpness(ps.blur(g, s), sel) for s in (0.45, 0.8)]
+    assert (soft[0] < 0.97 * e).all() and (soft[1] < 0.93 * soft[0]).all()
+    noisy = g + 0.01 * torch.randn(g.shape, generator=torch.Generator().manual_seed(0)) * m
+    raw, fixed = ps.edge_sharpness(noisy, sel), ps.edge_sharpness(noisy, sel, ps.noise_level(noisy, m))
+    assert ((fixed - e).abs() < 0.25 * (raw - e).abs()).all()             # the grain taken out of the fine band
+    assert torch.isnan(ps.edge_sharpness(g, torch.zeros_like(sel))).all()
+    # the disc left out of the selection: a blown-out disc with a soft rim (the simulator's
+    # bloom) pulls the whole selection's reading down and leaves the vessels' alone
+    d = ps.find_disc(x)
+    zone = ps.disc_zone(torch.stack([d["cx"], d["cy"]], dim=1), d["r"])
+    xx, yy = ps.frame_coords(4, 192, 192, "cpu")
+    dist = torch.sqrt((xx - d["cx"].view(4, 1, 1)) ** 2 + (yy - d["cy"].view(4, 1, 1)) ** 2).unsqueeze(1)
+    away = ps.edge_select(g, m, skip=zone)
+    assert away.sum() > 0 and float((away * (dist <= zone[1].view(4, 1, 1, 1))).sum()) == 0
+    assert torch.allclose(away.flatten(1).sum(1) / sel.flatten(1).sum(1), torch.ones(4), atol=0.25)
+    glow = (g + 0.5 * ps.blur((dist < 0.9 * d["r"].view(4, 1, 1, 1)).float(), 1.5)).clamp(0, 1) * m
+    with_disc = ps.edge_sharpness(glow, ps.edge_select(glow, m))
+    vessels = ps.edge_sharpness(glow, ps.edge_select(glow, m, skip=zone))
+    assert (with_disc < 0.9 * e).all() and torch.allclose(vessels, ps.edge_sharpness(g, away), rtol=0.03)
+    nowhere = ps.disc_zone(torch.full((4, 2), float("nan")), torch.full((4,), float("nan")))
+    assert torch.equal(ps.edge_select(g, m, skip=nowhere), sel)            # no disc found: nothing left out
+    # the bank's reading and the report's leave the disc out; the report keeps the other too
+    bloomed = (x + 0.5 * ps.blur((dist < 0.9 * d["r"].view(4, 1, 1, 1)).float(), 1.5)).clamp(0, 1) * m
+    assert torch.allclose(ps.describe(bloomed)["edge"], ps.describe(x)["edge"], rtol=0.08)   # (with the disc in: 0.74x)
+    a, b = ps.camera_stats(x), ps.camera_stats(bloomed)
+    assert torch.allclose(b["edge_sharpness"], a["edge_sharpness"], rtol=0.08)
+    assert (b["edge_with_disc"] < 0.9 * a["edge_with_disc"]).all()
+
+
+def test_the_detail_stage_matches_edges_and_leaves_a_soft_render_alone():
+    """Matched on edge sharpness (``rank`` and ``edge``): a render whose edges are already
+    as soft as its target is returned as it is; a sharper one is blurred down to the
+    target's reading. Matched on band energy per unit contrast (the /2 render), a photo
+    no sharper than its drawn photo was blurred whenever its contrast was lower."""
+    base = copy.deepcopy(_profile(size=96))
+    x = _fundus(6, 96, seed=15)
+    g, sel, inside = x.mean(dim=1, keepdim=True), _vessel_edges(x), ps.fov_mask(x)
+    stat = lambda t: ps.edge_sharpness(t, sel, ps.noise_level(t, inside))  # as the stage reads: the noise taken out
+    have = stat(g)
+    read = lambda y: stat(y.mean(dim=1, keepdim=True))
+    sim = lambda p, **kw: ps.PhoneSimulator(p, stages=("detail",), out_size=96, **kw)(x, torch.Generator().manual_seed(3))
+    target = float(have.min()) * 0.9
+    for by in ("rank", "edge"):
+        prof = base.with_params(detail_by=by)
+        prof.bank["edge"][:] = float(have.max()) * 1.2                     # every handheld photo sharper than x
+        assert torch.equal(sim(prof), x), by
+        prof.bank["edge"][:] = target                                      # ... and softer: down to it
+        got = read(sim(prof))
+        assert torch.allclose(got, torch.full_like(got, target), rtol=0.03), (by, got, target)
+        half = read(sim(prof, strength=0.5))
+        assert ((half > got + 1e-4) & (half < have - 1e-4)).all(), by      # strength: part of the way
+    prof = base.with_params(detail_by="edge")
+    prof.bank["edge"][:] = float("nan")                                    # a drawn photo with no reading: no blur
+    assert torch.equal(sim(prof), x)
+    # by rank, handheld photos without a reading are left out of the ranks (kept in, the top
+    # ranks' target is undefined and those renders come back black); a bank with none asks
+    # for no blur
+    prof = base.with_params(detail_by="rank", edge_src=[0.1, 0.2])         # every render ranks at the top
+    prof.bank["edge"][:] = target
+    prof.bank["edge"][::3] = float("nan")
+    got = read(sim(prof))
+    assert torch.allclose(got, torch.full_like(got, target), rtol=0.03), got
+    low = prof.with_params(edge_src=[5.0, 6.0])                            # every render ranks at the bottom: the softest
+    got = read(sim(low))                                                   # reading there is, not a blank row's (the ladder's end)
+    assert torch.allclose(got, torch.full_like(got, target), rtol=0.03), got
+    prof.bank["edge"][:] = float("nan")
+    assert torch.equal(sim(prof), x)
+    with pytest.raises(ValueError, match="edge_src reading"):              # a fit that never read its renders
+        ps.PhoneSimulator(base.with_params(edge_src=None, edge_src_whole=None))
+    # the band criterion on a drawn photo with the same edges but ten times the contrast: it blurs
+    prof = copy.deepcopy(base)
+    prof.bank["edge"][:] = float(have.max()) * 1.2
+    prof.bank["detail"][:] = float(ps.describe(x)["detail"].min()) * 0.1
+    assert torch.equal(sim(prof), x) and (sim(prof.with_params(detail_by="band")) - x).abs().max() > 0.01
+    # an image with nothing to read its edges on (a sliver of FOV) is left alone, not blanked
+    tiny = x.clone()
+    xx, yy = ps.frame_coords(6, 96, 96, "cpu")
+    tiny[1] = tiny[1] * ((xx[1] ** 2 + yy[1] ** 2) < 0.05 ** 2)
+    for by in ("rank", "edge"):
+        prof = base.with_params(detail_by=by)
+        prof.bank["edge"][:] = target
+        y = ps.PhoneSimulator(prof, stages=("detail",), out_size=96)(tiny, torch.Generator().manual_seed(3))
+        assert torch.equal(y[1], tiny[1]) and (y[0] - tiny[0]).abs().max() > 1e-3, by
+
+
+def test_the_detail_stage_matches_by_rank_not_against_one_drawn_photo():
+    """``detail_by: rank``: a render as sharp as the q-th quantile of the renders ``fit``
+    read is blurred to the handheld photos' q-th quantile, whichever photo it drew, and
+    one already softer than the handheld photo of its rank is untouched: as a set the
+    renders end where the handheld photos are. Against one independently drawn photo
+    (``edge``) every render ends at the softer of two readings, so a set of renders
+    exactly as sharp as the handheld photos comes out softer than them."""
+    base = copy.deepcopy(_profile(size=96, n=12))
+    x = _fundus(12, 96, seed=15)
+    x = ps.blur(x, torch.linspace(0.0, 0.6, 12)) * ps.fov_mask(x)          # a spread of sharpness
+    g, sel, inside = x.mean(dim=1, keepdim=True), _vessel_edges(x), ps.fov_mask(x)
+    stat = lambda t: ps.edge_sharpness(t, sel, ps.noise_level(t, inside))  # as the stage reads: the noise taken out
+    have = stat(g)
+    read = lambda y: stat(y.mean(dim=1, keepdim=True))
+    render = lambda p, seed=3: ps.PhoneSimulator(p, stages=("detail",), out_size=96)(x, torch.Generator().manual_seed(seed))
+    one = ps.PhoneSimulator(base, stages=("detail",), out_size=96)
+    one(x, torch.Generator().manual_seed(3))
+    assert torch.allclose(one._edge_pre, have, rtol=1e-5)                  # the reading fed below is the stage's own
+    order = torch.argsort(have)
+    src = [round(float(v), 6) for v in have[order]]
+    assert src[-1] > 1.15 * src[0] and all(hi > lo for lo, hi in zip(src, src[1:]))
+    ratio = torch.linspace(0.88, 1.09, 12)                                 # handheld softer at the low ranks only
+    bank = torch.tensor(src) * ratio
+    prof = base.with_params(edge_src=src)
+    perm = torch.randperm(12, generator=torch.Generator().manual_seed(0))
+    prof.bank["edge"][:] = bank[perm].numpy()                              # the rows' order does not matter,
+    y = render(prof)
+    assert torch.equal(y, render(prof, seed=4))                            # nor the photo a render draws
+    got, want = read(y)[order], torch.minimum(bank, torch.tensor(src))
+    assert torch.allclose(got, want, rtol=0.005), (got, want)              # (one rank off is a 1.9 % step)
+    sharper = (ratio > 1.0)[torch.argsort(order)]                          # per image: the handheld photo of its rank
+    assert sharper.any() and torch.equal(y[sharper], x[sharper])
+    assert (y[~sharper] - x[~sharper]).flatten(1).abs().amax(dim=1).min() > 1e-4
+    # handheld photos exactly as sharp as the renders: by rank the set stays where it is; one
+    # drawn at random per render leaves it softer than the handheld photos
+    prof.bank["edge"][:] = torch.tensor(src)[perm].numpy()
+    assert torch.allclose(read(render(prof)), have, rtol=2e-3)
+    drawn = torch.stack([read(render(prof.with_params(detail_by="edge"), seed=k)) for k in range(8)])
+    assert float(drawn.mean()) < float(have.mean()) - 0.005                # (0.010 here; by rank 0.000)
+    # between the readings fit took, a render's rank is interpolated; softer than all of
+    # them it has the lowest rank, never one below it
+    knots = src[1::3]                                                      # 4 of the 12: most renders lie between
+    prof = base.with_params(edge_src=knots)
+    prof.bank["edge"][:] = bank[perm].numpy()
+    u = np.interp(have.numpy(), knots, np.linspace(0, 1, len(knots)))
+    want = np.minimum(have.numpy(), np.interp(u, np.linspace(0, 1, 12), np.sort(bank.numpy())))
+    y = render(prof)
+    assert np.allclose(read(y).numpy(), want, rtol=0.02), (read(y), want)
+    low = have == have.min()                                               # softer than every reading fit took
+    assert int(low.sum()) == 1 and float(have.min()) < knots[0]
+    prof.bank["edge"][:] = (torch.tensor(src) * 1.02)[perm].numpy()        # every handheld photo a touch sharper:
+    assert torch.equal(render(prof)[low], x[low])                          # the lowest rank's is, too
+
+
+def test_interp_is_numpy_interp_with_the_ends_held():
+    g = torch.Generator().manual_seed(0)
+    for K in (1, 2, 5, 40):
+        xp = torch.sort(torch.rand(K, generator=g)).values
+        fp = torch.randn(K, generator=g)
+        x = torch.cat([torch.rand(200, generator=g) * 1.6 - 0.3, xp, xp[:1] - 1.0, xp[-1:] + 1.0])
+        want = np.interp(x.numpy().astype(np.float64), xp.numpy().astype(np.float64), fp.numpy().astype(np.float64))
+        assert np.allclose(ps._interp(x, xp, fp).numpy(), want, atol=1e-5), K
+    assert ps._interp(torch.rand(3, 4), torch.tensor([0.2, 0.7]), torch.tensor([1.0, 3.0])).shape == (3, 4)
+
+
+def test_fits_reading_of_its_renders_is_the_one_the_detail_stage_takes():
+    """``calibrate_detail`` reads the renders where the detail stage reads them: on the
+    chain asked for, as that chain's simulator reads them on other draws (a reading on
+    another scale, of the photos instead of their renders, or of another strength sends
+    every rank to one end), one reading per render; ``fit_detail`` keeps the fitted
+    chain's and the whole-field chain's, and falls back to ``edge`` when there is
+    nothing to rank."""
+    size, S = 96, 144
+    prof = copy.deepcopy(_profile_at(size))
+    x = _fundus(12, S, seed=2)
+    quiet = lambda t: None
+    cal = ps.calibrate_detail(prof, x, size, draws=3, log=quiet)
+    assert len(cal) == 36 and cal == sorted(cal) and min(cal) > 0 and len(set(cal)) > 30      # each draw its own
+    assert cal == ps.calibrate_detail(prof, x, size, draws=3, log=quiet)
+    assert cal != ps.calibrate_detail(prof, x, size, seed=1, draws=3, log=quiet)
+    assert len(ps.calibrate_detail(prof, x, size, draws=3, points=9, log=quiet)) == 9
+    assert ps.calibrate_detail(prof, x[:0], size, log=quiet) is None
+    assert ps.calibrate_detail(prof, x, size, log=quiet, stages=("field", "light")) is None    # no detail stage
+
+    def at_stage(seeds, **kw):
+        sim = ps.PhoneSimulator(prof.with_params(detail_by="edge"), out_size=size, **kw)
+        got = []
+        for k in seeds:
+            sim(x, torch.Generator().manual_seed(k))
+            got.append(sim._edge_pre.clone())
+        return torch.cat(got).numpy()
+
+    med = float(np.median(cal))
+    fresh = at_stage((11, 12, 13))
+    assert abs(float(np.median(fresh)) - med) < 0.02 * med                 # (0.5575 against 0.5574)
+    assert 0.3 < float((fresh < med).mean()) < 0.7                         # ranks spread about the middle
+    # another chain reads differently, and each is read on itself (here the whole field
+    # reads 4 % sharper, strength 0 5 % and the photos themselves 13 % softer)
+    for kw, lo, hi in ((dict(field="whole"), 1.02, 1.08), (dict(strength=0.0), 0.92, 0.97),
+                       (dict(stages=("detail",)), 0.84, 0.91)):
+        other = ps.calibrate_detail(prof, x, size, draws=3, log=quiet, **kw)
+        assert lo * med < float(np.median(other)) < hi * med, (kw, np.median(other), med)
+        assert abs(float(np.median(at_stage((11, 12), **kw))) - float(np.median(other))) < 0.02 * med, kw
+    # the rim stage is part of the chain read: with it the light stage draws the drawn photo's
+    # dark rim bands, which the colour stage after it sees
+    dark = copy.deepcopy(prof)
+    dark.bank["rim_ratio"][:] = 0.5
+    no_rim = [s for s in ps.STAGES if s != "rim"]
+    assert ps.calibrate_detail(dark, x, size, draws=1, log=quiet) != ps.calibrate_detail(dark, x, size, draws=1, log=quiet, stages=no_rim)
+    # the detail stage alone reads the photo as the model sees it, away from its disc, its
+    # flat regions' noise taken out (the bank's reading of a handheld photo)
+    lo_x = F.interpolate(x, size=(size, size), mode="bilinear", antialias=True, align_corners=False)
+    lum = lo_x.mean(dim=1, keepdim=True)
+    direct = ps.edge_sharpness(lum, _vessel_edges(lo_x), ps.noise_level(lum, ps.fov_mask(lo_x)))
+    alone = ps.calibrate_detail(prof, x, size, draws=1, log=quiet, stages=("detail",))
+    assert np.allclose(alone, np.sort(direct.numpy()), atol=2e-5)
+
+    # fit's step: both chains' readings, each the simulator's own for its field
+    p = copy.deepcopy(prof)
+    p.params.update(edge_src=None, edge_src_whole=None)
+    said = ps.fit_detail(p, x, size, log=quiet)
+    assert p.params["detail_by"] == "rank" and p.params["edge_src"] == ps.calibrate_detail(prof, x, size, log=quiet)
+    assert p.params["edge_src_whole"] == ps.calibrate_detail(prof, x, size, log=quiet, field="whole")
+    assert len(said) == 2 and "renders at the detail stage" in said[0] and "whole-field" in said[1]
+    q = copy.deepcopy(prof)                                                # another seed: other draws, for both readings
+    ps.fit_detail(q, x, size, 5, log=quiet)
+    assert q.params["edge_src"] == ps.calibrate_detail(prof, x, size, 5, log=quiet) != p.params["edge_src"]
+    assert q.params["edge_src_whole"] == ps.calibrate_detail(prof, x, size, 5, log=quiet, field="whole") != p.params["edge_src_whole"]
+    for field, key in ps.EDGE_SRC.items():
+        sim = ps.PhoneSimulator(p, out_size=size, field=field)
+        assert torch.equal(sim._edge_q[0], torch.tensor(sorted(p.params[key]))), field
+    old = p.with_params(edge_src_whole=None)                               # a fit from before the second reading
+    assert torch.equal(ps.PhoneSimulator(old, out_size=size, field="whole")._edge_q[0], torch.tensor(p.params["edge_src"]))
+    # nothing to rank against (no handheld photo with a reading): the drawn photo's own, and it renders
+    p = copy.deepcopy(prof)
+    p.bank["edge"][:] = float("nan")
+    said = ps.fit_detail(p, x, size, log=quiet)
+    assert p.params["detail_by"] == "edge" and p.params["edge_src"] is None and p.params["edge_src_whole"] is None
+    assert "too few to rank" in said[0] and "falls back to 'edge'" in said[-1]
+    assert ps.PhoneSimulator(p, out_size=size)(x[:2], torch.Generator().manual_seed(0)).shape == (2, 3, size, size)
+    p = prof.with_params(detail_by="band")                                 # another criterion: nothing to read
+    assert ps.fit_detail(p, x, size, log=quiet) == [] and p.params["edge_src"] == prof.params["edge_src"]
+
+
+def test_the_detail_stage_leaves_the_disc_out_where_the_field_put_it():
+    """After the field stage the disc is where the warp put it, not where it was in the
+    photo: the detail stage's reading leaves out that circle (every real render takes
+    this branch; the detail stage alone finds the disc itself). A glow around the disc
+    moves the whole selection's reading and must not move the stage's."""
+    size, S, n = 96, 144, 6
+    x = _fundus(n, S, seed=15)
+    d = ps.find_disc(x)
+    xx, yy = ps.frame_coords(n, S, S, "cpu")
+    dist = torch.sqrt((xx - d["cx"].view(n, 1, 1)) ** 2 + (yy - d["cy"].view(n, 1, 1)) ** 2).unsqueeze(1)
+    x = (x + 0.5 * ps.blur((dist < 1.2 * d["r"].view(n, 1, 1, 1)).float(), 1.5)).clamp(0, 1) * ps.fov_mask(x)
+    prof = copy.deepcopy(_profile_at(size)).with_params(detail_by="edge")
+    prof.bank["edge"][:] = 10.0                                            # no blur: only the reading is wanted
+    inside = ps.aperture(torch.ones(n), float(prof.params["rim_width"]), size, size) > 0.5
+    for before in (("field",), ("field", "light", "colour", "bloom")):
+        y = ps.PhoneSimulator(prof, stages=before, out_size=size)(x, torch.Generator().manual_seed(3))
+        sim = ps.PhoneSimulator(prof, stages=before + ("detail",), out_size=size)
+        assert torch.equal(sim(x, torch.Generator().manual_seed(3)), y)    # the same draws, nothing blurred
+        g = y.mean(dim=1, keepdim=True)
+        dr = ps.find_disc(y)                                               # the disc as the render shows it
+        noise = ps.noise_level(g, inside)
+        own = ps.edge_sharpness(g, ps.edge_select(g, inside, skip=ps.disc_zone(torch.stack([dr["cx"], dr["cy"]], 1), dr["r"])), noise)
+        whole = ps.edge_sharpness(g, ps.edge_select(g, inside), noise)
+        assert ((whole - own).abs() > 0.08 * own).all(), (before, whole, own)
+        assert torch.allclose(sim._edge_pre, own, rtol=0.05), (before, sim._edge_pre, own)
+
+
+def test_the_detail_stage_reads_a_render_as_the_bank_reads_a_photo():
+    """The stage's reading of a render is the bank's reading of a handheld photo and the
+    realism table's of the finished render: the flat regions' fine-band noise taken out.
+    With the noise left in, a grainy photo reads sharper than it is, and the stage blurs
+    one that is already as soft as its target."""
+    size, n = 96, 6
+    x = _fundus(n, size, seed=21)
+    grain = 0.02 * torch.randn(x.shape, generator=torch.Generator().manual_seed(4))
+    noisy = (x + grain).clamp(0, 1) * ps.fov_mask(x)
+    table = ps.camera_stats(noisy)["edge_sharpness"]
+    raw = ps.edge_sharpness(noisy.mean(dim=1, keepdim=True), _vessel_edges(noisy))
+    assert torch.isfinite(table).all() and (raw > 1.1 * table).all(), (raw, table)     # the grain, in the reading
+    between = float(table.max() + raw.min()) / 2
+    assert float(table.max()) < between < float(raw.min())
+    for by in ("edge", "rank"):
+        prof = copy.deepcopy(_profile_at(size)).with_params(detail_by=by)
+        prof.bank["edge"][:] = between                                     # softer than the grain reads, sharper than the edges are
+        sim = ps.PhoneSimulator(prof, stages=("detail",), out_size=size)
+        y = sim(noisy, torch.Generator().manual_seed(0))
+        assert torch.allclose(sim._edge_pre, table, rtol=1e-4), (by, sim._edge_pre, table)
+        assert torch.equal(y, noisy), by                                   # nothing to blur
+    # and the ladder is read the same way: blurred down to a target, the result reads that target
+    prof = copy.deepcopy(_profile_at(size)).with_params(detail_by="edge")
+    prof.bank["edge"][:] = 0.9 * float(table.min())
+    y = ps.PhoneSimulator(prof, stages=("detail",), out_size=size)(noisy, torch.Generator().manual_seed(0))
+    after = ps.camera_stats(y)["edge_sharpness"]
+    assert torch.allclose(after, torch.full_like(after, 0.9 * float(table.min())), rtol=0.03), (after, table)
+
+
+def test_a_reading_that_is_mostly_noise_asks_for_no_blur():
+    """Soft and grainy -- more than half of the edges' fine band is the noise taken out --
+    a photo's corrected reading is the small difference of two large numbers and can
+    rise along the blur ladder: the stage then spent its whole 0.8 px on an ask of 1 %.
+    Such a photo has no reading, for the stage, the bank and the realism table alike:
+    as a render it is left alone and ``fit``'s calibration leaves it out; as a handheld
+    photo it is left out of the ranks (its reading floors at 0 without the limit, the
+    softest photo of the bank, and every render ranked against it went to the ladder's
+    end)."""
+    size = 96
+    x = _fundus(6, size, seed=21)
+    x = ps.blur(x, 1.0) * ps.fov_mask(x)
+    noisy = (x + 0.03 * torch.randn(x.shape, generator=torch.Generator().manual_seed(4))).clamp(0, 1) * ps.fov_mask(x)
+    lum, m, sel = noisy.mean(dim=1, keepdim=True), ps.fov_mask(noisy), _vessel_edges(noisy)
+    noise = ps.noise_level(lum, m)
+    plain = ps.edge_sharpness(lum, sel, noise)
+    assert torch.isfinite(plain).all() and torch.equal(ps.edge_sharpness(lum, sel, noise, max_noise=0.95), plain)
+    assert torch.isnan(ps.edge_sharpness(lum, sel, noise, max_noise=ps.NOISE_SHARE)).all()
+    # the bank and the realism table read by the same rule: such a photo has no reading there either
+    assert torch.isnan(ps.camera_stats(noisy)["edge_sharpness"]).all() and torch.isnan(ps.describe(noisy)["edge"]).all()
+    rungs = [ps._detail_op(lum, op) for op in ps.DETAIL_OPS]
+    ladder = torch.stack([ps.edge_sharpness(t, sel, ps.noise_level(t, m)) for t in rungs])
+    assert (ladder[1:] > ladder[:-1]).any() and (ladder[-1] > 0.99 * ladder[0]).any()     # the hazard: a ladder that does not fall
+    for by in ("edge", "rank"):
+        prof = copy.deepcopy(_profile_at(size)).with_params(detail_by=by)
+        prof.bank["edge"][:] = 0.99 * float(plain.min())                   # an ask of 1 % or more of every photo
+        sim = ps.PhoneSimulator(prof, stages=("detail",), out_size=size)
+        assert torch.equal(sim(noisy, torch.Generator().manual_seed(0)), noisy), by
+        assert (sim._edge_pre == 0).all()
+    said = []
+    assert ps.calibrate_detail(prof, noisy, size, draws=1, log=said.append, stages=("detail",)) is None
+    assert "0 renders" in said[0] and "too few to rank" in said[0]
+    # in the bank: a floored reading (0) or none (NaN) is left out of the ranks and asks for
+    # no blur by itself; fit says how many handheld photos have none
+    clean = _fundus(6, size, seed=22)
+    want = 0.95 * float(ps.camera_stats(clean)["edge_sharpness"].min())
+    for blank in (0.0, float("nan")):
+        for by in ("rank", "edge"):
+            prof = copy.deepcopy(_profile_at(size)).with_params(detail_by=by, edge_src=[5.0, 6.0])   # every render ranks lowest
+            prof.bank["edge"][:] = want
+            if by == "rank":
+                prof.bank["edge"][::2] = blank                             # (by edge a drawn blank asks for no blur: below)
+            y = ps.PhoneSimulator(prof, stages=("detail",), out_size=size)(clean, torch.Generator().manual_seed(0))
+            after = ps.camera_stats(y)["edge_sharpness"]
+            assert torch.allclose(after, torch.full_like(after, want), rtol=0.05), (blank, by, after, want)   # not the ladder's end
+        prof.bank["edge"][:] = blank
+        assert torch.equal(ps.PhoneSimulator(prof, stages=("detail",), out_size=size)(clean, torch.Generator().manual_seed(0)), clean)
+    said = []
+    ps.fit_profile([torch.cat([_fundus(6, size, phone=True, seed=1), noisy[:2]])], [clean], size, log=said.append)
+    assert any("2 of the 8 handheld photos have no edge-sharpness reading" in t for t in said), said
+    # the same photos with a third of the grain have a reading, and are blurred to it
+    quiet = (x + 0.01 * torch.randn(x.shape, generator=torch.Generator().manual_seed(4))).clamp(0, 1) * ps.fov_mask(x)
+    table = ps.camera_stats(quiet)["edge_sharpness"]
+    prof = copy.deepcopy(_profile_at(size)).with_params(detail_by="edge")
+    prof.bank["edge"][:] = 0.92 * float(table.min())
+    sim = ps.PhoneSimulator(prof, stages=("detail",), out_size=size)
+    y = sim(quiet, torch.Generator().manual_seed(0))
+    assert torch.allclose(sim._edge_pre, table, rtol=1e-4) and not torch.equal(y, quiet)
+    after = ps.camera_stats(y)["edge_sharpness"]                           # (it finds its own disc and edges again)
+    assert torch.allclose(after, torch.full_like(after, 0.92 * float(table.min())), rtol=0.05), (after, table)
+
+
+def test_match_detail_holds_a_reading_at_its_running_minimum():
+    """``match_detail`` brackets the target between two rungs of the blur ladder. A reading
+    that rises on a rung (a noise-corrected one can) is held at its running minimum: the
+    crossing is read from the level the ladder had reached, not from the bump. When no
+    rung reaches the target the image stops at the rung that reads lowest: the ladder's
+    end for a reading that falls, the image itself for one that only rises (it was given
+    the whole blur). A reading that only falls is bracketed as before."""
+    x = _fundus(2, 64, seed=3)
+    m = ps.fov_mask(x)
+    rungs = [ps._detail_op(x, op) for op in ps.DETAIL_OPS]
+    assert torch.equal(rungs[0], x)
+
+    def ladder(vals):
+        it = iter(vals)
+        return lambda t: torch.full((len(t),), next(it))
+
+    want = torch.full((2,), 0.95)
+    for vals, top in (([1.0, 1.005, 0.9, 0.8, 0.7], 1.0), ([1.0, 0.97, 0.9, 0.8, 0.7], 0.97)):
+        y = ps.match_detail(x, want, m, stat=ladder(vals))
+        t = np.log(top / 0.95) / np.log(top / 0.9)
+        assert torch.allclose(y, (1 - t) * rungs[1] + t * rungs[2], atol=1e-6), vals
+    # a rung that raises the reading by more than 1 %: not a reading to match on (also when
+    # the ladder comes back down to where it started, which would otherwise be its end)
+    for vals in ([1.0, 1.05, 0.9, 0.8, 0.7], [0.403, 0.404, 0.423, 0.419, 0.4029]):
+        assert torch.equal(ps.match_detail(x, torch.full((2,), 0.95 * vals[0]), m, stat=ladder(vals)), x), vals
+    # at the target on the first rung: left alone, whatever the later rungs read
+    assert torch.equal(ps.match_detail(x, torch.ones(2), m, stat=ladder([1.0, 1.2, 1.3, 1.1, 0.5])), x)
+    # no rung reaches the target: the ladder's end, no further
+    assert torch.allclose(ps.match_detail(x, torch.full((2,), 0.1), m, stat=ladder([1.0, 0.9, 0.95, 0.8, 0.7])), rungs[-1], atol=1e-6)
+    # ... the rung that reads lowest when the reading turns back up, and the image itself
+    # when no blur lowers it at all
+    assert torch.allclose(ps.match_detail(x, torch.full((2,), 0.5), m, stat=ladder([1.0, 0.9, 0.8, 0.85, 0.9])), rungs[2], atol=1e-6)
+    assert torch.equal(ps.match_detail(x, torch.full((2,), 0.99), m, stat=ladder([1.0, 1.01, 1.05, 1.08, 1.06])), x)
+    assert torch.equal(ps.match_detail(x, torch.full((2,), 0.99), m, stat=ladder([1.0, 1.0, 1.0, 1.0, 1.0])), x)
+    # the band criterion (no reading passed in) keeps the ladder's end, as the /2 render has it
+    flat = torch.full_like(x, 0.5) * m
+    assert torch.allclose(ps.match_detail(x, torch.full((2,), 1e-9), m), rungs[-1], atol=1e-6)
+
+
+def test_the_realism_report_ranks_each_fold_on_the_other_folds_tabletop_photos(monkeypatch):
+    """Read on the photos it then scores, the rank criterion matches their sharpness
+    in-sample, and the report's edge_sharpness row flatters it. Each fold's renders
+    rank against a reading of the other fold's tabletop photos, from the fold's own half
+    of the bank; the render returned for the grid keeps the profile's own."""
+    size, S = 64, 96
+    prof = copy.deepcopy(_profile(size=size, n=8))
+    x, real = _fundus(6, S, seed=7), _fundus(6, size, phone=True, seed=8)
+    rows = np.array([0, 1, 2, 3, -1, -1])
+    calls, built = [], []
+    true_cal = ps.calibrate_detail
+
+    def cal(profile, src_hi, out_size, seed=0, **kw):
+        got = true_cal(profile, src_hi, out_size, seed, **kw)
+        calls.append((len(profile), [int(torch.isclose(x, p).flatten(1).all(dim=1).nonzero()[0, 0]) for p in src_hi],
+                      kw.get("strength", 1.0), got))
+        return got
+
+    class Sim(ps.PhoneSimulator):
+        def __init__(self, profile, *a, **kw):
+            built.append((len(profile), profile.params["detail_by"], profile.params["edge_src"]))
+            super().__init__(profile, *a, **kw)
+
+    monkeypatch.setattr(ps, "calibrate_detail", cal)
+    monkeypatch.setattr(ps, "PhoneSimulator", Sim)
+    df, y, diag, counts = ps.cross_fitted_report(prof, x, real, rows, 0, size, strength=0.5, log=lambda t: None)
+    assert df is not None and counts == [(0, 3, 3), (1, 3, 3)] and y.shape == (6, 3, size, size)
+    # fold 0 renders photos 0, 2, 4 from bank rows 0, 2, ...: its ranks come from photos 1, 3, 5
+    assert [(n, idx, st) for n, idx, st, _ in calls] == [(4, [1, 3, 5], 0.5), (4, [0, 2, 4], 0.5)]
+    assert calls[0][3] != calls[1][3] and prof.params["edge_src"] not in (calls[0][3], calls[1][3])
+    scored = [b for b in built if b[1] == "rank"]                           # (the reading's own simulators read by edge)
+    assert scored == [(4, "rank", calls[0][3]), (4, "rank", calls[1][3]), (8, "rank", prof.params["edge_src"])]
+    # too few photos on the other side: the fold keeps the profile's reading, and says so
+    calls.clear(); built.clear()
+    said, fell = [], []
+    ps.cross_fitted_report(prof, x[:1], real, rows, 0, size, log=said.append, in_sample=fell)
+    assert any("fold 0: no detail ranks could be read" in t for t in said) and fell == [0], (said, fell)
+    fell = []
+    ps.cross_fitted_report(prof, x, real, rows, 0, size, log=lambda t: None, in_sample=fell)
+    assert fell == []
+    # another criterion reads nothing
+    calls.clear()
+    ps.cross_fitted_report(prof.with_params(detail_by="edge"), x, real, rows, 0, size, log=lambda t: None)
+    assert calls == []
+
+
+def test_the_realism_table_scores_a_fold_against_its_own_photos_only(monkeypatch):
+    """A fold's renders drew their statistics from one half of the bank and are compared
+    with the real photos behind the other half. Pooled over both folds, half the pairs
+    set a render against the photos behind its own half (and the table's AUROC was the
+    mean of the two held-out blocks and the two in-sample ones)."""
+    assert ps.auroc([2.0, 0.0], [3.0, 1.0]) == 0.75
+    assert ps.auroc([2.0, 0.0], [3.0, 1.0], [0, 1], [0, 1]) == 1.0                    # the pairs of one fold only
+    assert ps.auroc([2.0, 0.0, np.nan], [3.0, 1.0, np.nan], [0, 1, 1], [0, 1, 0]) == 1.0
+    assert ps.auroc([1.0, 1.0, 1.0], [1.0, 2.0, 0.0], [0, 0, 1], [0, 0, 1]) == 0.6    # ties half; folds by their pairs
+    assert np.isnan(ps.auroc([1.0], [2.0], [0], [1])) and np.isnan(ps.auroc([], [2.0]))
+    # the report: fold 0's renders read 3 and its real photos 2, fold 1's 1 and 0 -- every
+    # render above the real photos of its fold, half of them below the other fold's
+    size, S = 64, 96
+    prof = copy.deepcopy(_profile(size=size, n=8)).with_params(detail_by="edge")
+    x, real = _fundus(6, S, seed=7), _fundus(6, size, phone=True, seed=8)
+    vals = iter([3.0, 2.0, 1.0, 0.0, 9.0])                                  # renders, real (fold 0); the same (fold 1); tabletop
+    monkeypatch.setattr(ps, "camera_stats", lambda t: {"s": torch.full((len(t),), next(vals))})
+    df, _, _, counts = ps.cross_fitted_report(prof, x, real, np.array([0, 1, 2, 3, -1, -1]), 0, size, log=lambda t: None)
+    assert counts == [(0, 3, 3), (1, 3, 3)]
+    row = df.iloc[0]
+    assert row.auc_simulated == 1.0 and row.gap_simulated == 1.0            # pooled: 0.75
+    assert (row.simulated, row.handheld, row.tabletop, row.auc_tabletop) == (2.0, 1.0, 9.0, 1.0)
+    # one fold left out: the other's pairs are all there is
+    vals = iter([3.0, 2.0, 9.0])
+    df, _, _, counts = ps.cross_fitted_report(prof, x[:1], real, np.array([0, 1, 2, 3, -1, -1]), 0, size, log=lambda t: None)
+    assert [c[0] for c in counts] == [0] and df.iloc[0].auc_simulated == 1.0
+
+
+def test_the_realism_table_reads_scale_and_sharpness():
+    """A render zoomed past the handheld's scale shows a larger disc, and a blurred one
+    softer edges: the table had no statistic that reads the field's scale, or the edges'
+    sharpness by itself (its detail, noise and structure statistics move with a blur, but
+    with contrast and grain too)."""
+    x = _fundus(6, 192, phone=True, seed=16)
+    one, z2, z0 = torch.ones(6), torch.zeros(6, 2), torch.zeros(6)
+    zoomed = ps.warp(x, 1.3 * one, one, one, z2, z0, (192, 192)) * ps.aperture(one, 0.0023, 192, 192)
+    a, b, c = ps.camera_stats(x), ps.camera_stats(zoomed), ps.camera_stats(ps.blur(x, 0.8) * ps.fov_mask(x))
+    assert {"disc_radius", "disc_from_centre", "edge_sharpness", "edge_with_disc", "laplacian_var"} <= set(a)
+    assert ps.auroc(a["disc_radius"].numpy(), b["disc_radius"].numpy()) > 0.9
+    assert ps.auroc(a["edge_sharpness"].numpy(), c["edge_sharpness"].numpy()) < 0.1
+    assert ps.auroc(a["laplacian_var"].numpy(), c["laplacian_var"].numpy()) < 0.1
+
+
+def test_laplacian_var_leaves_the_frame_border_out():
+    """Where the FOV meets the frame (a truncated tabletop frame's whole top and bottom
+    rows, the four places a phone's circle touches) the zero-padded Laplacian of a border
+    pixel is about minus its own value, hundreds of times an interior pixel's square: the
+    statistic counts the frame edge as outside the FOV, so black added around the frame
+    changes nothing. style_transfer.sharpness, which the table used, reads the frame's
+    border in: 2.9x higher on the tabletop fixture, and the same as this statistic once
+    the frame has a black margin. ``check``'s ``sharp`` column is this statistic too."""
+    from style_transfer import sharpness
+    from style_transfer_xfer import image_stats
+    for phone in (False, True):
+        x = _fundus(4, 96, phone=phone, seed=3)
+        wide = F.pad(x, (4, 4, 4, 4))
+        a = ps.laplacian_var(x)
+        assert torch.allclose(a, ps.laplacian_var(wide), rtol=1e-4)
+        assert torch.equal(ps.camera_stats(x)["laplacian_var"], a)
+        assert torch.equal(image_stats(x)["sharp"], a)
+        assert torch.allclose(sharpness(wide), a, rtol=1e-4)                # no border left to read
+        if not phone:
+            assert (sharpness(x) > 2 * a).all()                             # the truncated FOV's two rows
+    blurred = ps.blur(x, 0.8) * ps.fov_mask(x)
+    assert (ps.laplacian_var(blurred) < 0.7 * ps.laplacian_var(x)).all()    # it still reads a blur
+    # check's summary prints the column so that it can be read, and says which statistic it is
+    from style_transfer_xfer import summarise_check
+    table = pd.DataFrame({"method": ["REAL handheld", "identity", "phone_sim"], "cam_dist": [float("nan"), 0.015, 0.0025],
+                          "p_handheld_icdr0": [1.0, 0.05, 0.85], "sharp": [2.86e-4, 1.46e-4, 2.03e-4],
+                          "illum": [0.21, 0.12, 0.2], "glare": [0.0, 0.0, 0.0], "red": [0.66, 0.61, 0.67],
+                          "judge_auroc": [0.9, 0.9, 0.86], "tab_sens": [0.8, 0.87, 0.74]})
+    txt = summarise_check(table, {"auroc": 0.9, "flag_icdr0": 0.3}, 0.5, 0.5)
+    rows = {}
+    for ln in txt.split("LABEL PRESERVATION")[0].splitlines():             # the realism table
+        if ln.split()[:1] in (["identity"], ["phone_sim"]):
+            rows[ln.split()[0]] = ln.split()
+    assert [float(rows[k][3]) for k in ("identity", "phone_sim")] == [1.46e-4, 2.03e-4] and "e-04" in rows["identity"][3]
+    assert rows["identity"][4] == "0.1200" and "phone_sim.laplacian_var" in txt
+    # a variance, not a mean square: a constant curvature (an illumination bowl) reads nothing
+    xx, yy = ps.frame_coords(1, 96, 96, "cpu")
+    r2 = (xx ** 2 + yy ** 2).unsqueeze(1)
+    bowl = ((0.6 - 0.3 * r2) * (r2 <= 0.81)).repeat(1, 3, 1, 1)
+    lap = 4 * 0.3 / 48 ** 2                                                 # its Laplacian, every pixel
+    assert float(ps.laplacian_var(bowl)) < 1e-3 * lap ** 2
+
+
+# --------------------------------------------------------------------------- #
+# CLI and the trainers
+# --------------------------------------------------------------------------- #
+def _save_photos(folder, x):
+    folder.mkdir(parents=True)
+    for k, im in enumerate(x):
+        arr = (im.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+        Image.fromarray(arr).save(folder / f"p{k:02d}.jpg", quality=95)
+
+
+def test_fit_and_render_cli(tmp_path):
+    from style_transfer_xfer import _check_phone_profile
+    _save_photos(tmp_path / "phone", _fundus(10, 120, phone=True, seed=1))
+    tab = _fundus(10, 120, phone=True, seed=2)[..., 12:108, :]              # truncated circle, 120 x 96
+    _save_photos(tmp_path / "tab", tab)
+    out = tmp_path / "ck" / "profile.json"
+    fit = ["fit", "--target-dir", str(tmp_path / "phone"), "--source-dir", str(tmp_path / "tab"),
+           "--image-size", "64", "--validate", "6", "--num-workers", "0", "--device", "cpu",
+           "--batch-size", "5", "--out", str(out)]
+    with pytest.raises(SystemExit):                     # a folder has no grades (nor a camera column)
+        ps.main(fit + ["--select", "icdr0"])
+    assert ps.main(fit) == 0
+    prof = ps.PhoneProfile.load(str(out))
+    assert len(prof) == 10 and prof.image_size == 64 and 0.7 < prof.params["source_aspect"] < 0.9
+    # a folder is no split: the trainer must not take it for its own train split
+    assert prof.source["split"] is None and prof.source["split_seed"] is None and len(prof.source["files"]) == 10
+    txt = (tmp_path / "ck" / "fit_report.txt").read_text()
+    assert "photos per fold" in txt and "FIELD on the 6 validation renders: zoom median" in txt
+    # detail by rank: fit's reading of its renders is in the profile (both chains) and in
+    # the report, not in the report's parameter line
+    assert prof.params["detail_by"] == "rank" and len(prof.params["edge_src"]) == 18       # 6 photos x 3 draws
+    assert len(prof.params["edge_src_whole"]) == 18 and prof.params["edge_src_whole"] != prof.params["edge_src"]
+    detail = [ln for ln in txt.splitlines() if ln.startswith("DETAIL ")]
+    assert len(detail) == 1 and "18 renders at the detail stage" in detail[0] and "whole-field" in detail[0]
+    assert "edge_src" not in txt and "detail ranks were read on the other half of the tabletop photos" in txt
+    assert (tmp_path / "ck" / "fit_grid.jpg").exists() and not (tmp_path / "ck" / "profile.json.partial").exists()
+    rep = pd.read_csv(tmp_path / "ck" / "fit_report.csv")
+    assert {"statistic", "auc_tabletop", "auc_simulated"} <= set(rep.columns)
+    # a statistic too small for four decimals is written so that it can be read
+    row = next(ln.split() for ln in txt.splitlines() if ln.split()[:1] == ["laplacian_var"])
+    small = rep.set_index("statistic").loc["laplacian_var", ["tabletop", "simulated", "handheld"]].to_numpy(dtype=float)
+    assert (small > 0).all() and (small < 1e-3).all(), small
+    assert np.allclose([float(v) for v in row[1:4]], small, rtol=6e-3) and all("e-" in v for v in row[1:4]), row
+    assert ps._fmt_table(pd.DataFrame({"v": [0.0, 0.12345, 1.5, -0.00012345]})).split() == ["v", "0.0000", "0.1235", "1.5000", "-1.23e-04"]
+    with pytest.raises(SystemExit, match="measured at 64 px"):            # check would find out last
+        _check_phone_profile(str(out), 96)
+    # a fit whose report fails still leaves a profile that renders (its detail reading and
+    # grain calibration are saved before the report)
+    def broken(*args, **kw):
+        raise RuntimeError("the report failed")
+    out2 = tmp_path / "ck2" / "profile.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ps, "cross_fitted_report", broken)
+        with pytest.raises(RuntimeError, match="the report failed"):
+            ps.main(fit[:-1] + [str(out2)])
+    half = ps.PhoneProfile.load(str(out2))
+    assert half.params["detail_by"] == "rank" and half.params["edge_src"] == prof.params["edge_src"]
+    assert half.params["noise_corr"] == prof.params["noise_corr"] and "realism" not in half.report
+    assert ps.PhoneSimulator(half, out_size=64)(tab[:2], torch.Generator().manual_seed(0)).shape == (2, 3, 64, 64)
+    # ... and into a folder that held an earlier fit, none of that fit's report beside the new profile
+    before = (tmp_path / "ck" / "profile.json").read_text()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ps, "cross_fitted_report", broken)
+        with pytest.raises(RuntimeError, match="the report failed"):
+            ps.main(fit + ["--seed", "1"])
+    assert not [f for f in ("fit_report.txt", "fit_report.csv", "fit_grid.jpg") if (tmp_path / "ck" / f).exists()]
+    assert (tmp_path / "ck" / "profile.json").read_text() != before
+    # a fit that stops before its detail reading leaves no profile under the name a rerun
+    # looks for (by rank it would be one every consumer refuses); the bank is kept beside it
+    def stops(*args, **kw):
+        raise RuntimeError("stopped early")
+    out4 = tmp_path / "ck4" / "profile.json"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ps, "fit_detail", stops)
+        with pytest.raises(RuntimeError, match="stopped early"):
+            ps.main(fit[:-1] + [str(out4)])
+    assert not out4.exists() and len(ps.PhoneProfile.load(str(out4) + ".partial")) == 10
+    assert ps.main(fit[:-1] + [str(out4)]) == 0 and out4.exists() and not (tmp_path / "ck4" / "profile.json.partial").exists()
+    with pytest.MonkeyPatch.context() as mp:                               # ... nor the earlier fit's profile
+        mp.setattr(ps, "fit_detail", stops)
+        with pytest.raises(RuntimeError, match="stopped early"):
+            ps.main(fit[:-1] + [str(out4)])
+    assert not out4.exists() and (tmp_path / "ck4" / "profile.json.partial").exists()
+    # a fold that could not rank on the other fold's photos says so in the report's header
+    with pytest.MonkeyPatch.context() as mp:
+        true_cal = ps.calibrate_detail
+        mp.setattr(ps, "calibrate_detail", lambda profile, src_hi, *a, **kw: None if len(src_hi) == 3 else true_cal(profile, src_hi, *a, **kw))
+        assert ps.main(fit[:-1] + [str(out4)]) == 0
+    head = next(ln for ln in (tmp_path / "ck4" / "fit_report.txt").read_text().splitlines() if ln.startswith("REALISM"))
+    assert "fold 0, 1 kept the detail ranks read on all the tabletop photos, its own included" in head
+    assert "read on the other half" not in head
+    # without the report (--validate 0) the reading is taken all the same
+    out3 = tmp_path / "ck3" / "profile.json"
+    i = fit.index("--validate")
+    assert ps.main(fit[:i + 1] + ["0"] + fit[i + 2:-1] + [str(out3)]) == 0
+    bare = ps.PhoneProfile.load(str(out3))
+    assert bare.params["detail_by"] == "rank" and len(bare.params["edge_src"]) == 30 and bare.params["edge_src_whole"]
+    assert "DETAIL " in (tmp_path / "ck3" / "fit_report.txt").read_text()
+    r = tmp_path / "render"
+    assert ps.main(["render", "--profile", str(out), "--source-dir", str(tmp_path / "tab"), "--target-dir",
+                    str(tmp_path / "phone"), "--n", "4", "--stage-rows", "2", "--num-workers", "0",
+                    "--device", "cpu", "--out", str(r)]) == 0
+    assert (r / "grid.jpg").exists() and (r / "stages.jpg").exists()
+
+
+def test_trainer_check_and_score_with_phone_sim(tmp_path, monkeypatch):
+    from style_transfer_xfer import load_device
+    from style_transfer_xfer import main as xfer
+    from test_retinareach import BACKBONE, _make_brset, _make_mbrset
+    from train_retinareach import main as train
+    rng = np.random.default_rng(0)
+    B, M = tmp_path / "brset", tmp_path / "mbrset"
+    _make_brset(B, 30, rng, camera_of=lambda pid: "Canon CR" if pid % 4 else "NIKON NF5050")    # as on the box
+    _make_mbrset(M, 30, rng)
+    prof_path = tmp_path / "ck_phone_sim" / "profile.json"
+    assert ps.main(["fit", "--target-root", str(M), "--source-root", str(B), "--source-camera", "Canon CR",
+                    "--image-size", "64", "--validate", "0", "--num-workers", "0", "--device", "cpu",
+                    "--out", str(prof_path)]) == 0
+
+    def run(out, ck, extra=()):
+        return train(["--source-root", str(B), "--target-root", str(M), "--source-camera", "Canon CR",
+                      "--probe-targets", "hypertension",
+                      "--backbone", BACKBONE, "--no-pretrained", "--image-size", "64", "--epochs", "1",
+                      "--batch-size", "8", "--num-workers", "0", "--device", "cpu", "--calib-batch", "4",
+                      "--calib-sizes", "4", "--calib-repeats", "1", "--envelope-repeats", "2",
+                      "--prior-strengths", "0", "--min-probe-pos", "2", "--n-boot", "10", "--cv-repeats", "1",
+                      "--min-test-pos-patients", "2", "--demo-n", "4", "--n-shuffle", "0", "--ablation-frac", "0",
+                      "--out", str(out), "--ckpt", str(ck), *extra])
+
+    # what the training loop hands the simulator, and what the device-side augmentation
+    # (the step before the model) then receives
+    from dataset import DeviceAug
+    calls, returned, augmented = [], [], []
+    orig, orig_aug = ps.PhoneSimulator.augment_views, DeviceAug.__call__
+
+    def views(self, crop, full, p, g):
+        out = orig(self, crop, full, p, g)
+        calls.append((tuple(crop.shape[-2:]), tuple(full.shape[-2:])))
+        returned.append((out, not torch.equal(out, crop)))
+        return out
+
+    monkeypatch.setattr(ps.PhoneSimulator, "augment_views", views)
+    monkeypatch.setattr(DeviceAug, "__call__", lambda self, x: (augmented.append(x), orig_aug(self, x))[1])
+    base, arm = tmp_path / "base.pt", tmp_path / "arm.pt"
+    assert run(tmp_path / "out_base", base) == 0
+    assert not calls
+    augmented.clear()
+    assert run(tmp_path / "out_arm", arm, ["--phone-sim", str(prof_path), "--phone-sim-p", "0.5"]) == 0
+    assert calls and all(c == ((64, 64), (96, 96)) for c in calls)        # model-size crop, supersampled FOV
+    assert any(changed for _, changed in returned)                         # renders happened ...
+    assert all(any(a is out for a in augmented) for out, _ in returned)    # ... and every batch went on
+    res = json.loads((tmp_path / "out_arm" / "results.json").read_text())
+    assert res["args"]["phone_sim"] == str(prof_path) and res["args"]["gpu_aug"] is True
+    assert res["phone_sim_profile"]["train_size"] == 96 and len(res["phone_sim_profile"]["sha256"]) == 64
+    assert res["args"]["phone_sim_field"] == "phone" and res["phone_sim_profile"]["field"] == "phone"
+
+    # a profile from another split, holding a handheld val / test photo, or naming a photo
+    # this run's handheld train split does not have, is refused
+    blob = json.loads(prof_path.read_text())
+    test_file = pd.read_csv(tmp_path / "out_arm" / "split_handheld.csv").query("split == 'test'")["file"].iloc[0]
+    for change, why in (({"split_seed": 7}, "not fitted on this run's handheld train split"),
+                        ({"files": blob["source"]["files"] + [test_file]}, "validation / test split"),
+                        ({"files": blob["source"]["files"] + ["copy__" + test_file]}, "not in this run's")):
+        bad = tmp_path / "bad_profile.json"
+        bad.write_text(json.dumps({**blob, "source": {**blob["source"], **change}}))
+        with pytest.raises(SystemExit, match=why):
+            run(tmp_path / "out_bad", tmp_path / "bad.pt", ["--phone-sim", str(bad)])
+
+    out = tmp_path / "check"
+    assert xfer(["check", "--ckpt", str(base), "--methods", "colour", "--phone-profile", str(prof_path),
+                 "--out", str(out), "--bank", "8", "--calib-n", "8", "--calib-batch", "4", "--grid-n", "4",
+                 "--num-workers", "0", "--batch-size", "8", "--device", "cpu"]) == 0
+    df = pd.read_csv(out / "check.csv").set_index("method")
+    assert "phone_sim" in df.index and np.isfinite(df.loc["phone_sim", "tab_auroc"])
+    assert 0 <= df.loc["phone_sim", "vessel_r"] <= 1 and (out / "grid.jpg").exists()
+    assert "strength 1.0, field phone" in (out / "check_summary.txt").read_text()
+    out_w = tmp_path / "check_whole"
+    assert xfer(["check", "--ckpt", str(base), "--methods", "colour", "--phone-profile", str(prof_path),
+                 "--phone-field", "whole", "--out", str(out_w), "--bank", "8", "--calib-n", "8", "--calib-batch", "4",
+                 "--grid-n", "4", "--num-workers", "0", "--batch-size", "8", "--device", "cpu"]) == 0
+    assert "field whole" in (out_w / "check_summary.txt").read_text()
+    assert np.isfinite(pd.read_csv(out_w / "check.csv").set_index("method").loc["phone_sim", "tab_auroc"])
+
+    sc = tmp_path / "score"
+    score = ["score", "--source-root", str(B), "--target-root", str(M), "--num-workers", "0", "--device", "cpu",
+             "--batch-size", "8", "--ckpt", f"canon_only={base}", f"canon_phonesim={arm}"]
+    assert xfer(score + ["--out", str(sc)]) == 0
+    s = pd.read_csv(sc / "score.csv")
+    assert set(s.arm) == {"canon_only", "canon_phonesim"} and s.oracle_spec.between(0, 1).all()
+    n_canon_test = len(load_device(str(B), "brset", 64, 42, camera="Canon CR")["test"])        # Canon rows only
+    assert (s[s.camera == "tabletop"].n == n_canon_test).all()
+    assert n_canon_test != len(load_device(str(B), "brset", 64, 42)["test"])
+    summary = (sc / "score_summary.txt").read_text()
+    assert "PAIRED: canon_phonesim minus canon_only" in summary and "phone_sim p 0.5, strength 1.0" in summary
+    assert "field phone" in summary and (s[s.arm == "canon_phonesim"].phone_sim_field == "phone").all()
+    assert (s[s.arm == "canon_phonesim"].phone_sim_sha256 == res["phone_sim_profile"]["sha256"]).all()
+    assert xfer(score + ["--part", "val", "--out", str(tmp_path / "score_val")]) == 0      # ablations choose here
+    assert "val split" in (tmp_path / "score_val" / "score_summary.txt").read_text()
+    v = pd.read_csv(tmp_path / "score_val" / "score.csv")
+    tab = v[v.camera == "tabletop"]                           # the split that chose the epoch and threshold
+    assert tab.in_sample.all() and tab.sensitivity.isna().all() and not v[v.camera == "handheld"].in_sample.any()

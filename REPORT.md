@@ -50,10 +50,9 @@ noise floor on mBRSET AUROC was **0.0119**, and an attention-style block
 
 ## 2. Codebase audit (20 August)
 
-Every Python file in the repo was read line by line (three parallel reviewers
-over the segmentation core, the dataset loaders, and the tooling; the
-classification track reviewed directly). Findings were verified against the
-code before being fixed. Twenty-seven files changed; the full test suite (42
+Every Python file in the repo was read line by line (the segmentation core,
+the dataset loaders, the tooling and the classification track). Findings were
+verified against the code before being fixed. Twenty-seven files changed; the full test suite (42
 tests) passes.
 
 ### Bugs that were corrupting results
@@ -491,3 +490,915 @@ Data: BRSET and mBRSET (PhysioNet), passed as `B=`/`M=` (on the lab box they
 live under `/data/users4/nshaik3/Datasets/{BRSET,mBRSET}` on `arctrdgndev101`); FGADR under
 the IIAI research-use agreement (non-redistributable; cite Zhou et al.,
 arXiv:2008.09772).
+
+## 10. RetinaReach: self-calibration + capability gate (24 September; branch `retinareach`)
+
+The RetinaReach plan (engineering goal: a phone model that re-calibrates to an
+unfamiliar camera from unlabelled captures and declares which targets it can
+screen on that device) is built as `retinareach.py`, `capability_gate.py`,
+`train_retinareach.py`, `export_retinareach.py`, `run_retinareach.sh`,
+`summarize_retinareach.py` (see CHANGELOG). The image model has **not** been
+trained yet: BRSET/mBRSET images are only on the lab box. Two parts of the
+system could be measured on the Mac today.
+
+### 10.1 The bar each target must clear on the handheld device (real mBRSET labels)
+
+`capability_gate.py --dataset mbrset` on the public mBRSET v0.1 table
+(5,164 images, 1,291 patients), RetinaReach split (split seed 42, test = 1,032
+images). Comparator = strongest intake-form model (age/sex/diabetes
+duration/oral treatment/insulin; logreg or GBM chosen by grouped CV on
+train+val). "Must reach" = comparator test AUROC + max(0.02, its CV SD); a
+target also needs the paired bootstrap CI of image − metadata to exclude 0.
+
+| target | prevalence | test pos. patients | comparator | metadata test AUROC | image must reach | full chart |
+|---|---|---|---|---|---|---|
+| dr_referable | 0.176 | 55 | clinical/logreg | 0.756 | 0.794 | 0.749 |
+| edema | 0.087 | 25 | clinical/logreg | 0.698 | 0.739 | 0.683 |
+| hypertension | 0.714 | 183 | clinical/logreg | 0.727 | 0.760 | 0.743 |
+| insulin | 0.208 | 56 | clinical/gbm | 0.806 | 0.845 | 0.812 |
+| alcohol | 0.140 | 32 | age_sex/logreg | 0.641 | 0.682 | 0.686 |
+| vascular_disease | 0.171 | 41 | clinical/logreg | 0.556 | 0.606 | 0.594 |
+| diabetic_foot | 0.137 | 38 | age_sex/logreg | 0.568 | 0.629 | 0.609 |
+| obesity | 0.080 | 24 | clinical/logreg | 0.503 | 0.584 | 0.614 |
+| myocardial_infarction | 0.077 | 13 — underpowered | clinical/logreg | 0.654 | 0.725 | 0.736 |
+| neuropathy | 0.043 | 16 — underpowered | age_sex/gbm | 0.475 | 0.556 | 0.479 |
+| nephropathy | 0.036 | 7 — underpowered | age_sex/logreg | 0.543 | 0.634 | 0.608 |
+| smoking | 0.064 | 11 — underpowered | clinical/gbm | 0.423 | 0.500 | 0.675 |
+
+The full-chart hypertension baseline (0.743) is in line with the published
+metadata-only ~0.765, a sanity check on the comparator. Four systemic targets
+cannot pass on mBRSET's test split at any image AUROC (< 20 positive patients):
+the gate will report them UNDERPOWERED, which is the honest answer at this
+dataset size.
+
+### 10.2 On-device self-calibration: fidelity and cost (Core ML, this Mac)
+
+`export_retinareach.py --verify-images`: 64 ODIR-5K photographs (a camera the
+trunk never saw) as the unlabelled captures, calibrated in 4 batches of 16 by
+(a) PyTorch AdaBN and (b) the Core ML calibrator averaged over batches, then
+scored by (a) the eval-mode network and (b) the statistics-input Core ML graph
+(fp16, CPU_AND_NE). Weights: V4-Medium = the retinal-age v5 trunk (a trained
+fundus trunk, used only for its numerics; heads random); V4-Small = random
+trunk (no trained V4-Small is on the Mac). No screening performance is claimed.
+
+| | V4-Small @384 | V4-Medium @512 |
+|---|---|---|
+| BN layers / statistics vector | 46 / 25,088 floats | 77 / 67,904 floats |
+| calibrator vs AdaBN statistics, max error (of layer scale) | 7.1e-5 | 1.8e-5 |
+| probabilities, Core ML vs PyTorch, max abs diff | 0.015 | 0.008 |
+| for scale: how far calibration moved the probabilities | 0.70 | 0.15 |
+| inference, BN folded (today's export), ANE median | 0.65 ms | 2.00 ms |
+| inference, BN from the statistics input, ANE median | 0.94 ms | 4.71 ms |
+| calibrator, one batch of 16, fp32: GPU / CPU | 37 / 116 ms | 188 / 943 ms |
+
+Both PASS (tolerance 0.02; the error is the fp16 inference graph's, identical
+with PyTorch-computed statistics). ALL ≈ CPU_AND_NE for the statistics-input
+graph, so it stays on the ANE. Calibration costs +0.3 ms per screen at the
+deployed V4-Small/384 (+2.7 ms for V4-Medium/512); a camera whose profile is
+known at export time can ship the folded graph (`--fused --fused-profile`) and
+pay nothing. An **fp16 calibrator fails on the ANE** (Program Inference error,
+V4-Medium/512, batch 16), so the calibrator ships fp32: calibration is a
+one-time cost of ~0.04–0.2 s per 16 captures on the GPU. Mac latencies are an
+optimistic bound; the iPhone number needs an Xcode performance report.
+
+**INT8 (26 September).** `--weights int8` (convolutions int8, head float), same
+64 ODIR captures, V4-Medium/512 trained trunk: fidelity still PASS (max
+probability difference 0.013 vs the float PyTorch model), latency unchanged
+(4.46 ms calibratable / 1.97 ms folded on the ANE).
+
+| package | V4-Small @384 float → int8 | V4-Medium @512 float → int8 |
+|---|---|---|
+| screening model | 5.1 → 2.7 MB | 17.3 → 9.0 MB |
+| calibrator (fp32 compute) | 10.0 → 2.7 MB | 34.1 → 9.1 MB |
+
+The whole self-calibrating payload for the deployed V4-Small is 5.4 MB at int8.
+A multifunction bundle (screen + calibrate in one package) works but does not
+share weights (18.0 MB = 9.0 + 9.1): the two graphs compute at different
+precisions.
+
+### 10.3 The phone-side code (Swift reference)
+
+`app/RetinaReachKit` implements the app's procedure on Core ML's public API
+(identical on iOS): training-identical preprocessing, the calibrator averaged
+over capture batches, the camera lookup, screening at the shipped thresholds.
+Against Python on the same captures (a small trained checkpoint): calibration
+statistics identical to PyTorch AdaBN (camera distance 6e-11), capability
+statuses identical, probabilities within 5e-6. Crop + resize match the training
+pipeline to one gray level on 0.3 % of values; the JPEG decoder differs (Apple
+ImageIO vs libjpeg: ~24 % of values, mean 0.4 levels), which moves the
+calibrated statistics by ~1.5 % of the calibration shift. Full Xcode is needed
+to wrap it in an iPhone app; the package itself builds with the command-line
+tools.
+
+### 10.4 Choices made in the build (review before the proposal)
+
+* Systemic targets are **linear probes on the frozen, calibrated trunk** (the
+  trunk never sees a handheld label, so the DR/edema transfer test stays
+  clean). The plan's [DECIDE] "shared trunk vs per-target models" is then
+  measurable against `run_systemic.sh`'s fine-tuned per-target models.
+* The gate's comparator is the **intake form** (`age_sex`, `clinical`); the
+  full chart is reported beside it but does not gate.
+* Gate margin 0.02 (the measured run-to-run SD) per run; across seeds the
+  final status is the worst per-seed status, demoted if the mean delta does
+  not clear the seed SD of the image AUROC.
+* Sensitivity floor for SUPPORTED: target 0.85 minus tolerance 0.10.
+* Calibration is **inductive**: profiles from each device's train+val images;
+  test patients are never in a calibration pool.
+* An unfamiliar camera outside every validated profile's envelope gets
+  NOT_VALIDATED for every target (conservative lookup, not a performance
+  estimate). Envelopes come from 20 pool draws per N; recognition and false
+  acceptance are scored out of sample on draws of test-patient captures
+  (labels unread), and the camera lookup always uses the unblended measured
+  statistics (the prior only enters the inference vector).
+* The metadata comparator's seed is fixed across training seeds, so the bar is
+  a property of the split, and per-seed image − metadata deltas stay paired.
+* BRSET's `insuline` column maps to `insulin`, so the mBRSET-fit insulin probe
+  also gets a tabletop row (a handheld → tabletop transfer test), provided the
+  encoding audit accepts that column on the real BRSET CSV.
+
+* Controls and mechanism checks now in every run: permuted-label probes,
+  a quality-flags-only comparator, calibration metrics, gradable vs
+  ungradable strata, camera decodability as-trained vs calibrated; one
+  shuffled-source-label run (`SHUFFLE=1`).
+* ODIR-5K is the third, unfamiliar camera (DR only; age/sex comparator): it
+  tests whether the phone's label-free report matches what that camera's own
+  labels show. No licence is stated for ODIR-5K: evaluation only, never
+  redistributed.
+
+### 10.5 Mechanism checks and the unfamiliar camera's bar (28 September)
+
+* **Vessel ablation** is built without a vessel model: the multi-scale line
+  detector (training-free, published) finds the vasculature, a fixed 12 % of
+  the field of view is inpainted, and the control removes the same mask
+  rotated 90° (13–16 % overlap with the vessels on ODIR images, vs ~11 % by
+  chance). Checked by eye on ODIR photographs: the tree is traced on normal
+  images; on hazy images with few visible vessels the fixed quota picks up
+  texture, which is why only the paired vessels-minus-control contrast is read.
+* **ODIR-5K bar:** age + sex predict referable DR there with AUROC 0.545
+  (image must reach 0.568; 135 positive test patients, well powered). On the
+  third camera the gate will turn on whether the threshold holds, not on the
+  metadata bar.
+* **Shared trunk vs per-target models** is now measurable (`PERTARGET=`), paired
+  on the same handheld test rows.
+
+### 10.6 First lab-box results: seeds 0 and 3 of 5 (30 September; preliminary)
+
+**The gate behaves as designed.** DR and edema are SUPPORTED on the tabletop
+camera (DR AUROC 0.978 / 0.988, sensitivity at the shipped threshold 0.87 /
+0.85) and THRESHOLD_DRIFT on the phone camera and on ODIR (they rank well; the
+shipped threshold misses too many). All ten systemic targets are suppressed:
+six NO_IMAGE_EVIDENCE (hypertension probe 0.63 / 0.57 against an intake-form
+bar of 0.76; insulin 0.66 / 0.63 against 0.85), four UNDERPOWERED as §10.1
+predicted. Per-target fine-tuned models on the same split are no better
+(hypertension 0.615 / 0.599, insulin 0.573 / 0.583), so the systemic result is
+not an artefact of the frozen trunk.
+
+**Self-calibration improves ranking but moves the threshold the wrong way.**
+
+| referable DR | AUROC trained → AdaBN | sensitivity at shipped threshold, trained → AdaBN |
+|---|---|---|
+| phone camera (mBRSET) | 0.894 → 0.935 · 0.906 → 0.923 | 0.638 → 0.572 · 0.645 → 0.487 |
+| unfamiliar camera (ODIR) | 0.794 → 0.830 · 0.831 → 0.851 | 0.603 → 0.411 · 0.500 → 0.350 |
+
+Edema behaves the same (phone sensitivity 0.65 → 0.46 · 0.94 → 0.49). The
+calibration-size sweep shows the drop is systematic: 16 captures already give
+the full AUROC gain and the same sensitivity as 4,132. Working hypothesis:
+AdaBN re-centres features on the clinic's own average, and the phone and ODIR
+populations have ~2.5× BRSET's referable-DR prevalence, so part of the disease
+signal is normalised away. `redesign_calibration.py` tests it (prevalence-
+controlled calibration pools, including on the tabletop camera where only
+prevalence changes) and three label-free fixes (shallow-only recalibration,
+the in-forward prior, EM prevalence estimation with an expected-sensitivity
+threshold).
+
+**The shipped threshold flags fewer phone images than are diseased.** Referable
+DR is 5.5 % of tabletop test images and 15.6 % of phone test images (2.8×). On
+the phone the shipped threshold flags 11.3 % as trained (both seeds) and 10.5 % /
+8.0 % after AdaBN. Even if every flagged image were a true case, sensitivity
+could not exceed 0.113 / 0.156 ≈ 0.72, below the 0.75 floor, before calibration
+makes it worse. The flags themselves are mostly right (85–95 % are referable
+DR; specificity ~98–99 %): the threshold is too strict for this population, not
+the ranking too weak. A fix therefore has to raise the flag rate on the phone,
+which also means "flagged fraction stable across devices" is the wrong design
+criterion when prevalence differs; sensitivity at the floor is.
+
+**A defect found in the first results.** The source prior had been blended
+into each layer's statistics after the fact; with it, sensitivity fell to 0.16
+at N = 16, below both endpoints. The prior is now applied in the forward pass
+(Schneider et al. 2020); runs record `prior_mode`, and the summary and figures
+drop the prior rows of runs made before the fix. The phone path
+(`blend_vector`) still blends post hoc: ship prior 0 or shallow-only until the
+collector blends in-forward.
+
+### 10.7 Label-free threshold (2 October; simulated, not yet on real data)
+
+The same unlabelled captures that give the BN statistics can re-set the
+threshold (`retinareach.label_free_threshold`, references fit on tabletop
+validation and shipped in `profiles.json`):
+
+- **em**: estimate the clinic's prevalence by EM on Platt-calibrated scores
+  (Saerens et al. 2002), then take the threshold whose expected sensitivity
+  under the EM posteriors reaches the target.
+- **anchor**: move the shipped threshold in logit space by how far the lower
+  quartile of the captures' scores sits from tabletop validation. The lower
+  quartile is almost all disease-free eyes at any plausible prevalence, so it
+  tracks a shift of the whole score distribution without estimating prevalence.
+
+In simulation (binormal scores, source prevalence 0.055, target 0.85):
+
+| scenario | shipped | em | anchor |
+|---|---|---|---|
+| prevalence 0.156, no score shift | 0.83 | 0.85 | 0.81 |
+| prevalence 0.156, scores shifted down 1 logit | 0.51 | 0.37 | 0.83 |
+| as above, positives lose a further 0.5 | 0.31 | 0.19 | 0.66 |
+| prevalence 0.35, no score shift | 0.85 | 0.86 | 0.75 |
+
+EM is right only under a pure prevalence change: a score shift reads to it as
+"almost no disease here" (estimated prevalence 0.002–0.03) and its threshold
+ends up worse than the shipped one. The phone data show a score shift, so EM is
+expected to fail there. The anchor survives a uniform shift, loses some
+sensitivity as prevalence rises, and only partly recovers when disease signal
+itself shrinks. Capture count matters more for the threshold than for AUROC:
+from N = 16 captures, 66–80 % of simulated clinics reach the floor (two
+simulation seeds); from N = 128, 95–99 %. If real data agree, a clinic would
+calibrate the statistics on its first 16 captures and keep refining the
+threshold over its first ~100–150 screens.
+
+What the real runs now record: `operating_point.csv` (each device's full pool,
+every method, sensitivity with a patient-bootstrap CI; the tabletop rows check
+the home camera loses nothing); `sens_<t>__em` / `sens_<t>__anchor` columns in
+the calibration-size sweep (N = 4 … 512, threshold from the same N captures);
+`redesign_calibration.py` experiment C (both methods from N captures on the
+finished seed-0 and seed-3 checkpoints, 10 draws per N). Not yet on the phone:
+`app/RetinaReachKit` still applies the shipped threshold.
+
+### 10.8 Redesign round 1 on real data (3 October; seeds 0 and 3, referable DR)
+
+`redesign_calibration.py` (experiments A, B1, B2, B3-EM; the anchor and
+experiment C were added after this run).
+
+**The mechanism is prevalence.** On the tabletop camera, where only the
+calibration pool's prevalence changes, sensitivity at the shipped threshold
+falls 0.91 → 0.85 → 0.46 as pool prevalence goes 0 → 0.057 → 0.35, with AUROC
+flat (0.980–0.986). The phone (0.72 → 0.66 → 0.53 → 0.38, pool prevalence 0 →
+0.35) and ODIR (0.51 → 0.31) do the same. AdaBN cannot tell a new camera from a
+clinic with more disease.
+
+**Most of §10.6's AUROC gain is not camera adaptation.** Re-estimating BN
+statistics on clean tabletop images (no target image at all) already lifts the
+other cameras; the target camera's own statistics add little on top:
+
+| AUROC | as trained | tabletop statistics | AdaBN on the camera |
+|---|---|---|---|
+| phone, seed 0 · 3 | 0.894 · 0.906 | 0.906 · 0.923 | 0.935 · 0.923 |
+| ODIR, seed 0 · 3 | 0.794 · 0.831 | 0.830 · 0.849 | 0.830 · 0.851 |
+
+The training-time running statistics come from augmented batches and compress
+the logits (tabletop mean logit of positives 2.1 / 5.2 as trained vs 10.1 /
+12.1 re-estimated). Camera-specific gain: +0.029 / 0.000 on the phone,
+0.000 / +0.002 on ODIR. The capability table's `trained` protocol is therefore
+a weak baseline; the fair comparison for camera calibration is tabletop
+statistics.
+
+**Shallow-only recalibration keeps the gain and drops the cost.** Recalibrating
+the first 23–34 of 46 BN layers gives AUROC at or above full AdaBN (phone
+0.925–0.933 vs 0.929; ODIR 0.854–0.858 vs 0.841) with sensitivity back near
+the unadapted level (phone 0.68–0.69 vs 0.53 full AdaBN, 0.68 unadapted; ODIR
+0.51–0.55 vs 0.38). It does not reach the floor on its own (seed 3: 0.62–0.63).
+
+**The in-forward prior now interpolates** (phone sensitivity 0.55 / 0.59 /
+0.64 at alpha 0.25 / 0.5 / 0.75, between 0.53 and 0.68) but adds no AUROC:
+shallow-only dominates it.
+
+**EM works only on unadapted scores**, as the simulation predicted. Tabletop
+statistics + EM threshold: phone sensitivity 0.72 / 0.83 (estimated prevalence
+0.12 / 0.17 vs 0.18 in the pool), ODIR 0.71 / 0.62. After full AdaBN, EM
+reads the shifted scores as low prevalence (0.07) and sensitivity stays at
+0.55 / 0.53.
+
+**Resulting design.** Recalibrate the shallow layers for the camera; re-set the
+threshold label-free for the clinic's prevalence. The shallow depth (half the
+BN layers, `--shallow-frac 0.5`) is fixed now from seeds 0 and 3; seeds 1, 2
+and 4 are the confirmation. Still to measure: shallow + anchor/EM, and how many
+captures the threshold needs (`redesign_calibration.py` B3 and C on all five
+checkpoints). Mean logits suggest the anchor fits the phone's shift (seed 0:
+negatives −1.3, positives −1.1 under AdaBN) but would under-correct at very high
+prevalence, where positives fall about twice as far as negatives (tabletop,
+prevalence 0 → 0.35).
+
+**Round 2: the label-free thresholds on real data** (`redesign_v2`, same two
+checkpoints, before the shallow base existed). Sensitivity, seed 0 · 3:
+
+| threshold, full pool | phone, tabletop statistics | phone, AdaBN | ODIR, tabletop statistics |
+|---|---|---|---|
+| shipped | 0.66 · 0.70 | 0.57 · 0.49 | 0.59 · 0.45 |
+| anchor | 0.63 · 0.52 | 0.65 · 0.49 | 0.41 · 0.34 |
+| EM | **0.72 · 0.83** | 0.55 · 0.53 | **0.71 · 0.62** |
+
+*The anchor fails on real data.* It assumed a new camera moves every score
+together. Real cameras compress the scores instead: under tabletop statistics
+the phone's healthy eyes score higher than the tabletop's (mean logit +0.2 /
++2.9) and its referable eyes lower (−2.8 / −1.9); ODIR the same (+2.0 / +2.5,
+−3.6 / −4.3). The lower quartile rises, so the anchor raises the threshold
+while the positives fell: worse than shipping the threshold unchanged. The
+simulation's uniform-shift model was wrong, and only the real cameras showed it.
+
+*EM on unadapted scores is the best label-free threshold so far*, at a
+specificity cost (phone flags 15–23 % vs 13.5 % shipped; specificity
+0.95 / 0.88). It converges from few captures: seed 0's phone sensitivity is
+at its full-pool value from 8 captures, seed 3's climbs to it by 32–64
+(0.70 → 0.82). What remains is bias, not noise: EM underestimates prevalence (0.12 / 0.17 vs 0.18; the tabletop Platt
+map overstates confidence on compressed scores). Share of N-capture draws
+reaching the floor on the phone: 0.55–0.85 across N = 8 … 512 (seed 3 mostly
+above, seed 0 mostly just below); on ODIR it falls from 0.30 at N = 8 to 0 at
+N ≥ 64 — a consistent threshold that is consistently too high. After full
+AdaBN no threshold method reaches the floor on either camera.
+
+Not yet measured: EM on shallow-recalibrated scores (B3/C shallow base). If it
+too stays below the floor, the label-free design reaches its limit, and the
+honest outcome is a device that reports THRESHOLD_DRIFT on a new camera until a
+small labelled check is done there.
+
+### 10.10 Round 3 of the redesign, built 25 October (not yet run on the Canon checkpoints)
+
+What the 5-seed Canon sweep showed (24 October; per patient, shipped threshold,
+mean over seeds): Canon sensitivity 0.932 / specificity 0.949 and the held-out
+Nikon 0.954 / 0.933, both meeting the IDx-DR targets on every seed; the phone
+0.815 / 0.762 as trained and 0.655 / 0.958 after full AdaBN (AUROC 0.913 →
+0.926), meeting them on no seed; edema as trained flagging 59 % ± 24 % of phone
+images; every systemic probe failing the gate, four UNDERPOWERED. Three changes
+were built to test on those checkpoints without retraining:
+
+* **The prevalence-matched calibration pool** (experiment D in
+  `redesign_calibration.py`, `retinareach.prevalence_matched_sample`). Experiment
+  A located AdaBN's sensitivity loss in the pool's disease rate; the device now
+  builds a pool at the source's rate from its own posteriors: captures scored
+  under tabletop statistics, EM for the clinic's prevalence and each capture's
+  posterior, weights `r·a + (1 − r)` with `a` solved so the pool's expected rate
+  is the source's (or zero), calibration batches resampled by those weights. The
+  floor of what the pool can reach is set by how soft the posteriors are, and
+  `matched_expected_prev` reports it label-free beside the labels' audit value.
+* **Two threshold rules that survive score compression.** `em2` estimates the
+  prevalence where the Platt map holds (the captures under tabletop statistics)
+  and places the threshold on the same captures' calibrated scores; `rate` flags
+  the top fraction `π·0.85 + (1 − π)·(1 − source specificity)` by rank alone. In
+  simulation with ranks kept and logits compressed to 0.6× (the phone's
+  pattern), the shipped threshold's sensitivity moves, `em` on the compressed
+  scores over-flags, `anchor` collapses, and `em2` / `rate` hold 0.85. Every
+  method now runs on every base in B3 and C, the ladder prints specificity next
+  to sensitivity, and `score_once.py` accepts `calibrated:em2:<rule>` as the
+  Messidor-2 primary.
+* **Cross-fitted systemic probes** (`probe_folds.py`, or `--probe-folds 5` in a
+  run): each probe fit 5-fold out of fold over all 1,291 handheld patients with
+  the trunk frozen, the comparator cross-fit on the same folds. Positive patients
+  available for the gate: nephropathy 46, neuropathy 55, myocardial infarction
+  98, smoking 81, against 7–16 on the test split. Rows carry protocol
+  `calibrated_oof5`; the test-split rows are kept beside them.
+
+The phone path follows: `export_retinareach.py` ships the threshold references
+and the shallow depth, and `app/RetinaReachKit` calibrates in `full` or `shallow`
+mode and re-sets the threshold by `em2` or `rate` with the same arithmetic;
+defaults are unchanged. Next: the ladder and `probe_folds.py` on
+`ck_rr_canon/seed*.pt` (RUNBOOK step 5), then the primary for the Nov 8 look is
+chosen from the ladder.
+
+### 10.9 Next run (lab box)
+
+```bash
+# seconds, no GPU: are the systemic probes reading DR as a stand-in? (needs the mBRSET label table)
+python dr_proxy_check.py --dir exp_retinareach
+# minutes per checkpoint, no retraining: mechanism (A), the fixes (B1-B3), capture count (C);
+# rerun on every checkpoint as seeds 1, 2, 4 finish
+python redesign_calibration.py --ckpt ck_retinareach/seed0.pt ck_retinareach/seed3.pt \
+    --out exp_retinareach/redesign_v2
+B=<BRSET root> M=<mBRSET root> U=kaggle:andrewmvd/ocular-disease-recognition-odir5k SHUFFLE=1 \
+  PERTARGET="hypertension insulin" CUDA_VISIBLE_DEVICES=0 bash run_retinareach.sh 0 1 2 3 4
+# (a preflight runs first and stops the sweep if anything is wrong; figures at the end
+#  if matplotlib is present, else: python3 plot_retinareach.py --dir exp_retinareach)
+# on the Mac, with a trained checkpoint
+python export_retinareach.py --checkpoint ck_retinareach/seed0.pt --weights int8 --fused \
+    --fused-profile handheld --verify-images <captures> --benchmark \
+    --swift-cli app/RetinaReachKit/.build/release/retinareach-cli
+```
+
+### 10.11 Simulated phone photos for training (built 30 October, reviewed and fixed 31 October; first box results 2 November, one seed scored)
+
+**Why.** The phone-ceiling run (seed 0) split the phone gap: the Canon model ranks phone
+photos almost as well as a phone-trained one once AdaBN re-estimates its statistics
+(AUROC 0.920 vs 0.923), but at 0.85 sensitivity its test-oracle specificity is 0.79,
+against 0.86-0.89 for models that saw phone photos. The shift lives at the
+high-sensitivity end, and the only fix so far needs phone labels (the mixed model).
+`phone_sim.py` renders the tabletop training photos as phone photos instead, from
+statistics of unlabelled phone photos.
+
+**What differs, in the model's view** (`fundus_samples/`, 16 BRSET vs 16 mBRSET, model view
+at 384 px; AUROC 0.5 = the cameras cannot be told apart by the statistic; every number is
+16 vs 16 and must be re-measured by `phone_sim.py fit` on the train split):
+
+| | tabletop (BRSET) | handheld (mBRSET) | |
+|---|---|---|---|
+| FOV in model view | circle cut top and bottom, then squashed into the square: aspect 0.80, 88 % fill, Canon's orientation tab | exact digital circle: aspect 1.00, 79 % fill | the loader, not the optics, squashes Canon retinas ~20 % |
+| field of view | | ~1.10x narrower (disc-fovea distance 0.67 vs 0.61 FOV radii; the disc radius ratio, 1.15, is an upper bound: phone discs bloom); disc at 0.45 vs 0.58 of the radius | |
+| colour | orange, even | darker brick red; disc blown out to white in 14/16 | |
+| illumination | even (log-field SD 0.15) | tilted (0.62 vs 0.17 log per frame half-width, bright toward the bottom), blotchy (residual 0.16 vs 0.04), redder at the rim (B/R x0.52), bluish haze crescent at the bottom rim in 7-13/16, dark crescents in 7/16 | AUROC 0.95 (tilt), 1.00 (blotch) |
+| sharpness | vessel edge 2.29 px | 2.34 px: not blurrier | the extra high-frequency power is grain |
+| grain | ~0.3 % | 0.86 / 255 at 384, luma-only (R-G 0.89), nearly white | AUROC 0.87 |
+| channel structure | R-G 0.61, B-G 0.56 | R-G 0.84, B-G 0.88 (the phone ISP) | AUROC 1.0 |
+| none at 384 | | phone JPEG blocks, chroma subsampling, chromatic aberration, veiling haze | |
+
+Tabletop-only artefacts the simulator leaves alone: a central lens-reflex spot (10/16),
+fixed sensor-dust specks at microaneurysm size in two camera groups (14-88 per image, 0.6-0.9
+px at 384, ~6.5 % contrast), and stitched frames with a duplicated band (3/16 of the
+2672x2056 frames). The dust is worth a look on its own: it is microaneurysm-like structure
+in normal tabletop photos that the phone does not have.
+
+**Design.** One row of measurements per real phone photo (the bank: colour, illumination
+shape, blotchiness, rim profile, disc bloom, detail, grain, channel structure); each simulated
+photo takes one whole row, so its colour, light, grain and rim belong together. Stages in
+order: field (un-squash, zoom >= what clears the truncated FOV, shift toward the detected
+disc, aperture), light, colour (green untouched; red and blue pulled toward green's
+structure -- the phone ISP's fingerprint and the strongest single cue a frozen ImageNet network
+found -- then ratio-preserving gains), disc bloom, detail (blur only, <= 0.8 px), grain (size
+and channel correlation calibrated by simulation), rim. A drawn photo's horizontal light and rim are
+mirrored when its disc sits on the other side. Training renders from the photo's whole FOV,
+1.5x supersampled so the zoom costs no detail -- the view `fit` and `check` measure it on; the
+photos it leaves alone keep the ordinary training crop.
+
+**Label safety, measured not assumed.** Lesion contrast, on dots planted in the real tabletop
+samples (green-channel depth / height against a 6-10 px ring, before vs after): the chosen
+colour stage x0.97 / x0.96; a 3x3 optimal-transport colour map x1.72 / x1.44; a per-channel
+map x1.97 / x1.96; real phones vs tabletop ~x1.1-1.2 (colour measurement). The moment-matching
+maps closed more of the statistical gap (mean 0.17 vs 0.21) but would teach the model that
+phone lesions are MORE conspicuous than tabletop ones, the opposite of what it will meet, so
+they are kept only as ablation modes. Green is the channel the colour stage leaves alone; red
+and blue take on green's structure, so a small red lesion's luminance contrast rises (planted
+microaneurysm-sized dots, whole chain, medians: luminance x1.4, red x2.2, blue x1.8). Real
+phones move the same way -- their vessel contrast over the tabletop's is x1.65 in luminance,
+x1.9 in red, x6.0 in blue -- and small dark spots' luminance / green contrast reads 0.45
+tabletop, 0.54 real phone, 0.62 simulated: the simulator goes ~15 % further than the phone.
+Five other candidate designs drew lesion-like structure
+on the samples and were dropped (CHANGELOG 2026-10-30): per-channel histogram matching (red
+blotches, purple foveal rings), per-channel illumination gains (a magenta rim ring), a
+luminance-wide highlight curve (white specks on rim reflections), unsharp masking, and
+blotches at half the measured scale (haemorrhage-sized dark patches). The tests (synthetic
+fundi) check that haemorrhages and exudates planted on a tabletop photo keep their sign and
+0.7-1.3x of their relative contrast in red, green and luminance (0.65 at the 0.8 px blur cap;
+both moment-matching maps fail it, as do an unsharp mask and a blur past the cap), that the
+disc bloom changes nothing beyond 1.1 disc radii and leaves a lesion centred at 1.25 radii
+alone, that no stage but the grain adds a lesion-scale spot to a clean fundus more than 2 disc
+radii from the disc (also at the model's size with the field and the bloom on, where 3 %-deep
+microaneurysm-sized dots are found), and that grain lands at the drawn photo's level. At the
+disc's margin (0.9-1.1 radii) a few bright flecks remain on real photos: 4-6 in 48 renders of
+the samples, against 14-20 before the review. What the simulator can still remove: peripheral
+lesions outside its field -- renders keep ~65 % of the Canon FOV's area (r < ~0.76 FOV radii);
+the phone's narrower field alone would keep ~86 %, the rest is the extra zoom the aperture
+needs to clear the truncated Canon frame (median 1.31 on the samples against the fitted 1.10),
+and a dark tabletop FOV edge can push the zoom up to 1.8 (not seen on the samples; the fit
+report counts it) --, detail on a blown-out disc (new vessels on the disc, median x0.5-0.7),
+faint microaneurysms under grain, and the red part of lesions where red saturates (~4 % of the
+simulated retina against ~0.6 % on real phones, mostly where the transferred light brightens a
+Canon photo's already high red; green still carries them).
+
+**Review (31 October).** A review (geometry, photometry, integration and leakage, label
+safety, GPU cost, tests), every finding above nit level reproduced by a second check, found
+these problems, now fixed (CHANGELOG 2026-10-31): (1) training never used the view the
+simulator had been measured on -- the trainer handed it the random-resized training crop,
+which cuts a Canon frame's FOV on all four sides, so the FOV ellipse could not be read and
+simulated training retinas came out ~14 % wide (now: the whole-FOV view, from the same
+decode); (2) the disc bloom reached 1.3 disc radii and made peripapillary haemorrhages and
+exudates up to 2-4x more conspicuous, and on a PDR eye a laser-scar patch took the disc's
+place on every training view and was bloomed white (now: the disc only, and no disc-keyed
+step when the pick is ambiguous); (3) `fit` crashed on any GPU; (4) the 576 -> 384 warp
+aliased texture into crisper, microaneurysm-like dots; (5) nothing stopped a profile fitted on
+another split, or holding handheld test photos, from reaching training (now refused), and
+ablations could only be chosen on the decision split (now `PART=val`). The fixes cost
+the sample realism a little (below): the bloom now stops at the disc, so the simulated photos
+clip less than the phone's, and the warp no longer manufactures mid-band detail.
+
+**Realism on the samples** (cross-fitted, `phone_sim.py fit --validate`, refitted after the
+review): mean |AUROC - 0.5| x 2 over 21 statistics falls from 0.59 (tabletop vs real phone)
+to 0.18 (simulated vs real phone; 0.16 before the review's fixes). Channel-structure
+fingerprint B-G 1.00 -> 0.30 and R-G 0.80 -> 0.16, grain 0.74 -> 0.09, tilt 0.91 -> 0.15,
+shadowed area 0.59 -> 0.02, blotchiness 0.99 -> 0.46 (kept on the low side on purpose: finer
+or stronger blotch fields drew banding and haemorrhage-like patches), disc whiteout (clipped)
+0.13 -> 0.16 (the simulated photos now clip less than the phone's: 1.3 % vs 2.1 % of the FOV).
+Through a frozen ImageNet ResNet-18 (camera classifier on
+whole-view and interior-patch embeddings, bank and classifier cross-fitted on disjoint phone
+halves): p(phone) 0.06 tabletop -> 0.61 simulated (real phone held out 0.84), embedding MMD^2
+to the phone 0.114 -> 0.063 (phone-vs-phone floor 0.027) -- about 70 % and 58 % of the gap;
+the colour stage does most of it (MMD^2 0.116 -> 0.084), then the disc bloom, grain and field.
+The fixed classifier still scores simulated below real (AUROC 0.19 against 0.5 for
+indistinguishable): the simulator is closer, not identical. With 8-row half banks and 16 tabletop photos this is a
+smoke test of the machinery, not a result; the real reading is `fit_report.txt` from the full
+train split and `style_transfer_xfer.py check` (the trunk's own camera probe and BN-statistics
+distance).
+
+**Next run (lab box).**
+
+```bash
+cd ~/Oculomics && git pull && mkdir -p exp_phone_sim
+B=<BRSET root> M=<mBRSET root> bash run_phone_sim.sh 0 2>&1 | tee -a exp_phone_sim/run.log                      # fit, check, train, score
+B=<BRSET root> M=<mBRSET root> STAGES="train score" bash run_phone_sim.sh 1 2 3 4 2>&1 | tee -a exp_phone_sim/run.log
+```
+
+Decision rule, read on `exp_phone_sim/score/score_summary.txt` (phone test, `calibrated`
+protocol, mean over seeds and the per-seed difference paired with the Canon sweep; the score
+stage scores every seed both sweeps have): Canon + simulated phone photos
+reaching oracle specificity >= 0.825 at 0.85 sensitivity (the IDx-DR line; Canon-only ~0.79,
+mixed with real phone photos 0.86) means the gap is learnable from the tabletop photos alone;
+no gain means the simulator misses what matters (check the camera probe in `check`), and a
+drop on the Canon test means p is too high. Ablations (`P` 0.25 / 0.75, `STRENGTH` 0.5,
+`FIT_EXTRA="--colour-mode mk"`, `FIT_EXTRA="--select icdr0"`, each with a fresh `ARM_OUT` /
+`ARM_CK`, and a fresh `CK` for a profile) are compared on the validation split with `PART=val`
+(the commands are in `run_phone_sim.sh`'s header); there the tabletop rows are in-sample --
+that split chose each arm's epoch and threshold -- so the Canon side of a choice is a guard
+only. The chosen arm is then read on test once (`FINAL=1 STAGES="score patient"`); the trainer's own
+handheld test numbers for each arm are not consulted while choosing.
+
+**First box results (2 November; the fit and check on all five Canon-only checkpoints, the
+score on seed 0 only -- provisional).** The fit on 2,000 mBRSET train-split photos: mean gap
+0.62 (tabletop vs real phone) -> 0.13 (simulated vs real phone), 120 training-split photos per
+side, cross-fitted; the renders' median zoom 1.32 against the fitted angular scale 1.18, the
+FOV ellipse read on 119 of 120, 2 zooms pushed by a dark FOV edge, 2 ambiguous disc picks.
+`check` (means over the five seeds): the trunk's own camera probe calls 0.85 of simulated
+ICDR-0 photos handheld (colour and FDA transfer <= 0.09, real phone 0.997) and the
+BN-statistics camera distance falls 0.015 -> 0.0025 (floor 0.0002); the handheld-trained judge
+flags 0.32 of simulated ICDR-0 eyes against 0.33 of the originals, so no disease is invented;
+but referable eyes lose signal -- the Canon model's sensitivity on simulated referable photos
+falls 0.87 -> 0.74 and the judge's AUROC 0.92 -> 0.86, more than under colour or FDA transfer.
+Part of that is the camera shift training should cover; part is label noise, since the field
+keeps ~65 % of the Canon FOV and a referable eye can lose its peripheral lesions while keeping
+its label (§10.12 tests it). Seed 0 on the phone test split, Canon only -> + simulated phone
+photos: calibrated oracle specificity at 0.85 sensitivity 0.788 -> 0.820 (AUROC 0.920 ->
+0.912); as trained, oracle specificity 0.787 -> 0.713 and, at the shipped threshold,
+sensitivity / specificity 0.70 / 0.94 -> 0.82 / 0.79 (flagged 16 % -> 31 %); Canon test
+unchanged (calibrated AUROC 0.978 -> 0.980, oracle specificity 0.964 -> 0.974). Seed 0's
+Canon-only baseline sits below the five-seed AdaBN mean of the phone-ceiling run (0.819), and a
+second seed-0 run ran beside the sweep on the same GPU and may have written that score, so the
+decision waits for the paired five-seed block. The simulator costs 932 ms per batch on the RTX
+A2000 (inflated by that concurrent run), about 7 h per seed.
+
+### 10.12 Per-patient referral rule and the whole-field arm (built 2 November; not yet run on the box)
+
+**Per patient.** The shipped threshold is fixed on single photos, and `referral_outcomes.py`
+refers a patient when any gradable photo reaches it. The maximum over a patient's photos lifts
+sensitivity above the image-level target and pulls specificity below it: no model meets the
+targets per patient, phone-trained ones included (phone-only, seed 0: 0.891 / 0.767 at its
+shipped threshold; its five-seed image-level oracle specificity is 0.868). `patient_rule.py` scores finished
+checkpoints (no retraining) and compares three rules, every threshold set on tabletop
+validation -- the camera the device ships from, so no handheld label sets one: `shipped` (the
+current rule, reproduced count for count), `any_patient` (the same score, its threshold re-set
+on tabletop-validation patients) and `eye_mean` (each eye's gradable photos averaged, the
+higher eye; the pre-specified new rule). Each also reports the scored split's own patient-level
+oracle specificity, a ranking ceiling rather than a device. Retakes, truth and gradability are
+`referral_outcomes.py`'s. `run_phone_sim.sh` runs it as stage `patient` on the same seed pairs
+as `score`; the Canon sweep alone is scored with `--ckpt canon_only=ck_rr_canon/seed<s>.pt ...`.
+
+**The whole field (ablation).** `FIELD=whole` (`--phone-sim-field whole`) keeps zoom 1 and no
+framing shift, so the whole tabletop FOV stays inside the aperture; the un-squash, rotation,
+aperture and disc bloom stay, and the truncated FOV's flat top and bottom stay black (a
+tabletop cue the phone field exists to remove). It answers one question: does the phone
+field's crop cost more, through label noise, than its realism buys? Its `check` stage needs no
+training (it reads the Canon-only checkpoints) and says first whether the referable signal comes
+back (`tab_sens` back toward 0.87); the arm is then trained and chosen on the validation split
+like any ablation (`PART=val`, `FINAL=1` for its single test read).
+
+**Seed ensemble (built 6 November; not yet run on the box).** `patient_rule.py --ensemble`
+averages each arm's seeds photo by photo and scores the average like one more seed: its shipped
+threshold re-set the trainer's way on the averaged tabletop-validation photos, then the same three
+patient rules. Next to it, image-level AUROC and oracle specificity for every seed and the
+ensemble (the score stage's reading), so the ensemble is read against the mean and the best of
+the seeds it averages. It needs no GPU once `predictions.csv` exists; the `patient` stage runs it,
+and an earlier run is re-read with
+
+```bash
+python patient_rule.py --from-predictions exp_phone_sim/patient/predictions.csv --ensemble --out exp_phone_sim/patient_ens
+```
+
+On the phone the ensemble runs all five networks on each photo (~5 x 0.7 ms on the ANE for
+V4-Small at 384). The phone-ceiling arms (`train_phone_ceiling.py`) save checkpoints without
+per-camera BN statistics, so `patient_rule.py` cannot score them; only `train_retinareach.py`
+checkpoints (the Canon sweep, the simulator arms) can be ensembled here.
+
+### 10.13 Simulator render /3 and the handheld-trained referees (built 17 November; samples only, not yet run on the box)
+
+**What the box said was off.** Three readings, each from a report already on the box:
+
+| reading | simulated | real handheld | source |
+|---|---|---|---|
+| zoom of the renders | 1.32 | 1.18 (the fitted angular scale) | `fit_report.txt`, FIELD line, 120 renders |
+| Laplacian variance | 0.0002 | 0.0004 (tabletop 0.0004) | `check_summary.txt`, `sharp` |
+| Canon-only model, validation | AUROC 0.896, sensitivity 0.66 | AUROC 0.920, sensitivity 0.76 | effects table, seed 0 (one seed) |
+
+The zoom was not the phone's: it was whatever let the phone's circular aperture clear the Canon
+frame's flat top and bottom, so every simulated retina came out 12 % too large with a fifth less
+of it in view. The softness had three sources, found on the samples: the warp's prefilter (one
+isotropic blur sized for the frame's larger, vertical step: 0.58-0.67x of a reference render's
+Laplacian energy), the magnification itself, and the detail stage, which matched mid-band energy
+per unit background contrast -- lower on the handheld because its contrast is higher, not because
+it is softer -- and so blurred renders that were already softer than their drawn photo.
+
+The Laplacian row itself turned out to be mostly not a reading of sharpness (*What stays open*,
+below): `check` took that statistic with the frame's border lines in, and on a tabletop frame,
+cut along its whole top and bottom rows, the border is most of the number. With the frame edge
+counted as outside, tabletop photos read 0.00015 on the samples, the old render 0.00019 and
+handheld photos 0.00029: the renders were never softer than both cameras by this statistic. They
+were softer than the phone where it matters, on vessel edges (0.46 against 0.53, below), and that
+is the reading the changes are judged on.
+
+**What changed** (`phone_sim.py`, profile format `phone_sim/3`; CHANGELOG 2026-11-17). (1) `fill`:
+the field stage renders at the handheld's own scale; the caps the aperture then reaches past a
+truncated frame's cut are the mirror image of the retina beside the cut (3.4 % of the circle in the
+median render on the samples, at their fitted scale of 1.10; less at the box's 1.18, where the
+aperture reaches less far past the cut; up to 0.18 FOV radii, then the zoom rises), the mirror line set past the rows
+over which a frame darkens toward its cut and following the frame's edge column by column. (2)
+`prefilter: matched`: the warp
+blurs each axis as far as the loader's antialiased resize would at that axis's step. (3)
+`detail_by: rank`: the detail stage matches edge sharpness (fine over mid-band amplitude on the
+strongest structure away from the disc; a new bank reading) by rank: a render at the q-th
+quantile of the renders `fit` read is blurred down to the handheld photos' q-th quantile, and one
+already softer is left alone. A `phone_sim/2` profile keeps the old render (pixel for pixel
+against the committed code on the samples: render, geometry and training views all differ by 0.0;
+a test holds it to renders stored from the last commit before the change, every stage in play),
+so the arm trained with it can still be re-read.
+
+**On the samples** (16 BRSET photos rendered against 16 mBRSET photos; a smoke test of
+direction, not a result). `fit`'s report at seed 0; every simulated AUROC is within a fold, a
+fold's renders against the real photos behind the other half of the bank:
+
+| | old render | new render | real handheld |
+|---|---|---|---|
+| zoom, median | 1.31 | 1.13 | fitted scale 1.10 |
+| edge sharpness, vessels (disc left out); AUROC gap | 0.46; 0.41 | 0.53; 0.05 | 0.53 (tabletop 0.59) |
+| edge sharpness, disc included; AUROC gap | 0.40; 0.59 | 0.44; 0.47 | 0.51 (tabletop 0.57) |
+| Laplacian variance, frame edge counted as outside; AUROC gap | 0.00019; 0.56 | 0.00022; 0.47 | 0.00029 (tabletop 0.00015) |
+| realism gap, mean over 26 statistics | 0.220 | 0.202 | 0 (tabletop 0.570) |
+| resampling vs a 3x-oversampled render reduced by the loader's resize (Laplacian energy) | 0.58-0.67x | 0.91-1.06x | |
+| frozen ResNet-18: MMD^2 to the phone | 0.060 | 0.056 | floor 0.027 |
+| frozen ResNet-18: p(phone) | 0.58 | 0.57 | 0.84 |
+
+Closer on scale and on vessel-edge sharpness, slightly closer in a frozen network's embedding, no
+more phone-like to that network's camera classifier (for those two rows the renders' detail ranks
+were read on all sixteen tabletop photos, in-sample on that side). Without the detail stage that
+network reads p(phone) 0.55 and MMD^2 0.056: the stage costs it nothing. The report's halving (the
+fixed even/odd split, the same at every seed) is kind to the new render's vessel edges: on it the
+gap is 0.04 averaged over three render seeds. Over the three other halvings of the same photos it is
+0.19, and over all four 0.15 (next table), not 0.05.
+
+**Sharpness.** The first build of this change matched the detail stage to the drawn photo's edge
+sharpness read over the whole photo, and its renders read softer than the phone on that reading,
+which looked like a need for sharpening. Three things were wrong with that.
+
+*Where the reading is taken.* With the disc in, the reading is mostly the bloom's: switched off on
+the same draws, the whole-photo reading of fully bloomed renders is 0.49 instead of 0.44 (handheld
+0.51), and nothing away from the disc moves. Once the disc is blown out its rim is the strongest
+edge in the photo, and on a bloomed render the reading there sits about 0.08 below the vessels'
+(0.02 on phone photos; renders without a bloom read the same either way) -- not because the bloom
+draws the rim softer than the phone's, but because it draws it shorter (*The disc's rim*, below).
+Away from the disc the renders reach the detail stage sharper than the phone photos (0.56 against
+0.53; `fit`'s DETAIL line). So the reading now leaves the disc out, for the bank and for the render
+alike, and the report keeps the whole-photo reading as a second statistic.
+
+*How it is matched.* Blurring each render down to one randomly drawn photo's reading leaves it at
+the softer of two independent readings: softer as a set than the handheld photos, on the very
+statistic matched. By rank it is blurred to the handheld photo of its own rank instead. The ranks
+come from tabletop photos, so the comparison holds those out too (`fit`'s report ranks each half of
+its tabletop photos on the other half). Every number below is within a fold -- the 8 renders drawn
+from one half of the bank against the 8 handheld photos behind the other half, the two folds
+averaged -- and since one halving of sixteen photos is largely luck, each row averages four
+halvings (the report's and three random ones) of three render seeds each. The last row is the
+handheld photos against themselves, 8 against 8 over 2,000 halvings: what sampling alone gives at
+this size.
+
+| detail criterion | AUROC gap | Wasserstein distance (handheld IQRs) | above the handheld's 90th percentile | below its 10th | mean gap over 26 statistics |
+|---|---|---|---|---|---|
+| `rank`, ranked on the other half of the tabletop photos (the report's way) | 0.15 | 0.47 | 13 % | 19 % | 0.206 |
+| `rank`, ranked on its own half (in-sample) | 0.15 | 0.45 | 15 % | 24 % | 0.206 |
+| `edge` (one drawn photo) | 0.27 | 0.58 | 12 % | 29 % | 0.217 |
+| `band` (the /2 criterion) | 0.22 | 1.08 | 23 % | 43 % | 0.208 |
+| no detail stage | 0.20 | 0.81 | 35 % | 14 % | 0.190 |
+| handheld photos against themselves, 8 against 8 | | 0.43 | | | |
+
+From run to run the AUROC gap moves by about 0.10 (by halving 0.04-0.26 for the report's ranking)
+and the distance by 0.07-0.19; the mean gap over the 26 statistics by about 0.02. A single
+8-against-8 halving of the handheld photos against themselves already reads an AUROC gap of 0.24
+and a mean gap of 0.24 on average (two folds averaged, as in the rows, would read less), so on
+AUROC gap the criteria cannot be told apart here. What these photos do support: by rank the
+renders' vessel-edge sharpness is as close to the handheld photos' as two halves of the handheld
+photos are to each other (0.47 handheld IQRs against 0.43); the drawn photo's reading, no detail
+stage and the /2 criterion are 1.3x, 1.9x and 2.5x that floor, the last two mostly through a tail
+(a third of the renders above the handheld's 90th percentile with no stage, four in ten below its
+10th with the /2 criterion). Ranked on the other half or on its own, the rank criterion comes out
+the same. (Earlier versions of this table pooled the two folds before comparing, so half of the
+pairs set renders against the photos behind their own half of the bank, and they read 0.07 for
+rank. `fit`'s report pooled them the same way, until the last pass.)
+
+*How the render is read.* A third, smaller thing was wrong until the last pass. The bank's
+reading of a handheld photo, and the report's reading of a finished render, take the flat
+regions' fine-band noise out of the fine band; the detail stage read its render with the noise
+left in. A tabletop photo's own noise put that reading about 3 % high, so the blur came a touch
+early and the renders ended softer than the photos they were matched to. The stage now takes the
+noise out at every rung of its blur ladder, as the other two readings do: the finished renders'
+median goes from 0.510 to 0.519 where the handheld photos read 0.527, and in `fit`'s report over
+five seeds the vessel-edge AUROC gap goes from 0.09 to 0.03 and the mean gap over the 26
+statistics from 0.201 to 0.196 (lower on each seed). Against a fixed target (`detail_by: edge`) it
+can only ask for less blur, the reading being lower at every rung; by rank the readings it ranks
+against are re-read the same way, so a render noisier than most can drop in rank and get a lower
+target, and the samples show less blur as a set: 92 % of the renders blurred where 94 % were, and
+the finished median higher on each of five seeds. Two guards
+came with it. A reading in which the noise taken out is more than half of the edges' fine band is
+no reading, for the bank, the stage and the report alike: such a reading is the small difference
+of two large numbers, it floored at 0 in the bank (the softest handheld photo there, so every
+render ranked lowest was blurred to the end of the ladder), and in the stage it could rise with
+blur, which then spent the whole 0.8 px on an ask of 1 %. On the samples that share is 0.05 for
+handheld and tabletop photos (at most 0.19) and 0.12 for finished renders (at most 0.44), so the
+guard changes nothing on them; the synthetic test photos at 384 px reach 0.87. And an image whose
+reading some rung of the ladder raises by more than 1 % is left alone; one whose target no rung
+reaches stops at the rung that reads lowest.
+
+The ranks belong to the chain they were read on. `fit` reads two: the chain it fits, and the
+whole-field one (`--phone-sim-field whole`), whose renders reach the detail stage sharper because
+nothing is magnified (0.59 against 0.56) and which, ranked on the phone field's reading, would
+leave the set sharper than the handheld photos (17 % above their 90th percentile; 12 % on a
+reading of its own). A simulator on any other chain -- a stage dropped, another prefilter, a lower
+strength -- still ranks against the fitted chain's reading: with the old prefilter that blurs 85 %
+of the renders where a reading of its own blurs 35 %, and leaves a quarter of them below the
+handheld's 10th percentile instead of a sixth. `phone_sim_effects.py` therefore re-reads the ranks
+for each of its variants (`--cal-n` tabletop training photos) and adds `full_cal`, the fitted
+chain ranked on those same photos, so a re-read row read against `full_cal` changes one thing and
+not also the amount of blur.
+
+*What stays open.* Two readings stay below the phone's, and any blur lowers them further: the
+whole-photo edge reading (disc included) and Laplacian variance. Each was taken apart on the
+samples, by intervention on a scratch copy of the simulator, and then re-derived independently,
+with separate code and on render seeds the first pass had not used. Neither ends in a change to
+the bloom or the grain; the second corrected the statistic itself and the detail stage's reading
+(above).
+
+*The disc's rim.* The bloom is the cause: switched off on the same draws, the whole-photo reading
+of the bloomed renders rises from 0.44 to 0.49 (handheld 0.51) and nothing away from the disc
+moves. But the rim it draws is not softer than the phone's, as the first reading of the statistic
+had it. It is shorter. Along a ray, a blown-out handheld disc falls from its plateau to the retina over 22 px,
+as a tabletop disc does before any bloom; a bloomed render's falls over 11 px, with the same
+fine-band contrast and a quarter to a half more mid- and coarse-band contrast per unit of
+amplitude. The statistic is fine over mid-band amplitude, so the excess lowers it. Behind that
+is the taper that confines the bloom to 1.1 disc radii: the phone's glow reaches 1.5-2 radii
+(luminance 0.66 at 1.0 radius, still 0.50 at 1.5 and 0.43 at 2, where a render is back at the
+tabletop photo's own background by 1.1). A brightness-keyed push that reaches as far matches
+every rim measure at once (the whole-photo reading 0.50-0.51, the fall 20-24 px), and makes a
+third of planted dark lesions at 1.15-1.25 disc radii more than 1.1x more conspicuous, where the
+present bloom does that to 1 % or none: the push label safety rules out. Everything inside 1.1
+radii fails one of three conditions. A narrower or square-root taper raises the reading by
+drawing a harder rim (the narrower one about twice as steep as the phone's) and raises lesion
+conspicuity at the disc's margin (31-34 % of planted lesions at 1.05 radii against 23-24 %); a
+wider taper or a steeper brightness weighting moves the rim's shape toward the phone's but
+shrinks the bright disc and does not improve the table (mean gap unchanged to +0.03), and the
+steeper weightings are less safe inside the disc. Clipping harder and swapping the order of
+bloom and blur do nothing. So the bloom stays as it is, and `edge_with_disc` stays in the report as the
+reading of what the confinement costs.
+
+The same measurement showed something no test covers: inside its own zone the bloom, which lifts
+bright pixels more than dark ones, already makes 24-33 % of planted dark lesions at 0.9-1.05 disc
+radii more than 1.1x more conspicuous than on the tabletop photo (90th percentile 1.4x and up).
+That is the committed /2 render's behaviour as well; it makes a lesion at the disc's margin easier
+to see, it does not remove or invent one. A taper ending at 1.0 instead of 1.1 radii cuts it to
+4 % at 1.05 radii, with a mean gap about 0.01 lower (one seed's spread), at the price of a steeper
+rim and a smaller disc. Left alone; worth a decision once the box has said whether the simulator
+arm is kept.
+
+*Laplacian variance.* Part of this gap was the statistic. `check` read `style_transfer.sharpness`
+(and so did the realism table's new row as this change first built it): the variance of a
+zero-padded Laplacian over a FOV mask that runs up to the frame's edge. A FOV pixel on the frame's
+first or last row or column reads about minus its own level there, hundreds of times an interior
+pixel's square. Those pixels carried 70 % of a tabletop photo's reading (a Canon frame cuts the FOV
+along its whole top and bottom rows), 13 % of a handheld photo's and 4 % of a render's; a black
+margin added around a tabletop frame, which changes nothing in the photo, took the reading to
+0.29x. Both now read `phone_sim.laplacian_var`, the frame edge counted as outside the FOV:
+
+| Laplacian variance, x 1e-4, median | tabletop | handheld | new render (5 seeds) |
+|---|---|---|---|
+| frame border in (as read until now) | 4.26 | 3.65 | 2.13 |
+| frame edge counted as outside | 1.46 | 2.86 | 2.03 |
+
+So the box's "0.0004 on tabletop and handheld alike" was the frame on the tabletop side, and a
+render reads above the tabletop photos, not below both cameras. Within folds the renders' gap to
+the handheld photos on this statistic is 0.53 with the border in and 0.40 without (four halvings,
+three seeds; 0.47 at the report's seed 0), while the tabletop's rises from 0.31 to 0.67, no longer
+high for the wrong reason. Values of `check`'s `sharp` column in earlier reports are not comparable
+with new ones (`fit`'s table had no Laplacian row before this change). (`fda_sharp` still matches
+its blur on `sharpness`, border in; that baseline is left as it was run.)
+
+What is left is at the edge of what sixteen photos show, and it is not missing sharpness. At vessel
+walls the renders' fine-over-mid ratio equals the handheld photos' (0.43 and 0.42), and the grain
+reaches the bank's level (1.04x) with the handheld's autocorrelation; forcing the number with more
+or whiter grain breaks one of those two. What differs is amplitude: a render's vessel-wall
+amplitude in luminance is 0.65-0.71x that of the handheld photo whose statistics it drew, lower in
+95 % of pairs and at every band alike -- red matched, green 0.58x, blue about 0.5x -- part level
+(at the vessel walls green sits at 0.80-0.86 of the drawn photo's and blue at 0.66-0.78, though the
+centre-zone means the colour stage matches agree) and part relative contrast (about 0.7x in green
+and blue), strongest at the centre of the field and at the strongest edges, so not one global
+contrast factor. The detail stage's blur accounts for 0.2-0.35 of the 0.8-0.9 (x 1e-4) between the
+medians. Scaling the structure's contrast by 1.2-1.4x closes the gap, and makes every lesion that
+much more conspicuous than on the tabletop photo, so it cannot ship; a smooth per-channel level
+change would be label-safe and was not tried, because whether the handheld's higher vessel
+contrast belongs to the camera (tone curve, sharpening) or to an all-diabetic population cannot be
+told on these photos. On the box: per-channel vessel-wall contrast and level over the full mBRSET
+and BRSET training splits, by DR grade.
+
+Two smaller findings from the same work, both left alone. The aperture is applied twice in a
+render (at the field stage and at the end), so the FOV's edge rolls off as the aperture's profile
+squared (radius 1 frame half-width and `rim_width` 0.0023, both fixed: `fit` measures neither):
+over the three pixels where the circle ends (191 to 194 px from the centre at 384 px) luminance is
+0.51 / 0.10 / 0.01 of the interior's, against the handheld's 0.68 / 0.20 / 0.02. Applied once in
+effect the edge profile matches and the FOV area overshoots, because the fixed radius gives the
+handheld's area only with the squaring; putting it right means measuring the handheld's edge radius
+and width in `fit`, on more than sixteen photos. And the handheld photos are brighter where the
+circle meets the bottom of the frame (0.31 against 0.14), which belongs to the light and rim stages
+(tilt, blotch) and not to fine detail.
+
+Over all 26 statistics the mean gap is lowest with no detail stage at all (0.190 against 0.206 by
+rank, within folds; lower on each of the four halvings): the stage buys a closer match on
+vessel-edge sharpness (0.47 handheld IQRs against 0.81 with no stage) and pays for it on the
+whole-photo reading (AUROC gap 0.44 against 0.14 with no stage), on Laplacian
+variance (0.40 against 0.24) and on the mid-band `detail` statistic. Neither open reading is a case
+for sharpening the whole image, which rings microaneurysms. Whether the detail stage earns its
+place is a question for the box: the `drop_detail` row of the effects table.
+
+One change was tried and dropped: tightening the shadow allowance from +0.05 to +0.01 matches the
+median render's shadowed share to the handheld's (2 % -> 0.4 %) but scales the tilt and the
+blotches back with it, and the three statistics together moved away from the phone (summed
+realism gap 0.88 -> 1.12, on the build it was tried on).
+
+**The referees.** Phone-only training does worse on the handheld test than Canon + phone
+(oracle specificity at 0.85 sensitivity 0.868 against 0.889, AUROC 0.923 against 0.935, five
+seeds): the tabletop photos teach something the 3,612 handheld training photos alone do not.
+That gives two tests of the simulator that the Canon-only checkpoints cannot give, because both
+use models that know what a real handheld photo looks like, labels included.
+
+1. *No training* (`phone_sim_effects.py`, the phone-only and mixed checkpoints as arms, read as
+   trained at their own handheld-validation threshold). For the phone-only model the unsimulated
+   tabletop photos are another camera's: a faithful simulator brings them to the camera it knows,
+   so its AUROC on the re-rendered rows should be at or above its AUROC on the same photos
+   unsimulated. For the mixed model both cameras are home, so what it loses on the re-rendered
+   rows beyond its own tabletop-to-handheld difference is evidence the simulator destroyed. The
+   mixed model's camera probe says how handheld the renders look to a trunk trained on both
+   cameras' labels (the phone-only model's trunk never saw a tabletop photo: a weaker reading).
+   `--sets render` puts the old and the new render side by side on one bank, same draws; the
+   summary names the parameters behind each of those rows. A phone-only checkpoint is scored on
+   the tabletop photos of the arms beside it (the log says which; arms that read different
+   cameras are refused until `--source-camera` names one, and `--source-camera` is refused beside
+   an arm trained on every camera, whose split it would redraw). For an arm trained with a
+   simulator the summary says whether `--profile` is the file it was trained with.
+2. *Training* (`train_phone_ceiling.py --mix-phone-sim`, model `mixed_sim`; `MODES=mixed_sim` in
+   `run_phone_ceiling.sh`): the mixed run with every tabletop photo re-rendered as a handheld one.
+   On the same phone test rows as that seed's `mixed` and `phone` runs: at or above `mixed`, the
+   simulated photo is at least as good a partner for real handheld photos as the tabletop photo
+   itself; between `phone` and `mixed`, it keeps part of what the tabletop photos teach; at
+   `phone` or below, it teaches nothing the handheld photos lacked. This model uses handheld
+   labels, so like `phone` and `mixed` it is a reference line, never a candidate to ship.
+
+**Next run (lab box).** The /3 fit first (no training; nothing trained so far changes), then the
+referee table on it (no training, minutes per seed).
+
+```bash
+cd ~/Oculomics && git pull
+export B=<BRSET root> M=<mBRSET root>
+CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0
+# paste ck_phone_sim_v3/fit_report.txt
+CKS=(); for s in 0 1 2 3 4; do CKS+=(canon_only=ck_rr_canon/seed$s.pt phone=ck_phone_ceiling/seed$s.pt mixed=ck_phone_mixed/seed$s.pt); done
+.venv/bin/python phone_sim_effects.py --profile ck_phone_sim_v3/profile.json --source-root $B --target-root $M \
+    --sets render field drop --ckpt "${CKS[@]}" --num-workers 5 --out ck_phone_sim_v3/effects_referees
+# paste ck_phone_sim_v3/effects_referees/effects_summary.txt
+```
+
+On the /3 profile `full` is the new render with its own detail criterion and `render_v2` the old
+render on the same bank and draws. Read, in REFEREES' VERDICT and the per-arm tables: (a)
+`render_v2` against `tabletop` on the phone-only model -- above, the old simulator already helps a
+handheld model read tabletop photos; below, it removes more than the camera difference costs; (b)
+`full` against `render_v2` on every arm -- the new render is the better simulator if the referees'
+AUROC rises and the Canon-only model's rows move toward its `REAL handheld` row (AUROC 0.920,
+sensitivity 0.76 on seed 0) rather than past it. `fill_0` and `prefilter_gauss` take back one option
+each, ranked on a reading of their own chain (read them against `full_cal`); `detail_by_band` and
+`detail_by_edge` are the other criteria; `drop_detail` says whether the detail stage earns its place.
+If (b) holds, train the /3 arm (`CK=ck_phone_sim_v3 ARM_OUT=exp_rr_phonesim_v3
+ARM_CK=ck_rr_phonesim_v3 PART=val bash run_phone_sim.sh 0`, which reuses the fit, then the other
+seeds), and `MODES=mixed_sim PROFILE=ck_phone_sim_v3/profile.json bash run_phone_ceiling.sh 0` for
+the training test. If the referees do no better on the new render, the `drop_*` rows already in this table, and the
+`only_*` rows of a further run with `--sets only`, say which stage a handheld-trained model objects
+to.
+
+The same table on the box's /2 profile needs no fit, but there every render row keeps the band
+criterion, whose blur reacts to what reaches it (a render that arrives sharper or less magnified is
+blurred more): `render_v3` there need not be sharper than `full`, so it cannot decide the refit. On
+such a bank each render row has a `*_no_detail` twin beside `drop_detail`, which read the field and
+the resampling apart from that blur.
+
+The stored-reference test of the /2 render allows another machine's rounding (under 2e-3 anywhere,
+under 2 % of pixels at 1e-4: one photo whose blur is mixed between two rungs answers a rounding
+difference with a few 1e-4 on a few dozen pixels). A failure with every photo off is a real change;
+the stored file is only ever regenerated from commit 45d8b37.
+
+**Checked.** The whole change was reviewed three times and every confirmed finding fixed (the last
+pass: the report's pooled folds, readings that are mostly noise, a blur ladder that rises, a
+half-finished profile left under the final name, `--source-camera` beside an every-camera arm, and
+tests that passed by slack). On the final code the affected test files pass (116 tests, one skipped), a /2 profile renders on the samples exactly what commit 45d8b37 rendered, and 101 mistakes planted one at a time in a copy of the code are each caught by the tests.
