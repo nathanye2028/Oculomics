@@ -168,3 +168,141 @@ def test_phone_ceiling_without_a_split_file_or_comparison(tmp_path):
     assert set(split.loc[split["split"] == "test", "file"]) == set(test["file"])
     assert set(pd.read_csv(out / "ceiling.csv")["model"]) == {"phone"}
     assert ceiling(["--summarize", str(tmp_path / "pc")]) == 0
+
+
+def test_views_collate_and_simulate_tabletop_touch_only_the_tabletop_photos():
+    """A --mix-phone-sim batch: tabletop items carry two views, handheld items one; the
+    simulator gets the tabletop crops with their own whole-FOV views, in order, and its
+    renders go back into those slots (a mix-up would train a render under another
+    photo's label, or re-render a real handheld photo)."""
+    from train_phone_ceiling import simulate_tabletop, views_collate
+    item = lambda k, tab: {"image": ({"crop": torch.full((3, 4, 4), float(k)), "full": torch.full((3, 6, 6), float(k))}
+                                     if tab else torch.full((3, 4, 4), float(k))),
+                           "label": torch.tensor([float(k), 0.0]), "file": f"f{k}"}
+    kinds = [True, False, False, True, True, False]
+    b = views_collate([item(k, t) for k, t in enumerate(kinds)])
+    assert b["image"]["crop"].shape == (6, 3, 4, 4) and b["image"]["full"].shape == (3, 3, 6, 6)
+    assert b["image"]["tabletop"].tolist() == kinds and b["label"][:, 0].tolist() == [0, 1, 2, 3, 4, 5]
+    assert b["image"]["full"][:, 0, 0, 0].tolist() == [0, 3, 4] and b["file"] == [f"f{k}" for k in range(6)]
+
+    class Sim:                                    # "renders" a photo as 100 + its whole-FOV view's value
+        def augment_views(self, crop, full, p, gen):
+            assert crop.shape[0] == full.shape[0] and torch.equal(crop[:, 0, 0, 0], full[:, 0, 0, 0])
+            self.p = p
+            return 100 + full[:, :, :4, :4]
+
+    sim = Sim()
+    x = simulate_tabletop(sim, b["image"], 0.7, torch.Generator(), torch.device("cpu"), False)
+    assert x[:, 0, 0, 0].tolist() == [100, 1, 2, 103, 104, 5] and sim.p == 0.7
+    none = views_collate([item(k, False) for k in range(3)])               # a batch without a tabletop photo
+    assert none["image"]["full"].shape[0] == 0
+    assert torch.equal(simulate_tabletop(sim, none["image"], 1.0, torch.Generator(), torch.device("cpu"), False),
+                       none["image"]["crop"])
+
+
+def test_mixed_with_simulated_tabletop_photos(tmp_path, monkeypatch):
+    """--mix-phone-sim: the mixed run with its tabletop photos re-rendered as handheld
+    ones (model mixed_sim), read against the mixed run of the same seed."""
+    import phone_sim as ps
+    from train_phone_ceiling import family, main as ceiling
+    rng = np.random.default_rng(5)
+    B, M = tmp_path / "brset", tmp_path / "mbrset"
+    _make_brset(B, 40, rng)
+    _make_mbrset(M, 40, rng)
+    prof = tmp_path / "ck_phone_sim" / "profile.json"
+    assert ps.main(["fit", "--target-root", str(M), "--source-root", str(B), "--image-size", "64", "--validate", "0",
+                    "--num-workers", "0", "--device", "cpu", "--out", str(prof)]) == 0
+    small = ["--backbone", BACKBONE, "--no-pretrained", "--image-size", "64", "--epochs", "1", "--batch-size", "8",
+             "--num-workers", "0", "--device", "cpu", "--n-boot", "10", "--ema-decay", "0"]
+    mix = ["--root", str(M), "--mix-root", str(B)]
+    with pytest.raises(SystemExit):                                       # nothing to re-render without tabletop photos
+        ceiling(["--root", str(M), "--mix-phone-sim", str(prof), *small])
+    seen = []
+    orig = ps.PhoneSimulator.augment_views
+
+    def views(self, crop, full, p, gen):
+        out = orig(self, crop, full, p, gen)
+        seen.append((tuple(crop.shape), tuple(full.shape), p, bool((out != crop).flatten(1).any(1).all())))
+        return out
+
+    monkeypatch.setattr(ps.PhoneSimulator, "augment_views", views)
+    out = tmp_path / "sim" / "seed0"
+    assert ceiling([*mix, "--mix-phone-sim", str(prof), *small, "--out", str(out),
+                    "--ckpt", str(tmp_path / "ck_sim" / "seed0.pt")]) == 0
+    # every tabletop photo of every batch went through the simulator, from a 96 px whole-FOV view
+    assert seen and all(c[0] == f[0] and c[1:] == (3, 64, 64) and f[1:] == (3, 96, 96) and p == 1.0 and changed
+                        for c, f, p, changed in seen)
+    assert 0 < sum(c[0] for c, *_ in seen) < 8 * len(seen)                 # the handheld photos were not
+    res = json.loads((out / "results.json").read_text())
+    assert res["model"] == "mixed_sim" and family("mixed_sim") == "mixed_sim" and res["args"]["gpu_aug"] is True
+    assert len(res["phone_sim_profile"]["sha256"]) == 64 and res["phone_sim_profile"]["train_size"] == 96
+    assert res["phone_sim_profile"]["format"] == ps.FORMAT and res["phone_sim_profile"]["p"] == 1.0
+    assert set(pd.read_csv(out / "ceiling.csv")["model"]) == {"mixed_sim"}
+    assert set(pd.read_csv(out / "home_camera.csv")["model"]) == {"mixed_sim"}
+    ck = torch.load(tmp_path / "ck_sim" / "seed0.pt", map_location="cpu", weights_only=False)
+    assert ck["phone_sim_profile"]["sha256"] == res["phone_sim_profile"]["sha256"]
+
+    # a bank holding a handheld validation / test photo, or none listed, is refused
+    blob = json.loads(prof.read_text())
+    test_file = pd.read_csv(out / "split_handheld.csv").query("split == 'test'")["file"].iloc[0]
+    for files, why in ((blob["source"]["files"] + [test_file], "validation / test split"), ([], "no bank photos"),
+                       (blob["source"]["files"] + ["elsewhere.jpg"], "not in this run's handheld table")):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({**blob, "source": {**blob["source"], "files": files}}))
+        with pytest.raises(SystemExit, match=why):
+            ceiling([*mix, "--mix-phone-sim", str(bad), *small, "--out", str(tmp_path / "bad_out"),
+                     "--ckpt", str(tmp_path / "bad.pt")])
+
+    # read against the mixed run of the same seed, paired
+    monkeypatch.setattr(ps.PhoneSimulator, "augment_views", orig)
+    assert ceiling([*mix, *small, "--out", str(tmp_path / "mixed" / "seed0"),
+                    "--ckpt", str(tmp_path / "ck_mixed" / "seed0.pt")]) == 0
+    assert list(pd.read_csv(out / "predictions_mixed_sim.csv")["file"]) == \
+        list(pd.read_csv(tmp_path / "mixed" / "seed0" / "predictions_mixed.csv")["file"])
+    assert ceiling(["--summarize", str(tmp_path / "sim"), "--versus", str(tmp_path / "mixed"),
+                    str(tmp_path / "nowhere")]) == 0
+    summary = (tmp_path / "sim" / "summary.txt").read_text()
+    assert "mixed_sim" in summary and "minus mixed" in summary and "paired by seed" in summary
+    assert "oracle_spec" in summary and "no seed in both" in summary
+    # ... and its numbers: this sweep's mean, the other's, the difference, in that order
+    first = lambda d, m: pd.read_csv(d / "seed0" / "ceiling.csv").query("model == @m and target == 'dr_referable'").iloc[0]
+    sim_au, mix_au = first(tmp_path / "sim", "mixed_sim").auroc, first(tmp_path / "mixed", "mixed").auroc
+    line = next(l.split() for l in summary[summary.index("minus mixed"):].splitlines()
+                if l.split()[:2] == ["dr_referable", "auroc"])
+    assert line[2:5] == [f"{sim_au:.3f}", f"{mix_au:.3f}", f"{sim_au - mix_au:.3f}"]
+    assert line[-1] == f"{sim_au - mix_au:+.3f}"
+
+
+def test_the_paired_summary_subtracts_the_other_sweep_seed_by_seed(tmp_path):
+    """versus_table: this sweep minus the other, each seed against the same seed, per
+    metric; a seed only one sweep has is left out; two sweeps of one model keep a column
+    each."""
+    from train_phone_ceiling import versus_table
+
+    def sweep(name, model, by_seed):
+        for seed, (au, pa, sp) in by_seed.items():
+            d = tmp_path / name / f"seed{seed}"
+            d.mkdir(parents=True)
+            pd.DataFrame([{"model": model, "target": "dr_referable", "auroc": au, "patient_auroc": pa, "oracle_spec": sp},
+                          {"model": "ck_rr_canon_seed0_trained", "target": "dr_referable", "auroc": 0.1,
+                           "patient_auroc": 0.1, "oracle_spec": 0.1}]).to_csv(d / "ceiling.csv", index=False)
+        return str(tmp_path / name)
+
+    sim = sweep("sim", "mixed_sim", {0: (0.90, 0.80, 0.70), 1: (0.80, 0.85, 0.75), 2: (0.99, 0.99, 0.99)})
+    mix = sweep("mix", "mixed", {1: (0.86, 0.80, 0.70), 0: (0.85, 0.82, 0.60)})          # no seed 2
+    txt = "\n".join(versus_table(sim, [mix]))
+    row = lambda metric, t=None: next(l.split() for l in (t or txt).splitlines() if l.split()[:2] == ["dr_referable", metric])
+    assert "mixed_sim (" in txt and "minus mixed (" in txt
+    #                             this   other  difference  seeds above 0, seeds, each seed
+    assert row("auroc")[2:] == ["0.850", "0.855", "-0.005", "1", "2", "+0.050", "-0.060"]
+    assert row("patient_auroc")[2:] == ["0.825", "0.810", "0.015", "1", "2", "-0.020", "+0.050"]
+    assert row("oracle_spec")[2:] == ["0.725", "0.650", "0.075", "2", "2", "+0.100", "+0.050"]
+    # the seed the other sweep lacks is the first: still each seed against the same seed (paired
+    # by position, seed 0 here would meet the other sweep's seed 1)
+    late = sweep("late", "mixed", {1: (0.86, 0.80, 0.70), 2: (0.90, 0.90, 0.90)})
+    txt3 = "\n".join(versus_table(sim, [late]))
+    assert row("auroc", txt3)[2:] == ["0.895", "0.880", "0.015", "1", "2", "-0.060", "+0.090"]
+    other = sweep("sim_b", "mixed_sim", {0: (0.80, 0.80, 0.70), 1: (0.70, 0.85, 0.75)})
+    txt2 = "\n".join(versus_table(sim, [other]))
+    assert "mixed_sim (this)" in txt2 and "mixed_sim (other)" in txt2
+    assert row("auroc", txt2)[2:5] == ["0.850", "0.750", "0.100"]

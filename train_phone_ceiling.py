@@ -49,6 +49,27 @@ photos in cost the home camera anything?
         --mix-split-file exp_rr_canon/seed0/split_tabletop.csv --compare ck_rr_canon/seed0.pt \\
         --seed 0 --out exp_phone_mixed/seed0 --ckpt ck_phone_mixed/seed0.pt
 
+``--mix-phone-sim <profile.json>`` (with ``--mix-root``; the model named
+``mixed_sim``) re-renders the tabletop half of the mixture as handheld photos with
+``phone_sim.py`` before the model sees it, each tabletop draw with probability
+``--mix-sim-p`` (default 1: every one). Phone-only training does worse than the
+mixture (oracle specificity 0.868 against 0.889, five seeds), so tabletop photos
+add something the handheld photos alone do not teach; this arm asks whether a
+simulated handheld photo adds as much. Read on the same phone test rows, against
+that seed's ``mixed`` and ``phone`` runs: ``mixed_sim`` at or above ``mixed`` means
+the re-rendered photos are at least as good a partner for real handheld photos as
+the tabletop photos themselves (the simulator keeps what the tabletop photos teach
+and moves them toward the handheld camera); below ``mixed`` but above ``phone``, it
+keeps part of it; at ``phone`` or below, the simulated photos teach nothing the
+handheld photos lacked, or the wrong thing. The profile's bank must be this run's
+handheld train split (refused otherwise); the home-camera check then says what
+never seeing an unsimulated tabletop photo costs on the tabletop test.
+
+    python train_phone_ceiling.py --root <mBRSET> --mix-root <BRSET> --mix-camera 'Canon CR' \\
+        --split-file exp_rr_canon/seed0/split_handheld.csv \\
+        --mix-split-file exp_rr_canon/seed0/split_tabletop.csv --mix-phone-sim ck_phone_sim/profile.json \\
+        --seed 0 --out exp_phone_mixed_sim/seed0 --ckpt ck_phone_mixed_sim/seed0.pt
+
 ``--compare`` scores RetinaReach checkpoints on the same phone test rows, as
 trained (``<tag>_trained``: the ladder's "as trained" row, shipped tabletop
 threshold) and with full AdaBN on the phone pool (``<tag>_calibrated``), and
@@ -74,6 +95,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -100,6 +122,35 @@ from train_retinareach import MultiTargetDataset, balanced_weights, predict  # n
 
 PHONE = "phone"
 MIXED = "mixed"
+MIXED_SIM = "mixed_sim"            # mixed, its tabletop photos re-rendered as handheld ones
+
+
+def views_collate(batch: List[dict]) -> dict:
+    """A ``--mix-phone-sim`` training batch. Tabletop items carry two views
+    (``phone_sim.TrainViews``: the training crop and the whole FOV the simulator
+    renders from), handheld items the crop alone: ``image`` becomes ``{"crop":
+    [B,3,S,S], "full": [n_tabletop,3,S',S'], "tabletop": [B] bool}``, the ``full``
+    rows in the order of the tabletop items."""
+    from torch.utils.data import default_collate
+    imgs = [b["image"] for b in batch]
+    two = [isinstance(v, dict) for v in imgs]
+    crop = torch.stack([v["crop"] if t else v for v, t in zip(imgs, two)])
+    full = [v["full"] for v, t in zip(imgs, two) if t]
+    out = default_collate([{k: v for k, v in b.items() if k != "image"} for b in batch])
+    out["image"] = {"crop": crop, "full": torch.stack(full) if full else crop.new_zeros((0,) + crop.shape[1:]),
+                    "tabletop": torch.tensor(two)}
+    return out
+
+
+def simulate_tabletop(phone_sim, image: dict, p: float, gen: torch.Generator, dev, non_blocking: bool) -> torch.Tensor:
+    """The batch's crops on ``dev`` with each tabletop photo re-rendered from its whole
+    FOV with probability ``p`` (handheld photos are never touched)."""
+    x = image["crop"].to(dev, non_blocking=non_blocking)
+    idx = image["tabletop"].nonzero()[:, 0]
+    if len(idx):
+        idx = idx.to(dev)
+        x[idx] = phone_sim.augment_views(x[idx], image["full"], p, gen).to(x.dtype)
+    return x
 
 
 # --------------------------------------------------------------------------- #
@@ -135,9 +186,12 @@ def mixed_weights(y_tab: np.ndarray, y_phone: np.ndarray, phone_share: float,
 # --------------------------------------------------------------------------- #
 # Stage 1 on the phone (train_retinareach.py's loop, phone images in)
 # --------------------------------------------------------------------------- #
-def fit(a, model, train_loader, val_loader, y_val: np.ndarray, dev, name: str = PHONE) -> tuple:
-    """Train ``model`` in place; returns ``(best val mean AUROC, best epoch)``."""
+def fit(a, model, train_loader, val_loader, y_val: np.ndarray, dev, name: str = PHONE, phone_sim=None) -> tuple:
+    """Train ``model`` in place; returns ``(best val mean AUROC, best epoch)``.
+    ``phone_sim``: the loader yields :func:`views_collate` batches and the tabletop
+    photos are re-rendered before the device-side augmentation."""
     nS = len(model.source_targets)
+    psim_gen = torch.Generator().manual_seed(a.seed + 7919)          # train_retinareach.py's
     gpu_aug = a.gpu_aug if a.gpu_aug is not None else dev.type == "cuda"
     ema = ModelEMA(model, a.ema_decay) if a.ema_decay > 0 else None
     use_amp = a.amp if a.amp is not None else dev.type == "cuda"
@@ -165,7 +219,10 @@ def fit(a, model, train_loader, val_loader, y_val: np.ndarray, dev, name: str = 
         model.train()
         run, nb, te = 0.0, 0, time.time()
         for b in train_loader:
-            x = b["image"].to(dev, non_blocking=cuda)
+            if phone_sim is not None:
+                x = simulate_tabletop(phone_sim, b["image"], a.mix_sim_p, psim_gen, dev, cuda)
+            else:
+                x = b["image"].to(dev, non_blocking=cuda)
             # the label slice is strided: never a non-blocking copy off CUDA (see predict)
             y = b["label"][:, :nS].contiguous().to(dev, non_blocking=cuda)
             if dev_aug is not None:
@@ -295,12 +352,48 @@ def checkpoint_tag(path: str) -> str:
 # --------------------------------------------------------------------------- #
 def family(model: str) -> str:
     """'ck_rr_canon_seed3_trained' -> 'compare_trained': rows that pool over seeds."""
-    if model in (PHONE, MIXED):
+    if model in (PHONE, MIXED, MIXED_SIM):
         return model
     return "compare_" + model.rsplit("_", 1)[-1]
 
 
-def summarize(d: str) -> int:
+def own_rows(d: str) -> pd.DataFrame:
+    """Each seed's own model (phone / mixed / mixed_sim) in ``d``: seed, target, model, auroc, oracle_spec."""
+    parts = []
+    for f in sorted(glob.glob(os.path.join(d, "seed*", "ceiling.csv"))):
+        df = pd.read_csv(f)
+        df = df[df["model"].isin([PHONE, MIXED, MIXED_SIM])]
+        parts.append(df.assign(seed=int(re.sub(r"\D", "", os.path.basename(os.path.dirname(f))) or -1)))
+    cols = ["seed", "target", "model", "auroc", "patient_auroc", "oracle_spec"]
+    return pd.concat(parts, ignore_index=True)[cols] if parts else pd.DataFrame(columns=cols)
+
+
+def versus_table(d: str, others: Sequence[str]) -> List[str]:
+    """This sweep's model minus each other sweep's, seed by seed, on the same phone test
+    rows (the sweeps share their split files): mean difference and the seeds above 0."""
+    mine, lines = own_rows(d), []
+    for o in others:
+        theirs = own_rows(o)
+        m = mine.merge(theirs, on=["seed", "target"], suffixes=("", "_other"))
+        if not len(m):
+            lines.append(f"\n=== versus {o}: no seed in both ===")
+            continue
+        a, b = m["model"].iloc[0], m["model_other"].iloc[0]
+        # two sweeps of one model (another PROFILE or SIM_P): one column each all the same
+        ca, cb = (a, b) if a != b else (f"{a} (this)", f"{b} (other)")
+        rows = []
+        for t, g in m.groupby("target", sort=False):
+            for col in ("auroc", "patient_auroc", "oracle_spec"):
+                dlt = g[col] - g[f"{col}_other"]
+                rows.append({"target": t, "metric": col, ca: g[col].mean(), cb: g[f"{col}_other"].mean(),
+                             "difference": dlt.mean(), "seeds_above_0": int((dlt > 0).sum()), "seeds": len(dlt),
+                             "per_seed": " ".join(f"{v:+.3f}" for v in dlt)})
+        lines += [f"\n=== {a} ({d}) minus {b} ({o}), paired by seed, phone test, image level ===",
+                  pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.3f}")]
+    return lines
+
+
+def summarize(d: str, versus: Sequence[str] = ()) -> int:
     dirs = sorted(glob.glob(os.path.join(d, "seed*", "ceiling.csv")))
     if not dirs:
         raise SystemExit(f"[fatal] no seed*/ceiling.csv under {d}")
@@ -359,6 +452,8 @@ def summarize(d: str) -> int:
         say(f"\n=== transfer gap: AUROC {trained} minus the tabletop-trained model, same test rows "
             f"(handheld = phone test, tabletop = home-camera test; patient bootstrap per seed) ===")
         say(gt.to_string(float_format=lambda v: f"{v:+.3f}"))
+    for text in versus_table(d, versus):
+        say(text)
     with open(os.path.join(d, "summary.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nwrote {d}/summary.txt")
@@ -373,6 +468,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                             "the camera ladder (in-domain ceiling).")
     p.add_argument("--summarize", default=None, metavar="DIR",
                    help="print the mean over DIR/seed*/ and exit (no training)")
+    p.add_argument("--versus", nargs="*", default=[], metavar="DIR",
+                   help="with --summarize: other sweeps (e.g. exp_phone_mixed exp_phone_ceiling) whose own "
+                        "model this sweep's is compared with, seed by seed")
     p.add_argument("--root", help="handheld dataset root (labels + images)")
     p.add_argument("--dataset", default="mbrset", choices=["mbrset", "brset"])
     p.add_argument("--split-file", default=None,
@@ -392,6 +490,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "mixed model's, its tabletop test rows the home-camera check's")
     p.add_argument("--phone-share", type=float, default=0.5,
                    help="fraction of each epoch's draws that are phone photos (mixed runs)")
+    p.add_argument("--mix-phone-sim", default=None, metavar="PROFILE",
+                   help="phone_sim.py profile: the mixed run's tabletop photos re-rendered as handheld ones "
+                        "(model 'mixed_sim'); its bank must be this run's handheld train split")
+    p.add_argument("--mix-sim-p", type=float, default=1.0,
+                   help="probability that a tabletop draw is re-rendered (1: the model never sees an "
+                        "unsimulated tabletop photo)")
     p.add_argument("--targets", nargs="+", default=list(SOURCE_TARGETS))
     p.add_argument("--backbone", default=DEFAULT_BACKBONE)
     p.add_argument("--no-pretrained", action="store_true")
@@ -422,16 +526,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--log-every", type=int, default=100)
     a = p.parse_args(argv)
     if a.summarize:
-        return summarize(a.summarize)
+        return summarize(a.summarize, a.versus)
     if not a.root:
         p.error("--root is required unless --summarize")
     if a.mix_root and os.path.realpath(a.mix_root) == os.path.realpath(a.root):
         p.error("--mix-root is the phone --root")
     if a.mix_root and not 0 < a.phone_share < 1:
         p.error("--phone-share must be strictly between 0 and 1")
-    if (a.mix_camera or a.mix_split_file) and not a.mix_root:
-        p.error("--mix-camera / --mix-split-file need --mix-root")
-    name = MIXED if a.mix_root else PHONE
+    if (a.mix_camera or a.mix_split_file or a.mix_phone_sim) and not a.mix_root:
+        p.error("--mix-camera / --mix-split-file / --mix-phone-sim need --mix-root")
+    if a.mix_phone_sim and not 0 < a.mix_sim_p <= 1:
+        p.error("--mix-sim-p must be in (0, 1]")
+    name = MIXED_SIM if a.mix_phone_sim else MIXED if a.mix_root else PHONE
+    phone_sim, phone_sim_info = None, None
+    if a.mix_phone_sim:
+        from phone_sim import PhoneProfile, PhoneSimulator
+        try:
+            phone_sim = PhoneSimulator(PhoneProfile.load(a.mix_phone_sim), out_size=a.image_size)
+            phone_sim.check_size(a.image_size)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"[fatal] --mix-phone-sim: {e}")
+        if a.gpu_aug is False:
+            print("[phone-sim] --no-gpu-aug overridden: the simulator runs before the device-side augmentation")
+        a.gpu_aug = True
 
     seed_everything(a.seed, deterministic=not a.nondeterministic)
     dev = pick_device() if a.device == "auto" else torch.device(a.device)
@@ -460,6 +577,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[data] {a.dataset} @ {csv}: {len(table)} rows / {table['patient'].nunique()} patients; "
           f"images on disk train/val/test {len(train_ds)}/{len(val_ds)}/{len(test_ds)}"
           + ("" if agrees is None else f"; split file matches recomputed split: {agrees}"))
+    if phone_sim is not None:
+        # the simulator's bank is statistics of handheld photos: they must all be this run's
+        # handheld TRAINING photos (a validation or test photo's statistics would reach training)
+        bank = set(map(str, phone_sim.profile.source.get("files") or []))
+        files = {k: set(v["file"].astype(str)) for k, v in split.items()}
+        leak, unknown = bank & (files["val"] | files["test"]), bank - files["train"] - files["val"] - files["test"]
+        if not bank or leak or unknown:
+            why = ("it lists no bank photos" if not bank else
+                   f"{len(leak)} of its bank photos are in this run's handheld validation / test split" if leak else
+                   f"{len(unknown)} of its bank photos are not in this run's handheld table")
+            raise SystemExit(f"[fatal] --mix-phone-sim: {why}: refit it with phone_sim.py fit on this run's "
+                             f"handheld train split")
+        with open(a.mix_phone_sim, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        phone_sim_info = {"path": a.mix_phone_sim, "sha256": sha, "n_bank": len(phone_sim.profile),
+                          "format": phone_sim.profile.format, "p": a.mix_sim_p,
+                          "params": {k: v for k, v in phone_sim.p.items() if k != "src_illum"}}
 
     # ---- mixed: the tabletop camera's train split joins the phone's -------- #
     tab_split, tab_dir, tab_agrees, tab_train, tab_test = None, None, None, None, None
@@ -478,7 +612,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"using the file (it fixed that run's tabletop photos)")
         pd.concat([v.assign(split=k)[["file", "patient", "split"]] for k, v in tab_split.items()]
                   ).to_csv(os.path.join(a.out, "split_tabletop.csv"), index=False)
-        tab_train, tab_test = mk(tab_split, tab_dir, "train", "train"), mk(tab_split, tab_dir, "test", "val")
+        tab_test = mk(tab_split, tab_dir, "test", "val")
+        if phone_sim is not None:
+            # as train_retinareach.py --phone-sim: the simulator renders from the whole FOV,
+            # supersampled; a photo it leaves alone keeps the ordinary training crop
+            from phone_sim import TrainViews
+            train_size = int(round(a.image_size * float(phone_sim.profile.params["supersample"])))
+            tab_train = MultiTargetDataset(tab_split["train"], tab_dir, a.targets, "train", train_size,
+                                           transform=TrainViews(a.image_size, train_size))
+            phone_sim_info["train_size"] = train_size
+        else:
+            tab_train = mk(tab_split, tab_dir, "train", "train")
         for nm, d in (("train", tab_train), ("test", tab_test)):
             if len(d) == 0:
                 raise SystemExit(f"[fatal] tabletop {nm} has no images on disk under {tab_dir}")
@@ -486,8 +630,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               + (f", camera {a.mix_camera!r} ({len(tab)} of {n_all} rows)" if a.mix_camera else "")
               + f": images on disk train/test {len(tab_train)}/{len(tab_test)}"
               + ("" if tab_agrees is None else f"; split file matches recomputed split: {tab_agrees}"))
-        print(f"[data] {MIXED}: {len(tab_train)} tabletop + {len(train_ds)} phone training photos, "
-              f"phone share of draws {a.phone_share:.2f}")
+        print(f"[data] {name}: {len(tab_train)} tabletop + {len(train_ds)} phone training photos, "
+              f"phone share of draws {a.phone_share:.2f}"
+              + (f"; tabletop photos re-rendered by {a.mix_phone_sim} ({phone_sim.profile.format}, "
+                 f"{len(phone_sim.profile)} bank rows) with probability {a.mix_sim_p:g}, from the whole FOV at "
+                 f"{phone_sim_info['train_size']} px" if phone_sim is not None else ""))
 
     g = torch.Generator(); g.manual_seed(a.seed)
     dl = lambda d, **kw: DataLoader(d, batch_size=a.batch_size, num_workers=a.num_workers,
@@ -504,14 +651,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                          replacement=True, generator=g)
                    if a.imbalance == "sampler" else None)
     train_loader = dl(fit_ds, sampler=sampler, shuffle=sampler is None, drop_last=True,
-                      generator=g, persistent_workers=a.num_workers > 0)
+                      generator=g, persistent_workers=a.num_workers > 0,
+                      **({"collate_fn": views_collate} if phone_sim is not None else {}))
     val_loader, test_loader = dl(val_ds), dl(test_ds)
     tab_loader = dl(tab_test) if tab_test is not None else None
 
     # ---- train (phone photos, plus the tabletop's when mixed) --------------- #
     model = RetinaReachNet(a.targets, (), backbone=a.backbone, pretrained=not a.no_pretrained,
                            dropout=a.dropout).to(dev)
-    best, best_ep = fit(a, model, train_loader, val_loader, val_ds.label_array(), dev, name)
+    best, best_ep = fit(a, model, train_loader, val_loader, val_ds.label_array(), dev, name, phone_sim)
     print(f"[train] selected epoch {best_ep} (val mean AUROC {best:.4f})")
 
     # thresholds on the phone's own validation split: the phone is this model's home
@@ -527,7 +675,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     torch.save({"model": {k: v.cpu() for k, v in model.state_dict().items()},
                 "config": {**model.config(), "image_size": a.image_size},
                 "thresholds": {"trained": thr}, "profiles": {}, "args": vars(a),
-                "best_epoch": best_ep, "best_val": best}, a.ckpt)
+                "best_epoch": best_ep, "best_val": best, "phone_sim_profile": phone_sim_info}, a.ckpt)
 
     # ---- the tabletop-trained models on the same phone (and tabletop) test rows #
     compare_info = {}
@@ -612,7 +760,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n.update(tabletop_train=len(tab_train), tabletop_test=len(tab_test))
     results = {"args": vars(a), "model": name, "best_epoch": best_ep, "best_val_mean_auroc": best,
                "split_file_agrees": agrees, "mix_split_file_agrees": tab_agrees, "n": n,
-               "thresholds": thresholds, "compare": compare_info,
+               "thresholds": thresholds, "compare": compare_info, "phone_sim_profile": phone_sim_info,
                "ceiling": ceil_rows, "referral": ref_rows, "home_camera": home_rows,
                "transfer_gap": gaps,
                "minutes": (time.time() - t0) / 60,

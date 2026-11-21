@@ -11,7 +11,11 @@
 #          it; the split is the trainer's, stratified on referable DR) and the tabletop
 #          statistics from the Canon train split -> $CK/profile.json, fit_report.txt
 #          (cross-fitted realism per statistic, the field the renders get) and fit_grid.jpg.
-#          An existing profile is reused only if it has this format, size and camera.
+#          An existing profile is reused only if it has a readable format, this size and
+#          camera. A new fit writes format phone_sim/3 (the handheld's own angular scale,
+#          the matched resampling, detail matched on edge sharpness); a phone_sim/2 profile
+#          already in $CK is kept and renders as it always did, so the arm trained with it
+#          stays what it was. The /3 arm therefore needs a fresh CK (below).
 #   check  style_transfer_xfer.py check on the Canon sweep's checkpoint: realism among
 #          ICDR-0 eyes (camera distance, camera probe) and label preservation (judge,
 #          logit shifts, vessel_r) for phone_sim next to colour / fda_sharp ->
@@ -38,6 +42,10 @@
 #
 # Ablation arms (P, STRENGTH, FIELD or the profile changed) are chosen on the handheld VALIDATION
 # split and need a fresh ARM_OUT / ARM_CK each (and a fresh CK for another profile):
+#   CK=ck_phone_sim_v3 ARM_OUT=exp_rr_phonesim_v3 ARM_CK=ck_rr_phonesim_v3 PART=val bash run_phone_sim.sh 0 1 2 3 4
+#     (the phone_sim/3 render: a fresh fit. Its fit and check stages need no training; before
+#     training it, phone_sim_effects.py --sets render reads the new render against the old on
+#     the finished checkpoints, the phone-only and mixed ones included: see its header)
 #   P=0.25 ARM_OUT=exp_rr_p025 ARM_CK=ck_rr_p025 PART=val STAGES="train score" bash run_phone_sim.sh 0 1 2 3 4
 #   STRENGTH=0.5 ARM_OUT=exp_rr_s05 ARM_CK=ck_rr_s05 PART=val STAGES="check train score" bash run_phone_sim.sh 0 1 2 3 4
 #   FIELD=whole ARM_OUT=exp_rr_whole ARM_CK=ck_rr_whole PART=val STAGES="check train score patient" bash run_phone_sim.sh 0 1 2 3 4
@@ -118,10 +126,10 @@ import json, sys
 import phone_sim
 b = json.load(open(sys.argv[1]))
 s = b.get("source", {})
-sys.exit(0 if b.get("format") == phone_sim.FORMAT and s.get("image_size") == int(sys.argv[2])
+sys.exit(0 if b.get("format") in phone_sim.FORMATS and s.get("image_size") == int(sys.argv[2])
          and (s.get("source_camera") or "") == sys.argv[3] else 1)
 EOF
-    echo "[fit] $PROFILE exists (same format, size and camera), skipping"
+    echo "[fit] $PROFILE exists ($($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["format"])' "$PROFILE"), same size and camera), skipping"
   else
     # shellcheck disable=SC2086  # FIT_EXTRA: separate flags
     $PY phone_sim.py fit --device "$DEVICE" --target-root "$M" --source-root "$B" --source-camera "$CAM" \

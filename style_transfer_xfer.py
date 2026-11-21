@@ -89,7 +89,7 @@ from metadata_model import _auc, load_table, threshold_at_sensitivity  # noqa: E
 from retinareach import (build_from_checkpoint, calibrate_blended, camera_distance,  # noqa: E402
                          get_bn_stats, set_bn_stats, stats_from_lists)
 from style_transfer import (CycleStylizer, FDAStylizer, ReferenceBank, Stylizer, denorm,  # noqa: E402
-                            generator_from_state, renorm, sharpness, train_translator)
+                            generator_from_state, renorm, train_translator)
 from train_mbrset import pick_device  # noqa: E402
 from train_retinareach import MultiTargetDataset  # noqa: E402
 from vessel_ablation import fov_mask, vessel_response, window_for  # noqa: E402
@@ -283,7 +283,15 @@ def _check_phone_profile(phone_profile: str, size: int) -> None:
 def image_stats(x01: torch.Tensor) -> Dict[str, torch.Tensor]:
     """Per-image statistics inside the field of view: Laplacian variance, spread
     of the low-frequency luminance (std/mean), specular fraction (bright and
-    desaturated, ``artifacts.detect_glare``'s rule), red share of the colour."""
+    desaturated, ``artifacts.detect_glare``'s rule), red share of the colour.
+
+    The Laplacian variance is ``phone_sim.laplacian_var``: the frame edge counts as
+    outside the field of view. ``style_transfer.sharpness``, which this column read
+    before, takes in the frame's border lines, where a zero-padded Laplacian reads
+    the photo's own level; on a tabletop frame, cut along its whole top and bottom
+    rows, that was most of the number. ``fda_sharp`` still matches on ``sharpness``,
+    so this column is not the quantity that method matched."""
+    from phone_sim import laplacian_var
     m = fov_mask(x01).float()
     n = m.sum(dim=(1, 2, 3)).clamp(min=1)
     lum = x01.mean(dim=1, keepdim=True)
@@ -294,7 +302,7 @@ def image_stats(x01: torch.Tensor) -> Dict[str, torch.Tensor]:
     mx, mn = x01.max(dim=1, keepdim=True).values, x01.min(dim=1, keepdim=True).values
     glare = ((mx > 0.85) & ((mx - mn) / mx.clamp_min(1e-6) < 0.25)).float()
     rgb = (x01 * m).sum(dim=(2, 3)) / n.view(-1, 1)
-    return {"sharp": sharpness(x01), "illum": sd / mu.clamp_min(1e-6),
+    return {"sharp": laplacian_var(x01), "illum": sd / mu.clamp_min(1e-6),
             "glare": (glare * m).sum(dim=(1, 2, 3)) / n,
             "red": rgb[:, 0] / rgb.sum(dim=1).clamp_min(1e-6)}
 
@@ -534,8 +542,10 @@ def summarise_check(df: pd.DataFrame, judge_ref: Dict[str, float], judge_thr: fl
     real = df[df.method == "REAL handheld"].iloc[0]
     out = ["", "REALISM among ICDR-0 eyes (handheld-like without adding disease)",
            f"  cam_dist floor = REAL handheld vs itself; p_handheld: 0 tabletop, 1 handheld",
+           "  sharp = phone_sim.laplacian_var (Laplacian variance, the frame edge outside the FOV): not comparable "
+           "with a check report written before this line was",
            df[f(["method", "cam_dist", "p_handheld_icdr0", "sharp", "illum", "glare", "red"])]
-           .to_string(index=False, float_format=lambda v: f"{v:.4f}"),
+           .to_string(index=False, float_format=lambda v: f"{v:.4f}" if v == 0 or abs(v) >= 0.001 else f"{v:.2e}"),
            "", "LABEL PRESERVATION on tabletop test images, against their true labels",
            f"  judge = referable-DR probe trained on real handheld images; on real handheld test: "
            f"AUROC {judge_ref['auroc']:.3f}, flags {judge_ref['flag_icdr0']:.3f} of ICDR-0 eyes",
