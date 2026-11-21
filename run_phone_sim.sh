@@ -43,9 +43,12 @@
 # Ablation arms (P, STRENGTH, FIELD or the profile changed) are chosen on the handheld VALIDATION
 # split and need a fresh ARM_OUT / ARM_CK each (and a fresh CK for another profile):
 #   CK=ck_phone_sim_v3 ARM_OUT=exp_rr_phonesim_v3 ARM_CK=ck_rr_phonesim_v3 PART=val bash run_phone_sim.sh 0 1 2 3 4
-#     (the phone_sim/3 render: a fresh fit. Its fit and check stages need no training; before
-#     training it, phone_sim_effects.py --sets render reads the new render against the old on
-#     the finished checkpoints, the phone-only and mixed ones included: see its header)
+#     (the phone_sim/3 render: a fresh fit. Its fit and check stages need no training. Fit it
+#     first, CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0, and read
+#     phone_sim_effects.py --profile ck_phone_sim_v3/profile.json --sets render on the finished
+#     checkpoints, the phone-only and mixed ones included, before training it: on that profile
+#     `full` is the new render with its own detail criterion and `render_v2` the old one on the
+#     same bank. See REPORT 10.13, "Next run")
 #   P=0.25 ARM_OUT=exp_rr_p025 ARM_CK=ck_rr_p025 PART=val STAGES="train score" bash run_phone_sim.sh 0 1 2 3 4
 #   STRENGTH=0.5 ARM_OUT=exp_rr_s05 ARM_CK=ck_rr_s05 PART=val STAGES="check train score" bash run_phone_sim.sh 0 1 2 3 4
 #   FIELD=whole ARM_OUT=exp_rr_whole ARM_CK=ck_rr_whole PART=val STAGES="check train score patient" bash run_phone_sim.sh 0 1 2 3 4
@@ -121,13 +124,19 @@ mkdir -p "$OUT" "$CK"
 
 if has fit; then
   if [ -f "$PROFILE" ]; then
-    $PY - "$PROFILE" "$SIZE" "$CAM" <<'EOF' || { echo "[fatal] $PROFILE is another format, size or camera: move it aside and rerun the fit stage"; exit 1; }
+    $PY - "$PROFILE" "$SIZE" "$CAM" <<'EOF' || { echo "[fatal] $PROFILE is another format, size or camera, or one the simulator refuses: move it aside and rerun the fit stage"; exit 1; }
 import json, sys
 import phone_sim
 b = json.load(open(sys.argv[1]))
 s = b.get("source", {})
-sys.exit(0 if b.get("format") in phone_sim.FORMATS and s.get("image_size") == int(sys.argv[2])
-         and (s.get("source_camera") or "") == sys.argv[3] else 1)
+ok = (b.get("format") in phone_sim.FORMATS and s.get("image_size") == int(sys.argv[2])
+      and (s.get("source_camera") or "") == sys.argv[3])
+try:
+    phone_sim.PhoneSimulator(phone_sim.PhoneProfile.load(sys.argv[1]))   # a profile every consumer would refuse
+except ValueError as e:
+    print(f"[fit] {sys.argv[1]}: {e}")
+    ok = False
+sys.exit(0 if ok else 1)
 EOF
     echo "[fit] $PROFILE exists ($($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["format"])' "$PROFILE"), same size and camera), skipping"
   else

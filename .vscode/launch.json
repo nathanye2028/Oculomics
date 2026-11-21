@@ -258,11 +258,11 @@
       "cwd": "${workspaceFolder}"
     },
     {
-      "name": "phone sim: referees (phone-only, mixed) + new render vs old, seed 0, validation split (no training)",
+      "name": "phone sim (after CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0): referees (phone-only, mixed) + new render vs old, seed 0, validation split (no training)",
       "program": "${workspaceFolder}/phone_sim_effects.py",
       "args": [
         "--profile",
-        "ck_phone_sim/profile.json",
+        "ck_phone_sim_v3/profile.json",
         "--source-root",
         "/data/users4/nshaik3/Datasets/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1",
         "--target-root",
@@ -270,6 +270,7 @@
         "--sets",
         "render",
         "field",
+        "drop",
         "--ckpt",
         "canon_only=ck_rr_canon/seed0.pt",
         "canon_phonesim=ck_rr_phonesim/seed0.pt",
@@ -278,7 +279,7 @@
         "--num-workers",
         "5",
         "--out",
-        "ck_phone_sim/effects_referees_seed0"
+        "ck_phone_sim_v3/effects_referees_seed0"
       ],
       "type": "debugpy",
       "request": "launch",
@@ -287,11 +288,11 @@
       "cwd": "${workspaceFolder}"
     },
     {
-      "name": "phone sim: referees + new render vs old, seeds 0-4, validation split (no training)",
+      "name": "phone sim (after CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0): referees + new render vs old, seeds 0-4, validation split (no training)",
       "program": "${workspaceFolder}/phone_sim_effects.py",
       "args": [
         "--profile",
-        "ck_phone_sim/profile.json",
+        "ck_phone_sim_v3/profile.json",
         "--source-root",
         "/data/users4/nshaik3/Datasets/BRSET/physionet.org/files/brazilian-ophthalmological/1.0.1",
         "--target-root",
@@ -299,6 +300,7 @@
         "--sets",
         "render",
         "field",
+        "drop",
         "--ckpt",
         "canon_only=ck_rr_canon/seed0.pt",
         "phone=ck_phone_ceiling/seed0.pt",
@@ -318,7 +320,7 @@
         "--num-workers",
         "5",
         "--out",
-        "ck_phone_sim/effects_referees"
+        "ck_phone_sim_v3/effects_referees"
       ],
       "type": "debugpy",
       "request": "launch",

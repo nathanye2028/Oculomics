@@ -15,7 +15,9 @@ Variants (``--sets``):
               toward ``tabletop`` names the stage responsible for the change
   only        one stage alone (``only_light``, ...; the bloom needs the field's disc, so it
               is ``field+bloom`` next to ``only_field``)
-  strength    0, 0.25, 0.5, 0.75 of the photometric change (0 is the geometry alone)
+  strength    0, 0.25, 0.5, 0.75 of every photometric change, the zoom past 1, the rotation
+              and the framing shift (0 still un-squashes, zooms only as far as the aperture
+              needs and applies the aperture: not the phone field's scale)
   field       ``whole_field``: the whole tabletop FOV instead of the phone's narrower field
   render      the other generation of the render on the profile's own bank, one option at a
               time and all together: on a phone_sim/2 profile ``fill_0.18`` (the handheld's
@@ -76,9 +78,11 @@ cost of the crop (peripheral lesions lost while the label stays).
 
   python phone_sim_effects.py --profile ck_phone_sim/profile.json --source-root <BRSET> \\
       --target-root <mBRSET> --ckpt canon_only=ck_rr_canon/seed0.pt canon_phonesim=ck_rr_phonesim/seed0.pt
-  # the referees, and the new render against the old on the same bank (no training, no refit)
-  python phone_sim_effects.py --profile ck_phone_sim/profile.json --source-root <BRSET> \\
-      --target-root <mBRSET> --sets render field --out ck_phone_sim/effects_referees \\
+  # the referees, and the new render against the old on one bank (no training): on a /3
+  # profile (fit first: CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0) ``full`` is the
+  # new render with its own detail criterion and ``render_v2`` the old one
+  python phone_sim_effects.py --profile ck_phone_sim_v3/profile.json --source-root <BRSET> \\
+      --target-root <mBRSET> --sets render field --out ck_phone_sim_v3/effects_referees \\
       --ckpt canon_only=ck_rr_canon/seed0.pt phone=ck_phone_ceiling/seed0.pt mixed=ck_phone_mixed/seed0.pt
 
 Writes ``effects.csv``, ``effects_summary.txt`` and ``grid.jpg`` (dataset photos: keep the

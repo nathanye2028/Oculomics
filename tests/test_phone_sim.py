@@ -1455,8 +1455,7 @@ def test_match_detail_holds_a_reading_at_its_running_minimum():
 
 def test_the_realism_report_ranks_each_fold_on_the_other_folds_tabletop_photos(monkeypatch):
     """Read on the photos it then scores, the rank criterion matches their sharpness
-    in-sample (on sixteen sample photos it looked better than the criteria that take
-    nothing from the tabletop side, and no better once held out). Each fold's renders
+    in-sample, and the report's edge_sharpness row flatters it. Each fold's renders
     rank against a reading of the other fold's tabletop photos, from the fold's own half
     of the bank; the render returned for the grid keeps the profile's own."""
     size, S = 64, 96

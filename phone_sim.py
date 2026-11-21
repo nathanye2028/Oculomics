@@ -29,12 +29,14 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             1.00, hard edge). The phone's field is also narrower: its disc-fovea
             distance is ~1.10x the tabletop's in FOV radii (0.67 vs 0.61; ``fit``
             measures it; disc size reads 1.15x because phone discs bloom), and its
-            disc sits nearer the centre (0.45 vs 0.58 of the radius). So: un-squash
+            disc sits nearer the centre (0.45 vs 0.55 of the radius). So: un-squash
             (the FOV ellipse fitted per image from its side boundaries), zoom about
             the FOV centre to the handheld's own angular scale (1.18 on the box's
             fit). A Canon frame cuts its FOV circle top and bottom at 0.8 of the
             radius, so at that scale the aperture reaches past the cut: those caps
-            (~3 % of the circle) are filled with the mirror image of the retina
+            (3.4 % of the circle in the median render on the samples, at their
+            fitted scale of 1.10; less at 1.18, where the aperture reaches less
+            far past the cut) are filled with the mirror image of the retina
             beside the cut, up to ``fill`` FOV radii (0.18) and only inside the
             circle the FOV's sides were fitted with; past that the zoom rises until
             the aperture fits. (Until format /3 the zoom rose until the aperture
@@ -88,10 +90,11 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             than its rim. A luminance-wide highlight curve, tried first, whitened
             exudates and rim reflections into lesion-like specks; a region to 1.3
             radii made peripapillary lesions up to 2-4x more conspicuous.
-``detail``  The phone is NOT blurrier in the model's view (vessel edges 2.34 vs
-            2.29 px at 384); its extra high-frequency power is grain. So blur
-            only, at most 0.8 px, and only where a render's vessel edges are
-            sharper than the handheld photos'. :func:`edge_sharpness` (fine over
+``detail``  The phone is not sharper in the model's view: its extra
+            high-frequency power is grain, and on vessel edges it reads softer
+            than the tabletop photos and than the renders as they reach this
+            stage. So blur only, at most 0.8 px, and only where a render's vessel
+            edges are sharper than the handheld photos'. :func:`edge_sharpness` (fine over
             mid-band amplitude on the strongest mid-band structure away from the
             disc; contrast does not move it, and magnifying the field 1.18x
             lowers it about 3 %) reads 0.53 on the handheld photos, 0.59 on the
@@ -113,13 +116,16 @@ carries each difference (measured on the 16 + 16 photos in ``fundus_samples/``;
             unit background contrast (``band``), which is lower on the handheld
             because its contrast is higher: it blurred renders already softer than
             their drawn photo. The disc is left out of the reading: blown out, its
-            rim is the strongest edge of a photo, and the bloom above draws it
-            softer than the phone's own (0.09 below the vessels' reading, the
-            phone's 0.02), so with the disc in, renders read softer than phone
-            photos while their vessels were sharper. No unsharp mask: it rings
+            rim is the strongest edge of a photo, and the bloom above, confined to
+            1.1 disc radii, draws it shorter than the phone's glow (11 px from the
+            plateau to the retina along a ray against 22, with more mid-band
+            contrast per unit amplitude), which lowers a fine-over-mid reading:
+            about 0.08 below the vessels' reading on a bloomed render, the phone's
+            0.02. With the disc in, renders read softer than phone photos while
+            their vessels were sharper. No unsharp mask: it rings
             microaneurysms and turns grain into microaneurysm-like specks.
-``noise``   Grain to the drawn photo's flat-region level (0.86 / 255 at 384 on the
-            samples), nearly white at the model's scale and mostly luma; its
+``noise``   Grain to the drawn photo's flat-region level (:func:`noise_level`, median
+            0.75 / 255 at 384 on the handheld samples), nearly white at the model's scale and mostly luma; its
             spatial and cross-channel correlation are calibrated by simulation in
             ``fit``. Tapered off on clipped and black pixels, where the phone has
             none (grain on a blown-out disc would read as fine new vessels).
@@ -142,8 +148,9 @@ geometric, a smooth low-order or large-scale field, a pixel-wise colour map that
 leaves the green channel's ratios alone, the disc region, a capped blur or grain.
 The zoom can still crop a peripheral lesion out of the field: at the box's fitted
 scale of 1.18 renders keep ~79 % of the Canon FOV's area (r < 0.85 FOV radii; ~65 %
-until /3, when the zoom had to clear the truncated frame), and show ~3 % of it twice
-(the mirrored caps: a lesion within ~0.05 FOV radii of a Canon frame's cut appears
+until /3, when the zoom had to clear the truncated frame), and show a few per cent of it twice
+(the mirrored caps: 3.4 % of the circle in the median render on the samples at their 1.10,
+less at 1.18; a lesion within ~0.05 FOV radii of a Canon frame's cut appears
 with its mirror image beside it; the label does not change). Blur can soften
 microaneurysms the phone also softens, and where red saturates (~4 % of the retina,
 ~0.6 % on real phones) a lesion keeps only its green and blue contrast.
@@ -192,9 +199,10 @@ FIELDS = ("phone", "whole")
 PREFILTERS = ("gauss", "matched")
 N_SECTORS = 16
 # The detail ladder: (a, r) with a > 0 = Gaussian blur of sigma a px, a = 0 = unchanged.
-# Blur only, capped at 0.8 px at 384: in the model's view the handheld is not blurrier
-# (vessel edges 2.34 vs 2.29 px) and its extra high-frequency power is grain, so no
-# unsharp mask (it rings microaneurysms and turns grain into microaneurysm-like specks).
+# Blur only, capped at 0.8 px at 384: in the model's view the handheld is not sharper -- its
+# extra high-frequency power is grain, and its vessel edges read softer than the tabletop's
+# (edge sharpness 0.53 vs 0.59) -- so no unsharp mask (it rings microaneurysms and turns grain
+# into microaneurysm-like specks).
 # no edge-sharpness reading where the noise taken out is more than this share of the fine band at the
 # edges (a soft or grainy photo: the corrected value is then mostly its own correction, floors at 0 or
 # scatters): the bank, the detail stage and the realism table alike
@@ -210,17 +218,18 @@ DEFAULT_PARAMS: Dict[str, object] = {
     # the render options of format /3 (RENDER_V3; a /2 profile has LEGACY_PARAMS instead):
     # fill       the field stage renders at the handheld's own angular scale: the aperture may
     #            reach up to this many FOV radii past a truncated tabletop frame's flat top and
-    #            bottom, the caps filled with the mirror image of the retina beside them (~3 %
-    #            of the circle at the fitted scale). 0 = zoom until the aperture clears the
+    #            bottom, the caps filled with the mirror image of the retina beside them (3.4 %
+    #            of the circle in the median render on the samples, fitted at 1.10; less at the
+    #            box's 1.18). 0 = zoom until the aperture clears the
     #            frame instead: 1.32 on Canon frames where the handheld's scale is 1.18, so
     #            every simulated retina 12 % too large and a fifth less of it in view
     # prefilter  matched: the warp blurs each axis only as far as the loader's own antialiased
     #            resize would at that step. gauss: one isotropic 0.5 sqrt(step^2 - 1) px blur
     #            from the larger step: 0.6x of a reference render's fine detail. (The finished
-    #            render's Laplacian variance barely shows it, about 0.00019 with the old filter
-    #            and 0.00020 with this one on the samples: most of that number is the grain,
-    #            added later. The 0.0004 once read on tabletop photos was their frame's border,
-    #            :func:`laplacian_var`)
+    #            render's Laplacian variance barely shows it, 0.00019 with the old render's
+    #            options and 0.00022 with the new in fit's report on the samples: most of that
+    #            number is the grain, added later. The 0.0004 once read on tabletop photos was
+    #            their frame's border, :func:`laplacian_var`)
     # detail_by  what the detail stage's blur is matched on (:data:`DETAIL_BY`). rank: edge
     #            sharpness (:func:`edge_sharpness`; needs a /3 bank, which measures it), by
     #            rank -- a render as sharp as the q-th quantile of the renders ``fit`` measured
@@ -404,8 +413,7 @@ def warp(x: torch.Tensor, zoom: torch.Tensor, a_f: torch.Tensor, b_f: torch.Tens
     render 3x oversampled and then reduced with that same antialiased resize, on the
     samples' Canon frames from 576-1152 px views at zooms 1.0-1.31, it keeps 0.98x of
     the Laplacian energy (0.91-1.06) where ``gauss`` keeps 0.58-0.67x: as soft as the
-    loader makes a photo, no softer. (Against a 3x3 box average of the oversampled
-    render, a sharper reference than the loader's, 0.62-0.74x and 0.41-0.47x.)"""
+    loader makes a photo, no softer."""
     B = x.shape[0]
     if prefilter == "matched":
         fx = (x.shape[-1] / out_hw[1]) * a_f.float() / zoom.float()                       # source px / output px
@@ -1009,9 +1017,10 @@ def edge_select(g: torch.Tensor, m: torch.Tensor, top: float = 0.05,
     0.7 of the frame circle and the FOV eroded by 1/16 of the frame: where
     :func:`edge_sharpness` is read. ``skip`` (:func:`disc_zone`) leaves a circle out:
     the disc, whose rim is the strongest edge of a photo and, blown out, not a reading
-    of the camera's sharpness -- a phone photo's bloomed rim reads 0.02 softer than its
-    vessels, the simulator's 0.09 softer, so with the disc in a render looked softer
-    than a phone photo when its vessels were sharper."""
+    of the camera's sharpness -- with a phone photo's blown-out disc in, the reading is
+    0.02 below its vessels', with a bloomed render's about 0.08 below (the bloom's rim is
+    shorter than the phone's glow), so with the disc in a render looked softer than a
+    phone photo when its vessels were sharper."""
     B, _, H, W = g.shape
     xx, yy = frame_coords(B, H, W, g.device)
     mm = erode(m, max(3, H // 16)) & ((xx ** 2 + yy ** 2) < 0.49).unsqueeze(1)
@@ -1033,8 +1042,8 @@ def edge_sharpness(g: torch.Tensor, sel: torch.Tensor, noise: Optional[torch.Ten
     handheld photos read 0.53 and the tabletop's 0.59 (0.51 and 0.57 with the disc in);
     a Gaussian blur of 0.45 / 0.6 / 0.8 px takes a tabletop photo's 0.59 to 0.53 / 0.48 /
     0.43; magnifying the field lowers it by about 3 % at 1.18x and 7 % at 1.31x (nothing
-    measurable at 1.10x; photo to photo the change runs from -8 % to +8 %, since other
-    edges enter the selection), so the two cameras are read at one scale. NaN where
+    measurable at 1.10x; photo to photo the change at 1.18x runs from -8 % to +8 %, p10
+    to p90, since other edges enter the selection), so the two cameras are read at one scale. NaN where
     nothing is selected and, with ``max_noise`` (:data:`NOISE_SHARE` for the bank, the
     detail stage and the realism table), where the noise taken out is more than that
     share of the fine band's energy at the edges: a reading that is mostly its own
@@ -1879,7 +1888,8 @@ def laplacian_var(x01: torch.Tensor) -> torch.Tensor:
     """[B] variance of the grey-level 4-neighbour Laplacian over the FOV eroded by 2 px,
     the frame edge counted as outside the FOV (:func:`erode`).
 
-    ``style_transfer.sharpness``, which the realism table and ``check`` read before,
+    ``style_transfer.sharpness``, which ``check``'s ``sharp`` column read before (and
+    this row of the realism table as it was first added),
     erodes with a pooling that lets the FOV run up to the frame's edge, and its Laplacian
     is a zero-padded convolution: a FOV pixel on the frame's first or last row or column
     reads about minus its own level there, hundreds of times an interior pixel's square.

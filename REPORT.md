@@ -50,10 +50,9 @@ noise floor on mBRSET AUROC was **0.0119**, and an attention-style block
 
 ## 2. Codebase audit (20 August)
 
-Every Python file in the repo was read line by line (three parallel reviewers
-over the segmentation core, the dataset loaders, and the tooling; the
-classification track reviewed directly). Findings were verified against the
-code before being fixed. Twenty-seven files changed; the full test suite (42
+Every Python file in the repo was read line by line (the segmentation core,
+the dataset loaders, the tooling and the classification track). Findings were
+verified against the code before being fixed. Twenty-seven files changed; the full test suite (42
 tests) passes.
 
 ### Bugs that were corrupting results
@@ -1109,8 +1108,9 @@ is the reading the changes are judged on.
 
 **What changed** (`phone_sim.py`, profile format `phone_sim/3`; CHANGELOG 2026-11-17). (1) `fill`:
 the field stage renders at the handheld's own scale; the caps the aperture then reaches past a
-truncated frame's cut are the mirror image of the retina beside the cut (about 3 % of the circle at
-the box's scale; up to 0.18 FOV radii, then the zoom rises), the mirror line set past the rows
+truncated frame's cut are the mirror image of the retina beside the cut (3.4 % of the circle in the
+median render on the samples, at their fitted scale of 1.10; less at the box's 1.18, where the
+aperture reaches less far past the cut; up to 0.18 FOV radii, then the zoom rises), the mirror line set past the rows
 over which a frame darkens toward its cut and following the frame's edge column by column. (2)
 `prefilter: matched`: the warp
 blurs each axis as far as the loader's antialiased resize would at that axis's step. (3)
@@ -1118,99 +1118,127 @@ blurs each axis as far as the loader's antialiased resize would at that axis's s
 strongest structure away from the disc; a new bank reading) by rank: a render at the q-th
 quantile of the renders `fit` read is blurred down to the handheld photos' q-th quantile, and one
 already softer is left alone. A `phone_sim/2` profile keeps the old render (pixel for pixel
-against the committed code on the samples; a test holds it to 1e-4 against renders stored from the
-last commit before the change, every stage in play), so the arm trained with it can still be
-re-read.
+against the committed code on the samples: render, geometry and training views all differ by 0.0;
+a test holds it to renders stored from the last commit before the change, every stage in play),
+so the arm trained with it can still be re-read.
 
 **On the samples** (16 BRSET photos rendered against 16 mBRSET photos; a smoke test of
-direction, not a result):
+direction, not a result). `fit`'s report at seed 0; every simulated AUROC is within a fold, a
+fold's renders against the real photos behind the other half of the bank:
 
 | | old render | new render | real handheld |
 |---|---|---|---|
 | zoom, median | 1.31 | 1.13 | fitted scale 1.10 |
-| edge sharpness, vessels (disc left out) | 0.46 | 0.53 | 0.53 (tabletop 0.59) |
-| edge sharpness, disc included | 0.40 | 0.44 | 0.51 (tabletop 0.57) |
-| Laplacian variance, frame edge counted as outside | 0.00019 | 0.00022 | 0.00029 (tabletop 0.00015) |
+| edge sharpness, vessels (disc left out); AUROC gap | 0.46; 0.41 | 0.53; 0.05 | 0.53 (tabletop 0.59) |
+| edge sharpness, disc included; AUROC gap | 0.40; 0.59 | 0.44; 0.47 | 0.51 (tabletop 0.57) |
+| Laplacian variance, frame edge counted as outside; AUROC gap | 0.00019; 0.56 | 0.00022; 0.47 | 0.00029 (tabletop 0.00015) |
+| realism gap, mean over 26 statistics | 0.220 | 0.202 | 0 (tabletop 0.570) |
 | resampling vs a 3x-oversampled render reduced by the loader's resize (Laplacian energy) | 0.58-0.67x | 0.91-1.06x | |
-| realism gap, mean over 26 statistics (cross-fitted, seed 0) | 0.237 | 0.213 | 0 |
 | frozen ResNet-18: MMD^2 to the phone | 0.060 | 0.056 | floor 0.027 |
 | frozen ResNet-18: p(phone) | 0.58 | 0.57 | 0.84 |
 
-Closer on scale and on vessel-edge sharpness (AUROC gap against the handheld photos 0.43 -> 0.07
-over five render seeds; 0.02 at the report's seed 0), slightly closer in a frozen
-network's embedding, no more phone-like to that network's camera classifier. The ResNet rows
-were read again on the final render (its detail ranks read on all sixteen tabletop photos,
-in-sample on that side). Without the detail stage that network reads p(phone) 0.55 and MMD^2 0.056: the stage
-costs it nothing.
+Closer on scale and on vessel-edge sharpness, slightly closer in a frozen network's embedding, no
+more phone-like to that network's camera classifier (for those two rows the renders' detail ranks
+were read on all sixteen tabletop photos, in-sample on that side). Without the detail stage that
+network reads p(phone) 0.55 and MMD^2 0.056: the stage costs it nothing. The report's halving (the
+fixed even/odd split, the same at every seed) is kind to the new render's vessel edges: on it the
+gap is 0.04 averaged over three render seeds. Over the three other halvings of the same photos it is
+0.19, and over all four 0.15 (next table), not 0.05.
 
-**Sharpness.** The first build of this change matched the detail stage to the
-drawn photo's edge sharpness read over the whole photo, and its renders read softer than the phone
-(0.47 against 0.51), which looked like a need for sharpening. Two things were wrong with that.
+**Sharpness.** The first build of this change matched the detail stage to the drawn photo's edge
+sharpness read over the whole photo, and its renders read softer than the phone on that reading,
+which looked like a need for sharpening. Three things were wrong with that.
 
-*Where the reading is taken.* Stage by stage, the whole-photo reading stays at 0.55 through the
-field, light and colour stages and falls to 0.49 at the bloom: once the disc is blown out its rim
-is the strongest edge in the photo, and the simulator's bloom draws that rim softer than the
-phone's own (0.09 below the vessels' reading on bloomed renders, 0.02 on phone photos; renders
-without a bloom read the same either way). Away from the disc the renders are sharper than the
-phone photos (0.56 against 0.53; `fit`'s DETAIL line). So the reading now leaves the disc out, for the bank
-and for the render alike, and the report keeps the whole-photo reading as a second statistic.
+*Where the reading is taken.* With the disc in, the reading is mostly the bloom's: switched off on
+the same draws, the whole-photo reading of fully bloomed renders is 0.49 instead of 0.44 (handheld
+0.51), and nothing away from the disc moves. Once the disc is blown out its rim is the strongest
+edge in the photo, and on a bloomed render the reading there sits about 0.08 below the vessels'
+(0.02 on phone photos; renders without a bloom read the same either way) -- not because the bloom
+draws the rim softer than the phone's, but because it draws it shorter (*The disc's rim*, below).
+Away from the disc the renders reach the detail stage sharper than the phone photos (0.56 against
+0.53; `fit`'s DETAIL line). So the reading now leaves the disc out, for the bank and for the render
+alike, and the report keeps the whole-photo reading as a second statistic.
 
 *How it is matched.* Blurring each render down to one randomly drawn photo's reading leaves it at
 the softer of two independent readings: softer as a set than the handheld photos, on the very
 statistic matched. By rank it is blurred to the handheld photo of its own rank instead. The ranks
-come from tabletop photos, so the comparison has to hold those out as well: a render ranked on a
-reading that includes itself has its sharpness matched in-sample. (The first version of this table
-did that; `fit`'s report now ranks each half of its tabletop photos on the other half.)
-Vessel-edge sharpness of the renders against the handheld photos, cross-fitted on both sides,
-five render seeds:
+come from tabletop photos, so the comparison holds those out too (`fit`'s report ranks each half of
+its tabletop photos on the other half). Every number below is within a fold -- the 8 renders drawn
+from one half of the bank against the 8 handheld photos behind the other half, the two folds
+averaged -- and since one halving of sixteen photos is largely luck, each row averages four
+halvings (the report's and three random ones) of three render seeds each. The last row is the
+handheld photos against themselves, 8 against 8 over 2,000 halvings: what sampling alone gives at
+this size.
 
-| detail criterion | AUROC gap | Wasserstein distance (handheld IQRs) | above the handheld's 90th percentile | below its 10th |
-|---|---|---|---|---|
-| `rank`, ranked on the other 8 tabletop photos (the report's way) | 0.07 | 0.18 | 7 % | 11 % |
-| `rank`, ranked on the other 14 | 0.11 | 0.23 | 6 % | 17 % |
-| `rank`, ranked on all 16, itself included (in-sample) | 0.11 | 0.22 | 6 % | 16 % |
-| `edge` (one drawn photo) | 0.20 | 0.36 | 6 % | 23 % |
-| `band` (the /2 criterion) | 0.19 | 0.98 | 17 % | 40 % |
-| no detail stage | 0.24 | 0.78 | 25 % | 11 % |
+| detail criterion | AUROC gap | Wasserstein distance (handheld IQRs) | above the handheld's 90th percentile | below its 10th | mean gap over 26 statistics |
+|---|---|---|---|---|---|
+| `rank`, ranked on the other half of the tabletop photos (the report's way) | 0.15 | 0.47 | 13 % | 19 % | 0.206 |
+| `rank`, ranked on its own half (in-sample) | 0.15 | 0.45 | 15 % | 24 % | 0.206 |
+| `edge` (one drawn photo) | 0.27 | 0.58 | 12 % | 29 % | 0.217 |
+| `band` (the /2 criterion) | 0.22 | 1.08 | 23 % | 43 % | 0.208 |
+| no detail stage | 0.20 | 0.81 | 35 % | 14 % | 0.190 |
+| handheld photos against themselves, 8 against 8 | | 0.43 | | | |
 
-Seed to seed the AUROC gap moves by 0.03-0.07 (0.10 for `band`) and the distance by 0.05-0.10
-(0.17 for `band`), on the same sixteen photos each time, so that is render noise and not the
-sampling error of a larger set. What these photos support: held out or not, ranking leaves the
-renders' vessel edges nearer the handheld photos' than no stage or the /2 criterion does
-(0.18-0.23 handheld IQRs against 0.78 and 0.98); against `edge` (0.36) the difference is one to
-two seeds' spread.
+From run to run the AUROC gap moves by about 0.10 (by halving 0.04-0.26 for the report's ranking)
+and the distance by 0.07-0.19; the mean gap over the 26 statistics by about 0.02. A single
+8-against-8 halving of the handheld photos against themselves already reads an AUROC gap of 0.24
+and a mean gap of 0.24 on average (two folds averaged, as in the rows, would read less), so on
+AUROC gap the criteria cannot be told apart here. What these photos do support: by rank the
+renders' vessel-edge sharpness is as close to the handheld photos' as two halves of the handheld
+photos are to each other (0.47 handheld IQRs against 0.43); the drawn photo's reading, no detail
+stage and the /2 criterion are 1.3x, 1.9x and 2.5x that floor, the last two mostly through a tail
+(a third of the renders above the handheld's 90th percentile with no stage, four in ten below its
+10th with the /2 criterion). Ranked on the other half or on its own, the rank criterion comes out
+the same. (Earlier versions of this table pooled the two folds before comparing, so half of the
+pairs set renders against the photos behind their own half of the bank, and they read 0.07 for
+rank. `fit`'s report pooled them the same way, until the last pass.)
 
 *How the render is read.* A third, smaller thing was wrong until the last pass. The bank's
 reading of a handheld photo, and the report's reading of a finished render, take the flat
 regions' fine-band noise out of the fine band; the detail stage read its render with the noise
 left in. A tabletop photo's own noise put that reading about 3 % high, so the blur came a touch
-early and the renders ended 0.01 softer than the photos they were matched to. The stage now
-takes the noise out at every rung of its blur ladder, as the other two readings do: the median
-render leaves the stage at 0.528 where the handheld photos read 0.527, the held-out AUROC gap in
-the table above was 0.14 before and is 0.07, and the mean gap over the 26 statistics went from
-0.208 to 0.203 (lower or equal on each of five seeds). It only ever asks for less blur.
+early and the renders ended softer than the photos they were matched to. The stage now takes the
+noise out at every rung of its blur ladder, as the other two readings do: the finished renders'
+median goes from 0.510 to 0.519 where the handheld photos read 0.527, and in `fit`'s report over
+five seeds the vessel-edge AUROC gap goes from 0.09 to 0.03 and the mean gap over the 26
+statistics from 0.201 to 0.196 (lower on each seed). Against a fixed target (`detail_by: edge`) it
+can only ask for less blur, the reading being lower at every rung; by rank the readings it ranks
+against are re-read the same way, so a render noisier than most can drop in rank and get a lower
+target, and the samples show less blur as a set: 92 % of the renders blurred where 94 % were, and
+the finished median higher on each of five seeds. Two guards
+came with it. A reading in which the noise taken out is more than half of the edges' fine band is
+no reading, for the bank, the stage and the report alike: such a reading is the small difference
+of two large numbers, it floored at 0 in the bank (the softest handheld photo there, so every
+render ranked lowest was blurred to the end of the ladder), and in the stage it could rise with
+blur, which then spent the whole 0.8 px on an ask of 1 %. On the samples that share is 0.05 for
+handheld and tabletop photos (at most 0.19) and 0.12 for finished renders (at most 0.44), so the
+guard changes nothing on them; the synthetic test photos at 384 px reach 0.87. And an image whose
+reading some rung of the ladder raises by more than 1 % is left alone; one whose target no rung
+reaches stops at the rung that reads lowest.
 
 The ranks belong to the chain they were read on. `fit` reads two: the chain it fits, and the
 whole-field one (`--phone-sim-field whole`), whose renders reach the detail stage sharper because
 nothing is magnified (0.59 against 0.56) and which, ranked on the phone field's reading, would
 leave the set sharper than the handheld photos (17 % above their 90th percentile; 12 % on a
-reading of its own). A simulator on any other chain -- a stage dropped,
-another prefilter, a lower strength -- still ranks against the fitted chain's reading: with the
-old prefilter that blurs 85 % of the renders where a reading of its own blurs 35 %, and leaves a
-quarter of them below the handheld's 10th percentile instead of a sixth. `phone_sim_effects.py`
-therefore re-reads the ranks for each of its variants (`--cal-n` tabletop training photos), so a
-row of its table changes one thing and not also the amount of blur.
+reading of its own). A simulator on any other chain -- a stage dropped, another prefilter, a lower
+strength -- still ranks against the fitted chain's reading: with the old prefilter that blurs 85 %
+of the renders where a reading of its own blurs 35 %, and leaves a quarter of them below the
+handheld's 10th percentile instead of a sixth. `phone_sim_effects.py` therefore re-reads the ranks
+for each of its variants (`--cal-n` tabletop training photos) and adds `full_cal`, the fitted
+chain ranked on those same photos, so a re-read row read against `full_cal` changes one thing and
+not also the amount of blur.
 
-*What stays open.* Two readings stayed below the phone's, and any blur lowers them further: the
+*What stays open.* Two readings stay below the phone's, and any blur lowers them further: the
 whole-photo edge reading (disc included) and Laplacian variance. Each was taken apart on the
-samples, by intervention on a scratch copy of the simulator, and re-derived by a second reader
-with separate code on render seeds the first had not used. Neither ends in a change to the bloom
-or the grain; the second corrected the statistic itself and the detail stage's reading (above).
+samples, by intervention on a scratch copy of the simulator, and then re-derived independently,
+with separate code and on render seeds the first pass had not used. Neither ends in a change to
+the bloom or the grain; the second corrected the statistic itself and the detail stage's reading
+(above).
 
 *The disc's rim.* The bloom is the cause: switched off on the same draws, the whole-photo reading
 of the bloomed renders rises from 0.44 to 0.49 (handheld 0.51) and nothing away from the disc
-moves. But the rim it draws is not softer than the phone's, as this section first read it. It is
-shorter. Along a ray, a blown-out handheld disc falls from its plateau to the retina over 22 px,
+moves. But the rim it draws is not softer than the phone's, as the first reading of the statistic
+had it. It is shorter. Along a ray, a blown-out handheld disc falls from its plateau to the retina over 22 px,
 as a tabletop disc does before any bloom; a bloomed render's falls over 11 px, with the same
 fine-band contrast and a quarter to a half more mid- and coarse-band contrast per unit of
 amplitude. The statistic is fine over mid-band amplitude, so the excess lowers it. Behind that
@@ -1238,66 +1266,68 @@ to see, it does not remove or invent one. A taper ending at 1.0 instead of 1.1 r
 rim and a smaller disc. Left alone; worth a decision once the box has said whether the simulator
 arm is kept.
 
-*Laplacian variance.* Part of this gap was the statistic. `check` and the realism table read
-`style_transfer.sharpness`: the variance of a zero-padded Laplacian over a FOV mask that runs up
-to the frame's edge. A FOV pixel on the frame's first or last row or column reads about minus its
-own level there, hundreds of times an interior pixel's square. Those pixels carried 70 % of a
-tabletop photo's reading (a Canon frame cuts the FOV along its whole top and bottom rows), 13 % of
-a handheld photo's and 4 % of a render's; a black margin added around a tabletop frame, which
-changes nothing in the photo, took the reading to 0.29x. Both now read `phone_sim.laplacian_var`,
-the frame edge counted as outside the FOV:
+*Laplacian variance.* Part of this gap was the statistic. `check` read `style_transfer.sharpness`
+(and so did the realism table's new row as this change first built it): the variance of a
+zero-padded Laplacian over a FOV mask that runs up to the frame's edge. A FOV pixel on the frame's
+first or last row or column reads about minus its own level there, hundreds of times an interior
+pixel's square. Those pixels carried 70 % of a tabletop photo's reading (a Canon frame cuts the FOV
+along its whole top and bottom rows), 13 % of a handheld photo's and 4 % of a render's; a black
+margin added around a tabletop frame, which changes nothing in the photo, took the reading to
+0.29x. Both now read `phone_sim.laplacian_var`, the frame edge counted as outside the FOV:
 
 | Laplacian variance, x 1e-4, median | tabletop | handheld | new render (5 seeds) |
 |---|---|---|---|
 | frame border in (as read until now) | 4.26 | 3.65 | 2.13 |
 | frame edge counted as outside | 1.46 | 2.86 | 2.03 |
 
-So the box's "0.0004 on tabletop and handheld alike" was the frame on the tabletop side, a render
-reads above the tabletop photos and not below both cameras, and the renders' cross-fitted gap to
-the handheld photos on this statistic falls from 0.54 to 0.37 over five seeds on the same
-renders (0.34 with the detail stage's reading corrected as above; 0.41 at the report's seed 0),
-while the tabletop's rises from 0.31 to 0.67, no longer high for the wrong reason. Values of this one row in earlier `fit` and `check` reports are not comparable with new
-ones. (`fda_sharp` still matches its blur on `sharpness`, border in; that baseline is left as it
-was run.)
+So the box's "0.0004 on tabletop and handheld alike" was the frame on the tabletop side, and a
+render reads above the tabletop photos, not below both cameras. Within folds the renders' gap to
+the handheld photos on this statistic is 0.53 with the border in and 0.40 without (four halvings,
+three seeds; 0.47 at the report's seed 0), while the tabletop's rises from 0.31 to 0.67, no longer
+high for the wrong reason. Values of `check`'s `sharp` column in earlier reports are not comparable
+with new ones (`fit`'s table had no Laplacian row before this change). (`fda_sharp` still matches
+its blur on `sharpness`, border in; that baseline is left as it was run.)
 
-What is left is at the edge of what sixteen photos show (a gap of 0.36 arises by chance about one
-time in twelve) and it is not missing sharpness. At vessel walls the renders' fine-over-mid ratio
-equals the handheld photos' (0.43 and 0.42), and the grain reaches the bank's level (1.04x) with
-the handheld's autocorrelation; forcing the number with more or whiter grain breaks one of those
-two. What differs is amplitude: a render's vessel-wall amplitude is 0.65-0.71x that of the
-handheld photo whose statistics it drew, lower in 95 % of pairs and at every band alike -- red
-matched, green 0.58x, blue about 0.5x -- part level (at the vessel walls green sits at 0.80-0.86
-of the drawn photo's and blue at 0.66-0.78, though the centre-zone means the colour stage matches
-agree) and part relative contrast (about 0.7x in green and blue), strongest at the centre of the
-field and at the strongest edges, so not one global contrast factor. The detail stage's blur
-accounts for 0.2-0.35 of the 0.9 (x 1e-4) between the medians. Scaling the structure's contrast by 1.2-1.4x closes the gap,
-and makes every lesion that much more conspicuous than on the tabletop photo, so it cannot ship;
-a smooth per-channel level change would be label-safe and was not tried, because whether the
-handheld's higher vessel contrast belongs to the camera (tone curve, sharpening) or to an
-all-diabetic population cannot be told on these photos. On the box: per-channel vessel-wall
-contrast and level over the full mBRSET and BRSET training splits, by DR grade.
+What is left is at the edge of what sixteen photos show, and it is not missing sharpness. At vessel
+walls the renders' fine-over-mid ratio equals the handheld photos' (0.43 and 0.42), and the grain
+reaches the bank's level (1.04x) with the handheld's autocorrelation; forcing the number with more
+or whiter grain breaks one of those two. What differs is amplitude: a render's vessel-wall
+amplitude in luminance is 0.65-0.71x that of the handheld photo whose statistics it drew, lower in
+95 % of pairs and at every band alike -- red matched, green 0.58x, blue about 0.5x -- part level
+(at the vessel walls green sits at 0.80-0.86 of the drawn photo's and blue at 0.66-0.78, though the
+centre-zone means the colour stage matches agree) and part relative contrast (about 0.7x in green
+and blue), strongest at the centre of the field and at the strongest edges, so not one global
+contrast factor. The detail stage's blur accounts for 0.2-0.35 of the 0.8-0.9 (x 1e-4) between the
+medians. Scaling the structure's contrast by 1.2-1.4x closes the gap, and makes every lesion that
+much more conspicuous than on the tabletop photo, so it cannot ship; a smooth per-channel level
+change would be label-safe and was not tried, because whether the handheld's higher vessel
+contrast belongs to the camera (tone curve, sharpening) or to an all-diabetic population cannot be
+told on these photos. On the box: per-channel vessel-wall contrast and level over the full mBRSET
+and BRSET training splits, by DR grade.
 
 Two smaller findings from the same work, both left alone. The aperture is applied twice in a
-render (at the field stage and at the end), so the FOV's edge rolls off as the fitted profile
-squared: over the three pixels where the circle ends (191 to 194 px from the centre at 384 px)
-luminance is 0.51 / 0.10 / 0.01 of the interior's, against the handheld's 0.68 / 0.20 / 0.02. Applied once in effect the edge profile
-matches and the FOV area overshoots, because the fitted radius has absorbed the squaring; putting
-it right means fitting radius and width together, on more than sixteen photos. And the handheld
-photos are brighter where the circle meets the bottom of the frame (0.31 against 0.14), which
-belongs to the light and rim stages (tilt, blotch) and not to fine detail.
+render (at the field stage and at the end), so the FOV's edge rolls off as the aperture's profile
+squared (radius 1 frame half-width and `rim_width` 0.0023, both fixed: `fit` measures neither):
+over the three pixels where the circle ends (191 to 194 px from the centre at 384 px) luminance is
+0.51 / 0.10 / 0.01 of the interior's, against the handheld's 0.68 / 0.20 / 0.02. Applied once in
+effect the edge profile matches and the FOV area overshoots, because the fixed radius gives the
+handheld's area only with the squaring; putting it right means measuring the handheld's edge radius
+and width in `fit`, on more than sixteen photos. And the handheld photos are brighter where the
+circle meets the bottom of the frame (0.31 against 0.14), which belongs to the light and rim stages
+(tilt, blotch) and not to fine detail.
 
-Over all 26 statistics the mean gap is lowest with no detail stage at all (0.192 against
-0.200-0.205 by rank; seed spread 0.02, but lower on each of five seeds in two separate runs of
-the comparison): the stage buys
-vessel-edge sharpness and pays for it on the whole-photo reading, on Laplacian variance and on
-the mid-band `detail` statistic. Neither open reading is a case for sharpening the whole image,
-which rings microaneurysms. Whether the detail stage earns its place is a question for the box:
-the `drop_detail` row of the effects table.
+Over all 26 statistics the mean gap is lowest with no detail stage at all (0.190 against 0.206 by
+rank, within folds; lower on each of the four halvings): the stage buys a closer match on
+vessel-edge sharpness (0.47 handheld IQRs against 0.81 with no stage) and pays for it on the
+whole-photo reading (AUROC gap 0.44 against 0.14 with no stage), on Laplacian
+variance (0.40 against 0.24) and on the mid-band `detail` statistic. Neither open reading is a case
+for sharpening the whole image, which rings microaneurysms. Whether the detail stage earns its
+place is a question for the box: the `drop_detail` row of the effects table.
 
 One change was tried and dropped: tightening the shadow allowance from +0.05 to +0.01 matches the
 median render's shadowed share to the handheld's (2 % -> 0.4 %) but scales the tilt and the
 blotches back with it, and the three statistics together moved away from the phone (summed
-realism gap 0.88 -> 1.12).
+realism gap 0.88 -> 1.12, on the build it was tried on).
 
 **The referees.** Phone-only training does worse on the handheld test than Canon + phone
 (oracle specificity at 0.85 sensitivity 0.868 against 0.889, AUROC 0.923 against 0.935, five
@@ -1313,10 +1343,12 @@ use models that know what a real handheld photo looks like, labels included.
    rows beyond its own tabletop-to-handheld difference is evidence the simulator destroyed. The
    mixed model's camera probe says how handheld the renders look to a trunk trained on both
    cameras' labels (the phone-only model's trunk never saw a tabletop photo: a weaker reading).
-   `--sets render` puts the old and the new render side by side on the existing bank, same
-   draws; the summary names the parameters behind each of those rows. A phone-only checkpoint is
-   scored on the tabletop photos of the arms beside it (the log says which; arms that read
-   different cameras are refused until `--source-camera` names one).
+   `--sets render` puts the old and the new render side by side on one bank, same draws; the
+   summary names the parameters behind each of those rows. A phone-only checkpoint is scored on
+   the tabletop photos of the arms beside it (the log says which; arms that read different
+   cameras are refused until `--source-camera` names one, and `--source-camera` is refused beside
+   an arm trained on every camera, whose split it would redraw). For an arm trained with a
+   simulator the summary says whether `--profile` is the file it was trained with.
 2. *Training* (`train_phone_ceiling.py --mix-phone-sim`, model `mixed_sim`; `MODES=mixed_sim` in
    `run_phone_ceiling.sh`): the mixed run with every tabletop photo re-rendered as a handheld one.
    On the same phone test rows as that seed's `mixed` and `phone` runs: at or above `mixed`, the
@@ -1325,27 +1357,48 @@ use models that know what a real handheld photo looks like, labels included.
    `phone` or below, it teaches nothing the handheld photos lacked. This model uses handheld
    labels, so like `phone` and `mixed` it is a reference line, never a candidate to ship.
 
-**Next run (lab box).** The referee table first: no training, no refit, minutes per seed.
+**Next run (lab box).** The /3 fit first (no training; nothing trained so far changes), then the
+referee table on it (no training, minutes per seed).
 
 ```bash
 cd ~/Oculomics && git pull
+export B=<BRSET root> M=<mBRSET root>
+CK=ck_phone_sim_v3 STAGES=fit bash run_phone_sim.sh 0
+# paste ck_phone_sim_v3/fit_report.txt
 CKS=(); for s in 0 1 2 3 4; do CKS+=(canon_only=ck_rr_canon/seed$s.pt phone=ck_phone_ceiling/seed$s.pt mixed=ck_phone_mixed/seed$s.pt); done
-.venv/bin/python phone_sim_effects.py --profile ck_phone_sim/profile.json --source-root $B --target-root $M \
-    --sets render field --ckpt "${CKS[@]}" --num-workers 5 --out ck_phone_sim/effects_referees
-# paste ck_phone_sim/effects_referees/effects_summary.txt
+.venv/bin/python phone_sim_effects.py --profile ck_phone_sim_v3/profile.json --source-root $B --target-root $M \
+    --sets render field drop --ckpt "${CKS[@]}" --num-workers 5 --out ck_phone_sim_v3/effects_referees
+# paste ck_phone_sim_v3/effects_referees/effects_summary.txt
 ```
 
-Read, in REFEREES' VERDICT and the per-arm tables: (a) `full` (the old render) against `tabletop`
-on the phone-only model -- above, the simulator already helps a handheld model read tabletop
-photos; below, it removes more than the camera difference costs; (b) `render_v3`, `fill_0.18`,
-`prefilter_matched` against `full` on every arm -- the new render is the better simulator if the
-referees' AUROC rises and the Canon-only model's rows move toward its `REAL handheld` row (AUROC
-0.920, sensitivity 0.76 on seed 0) rather than past it. If (b) holds, refit and train the /3 arm
-(`CK=ck_phone_sim_v3 ARM_OUT=exp_rr_phonesim_v3 ARM_CK=ck_rr_phonesim_v3 PART=val bash
-run_phone_sim.sh 0`, then the other seeds), and `MODES=mixed_sim PROFILE=ck_phone_sim_v3/profile.json
-bash run_phone_ceiling.sh 0` for the training test. If the referees do no better on the new
-render, the remaining gap is not scale or sharpness, and the per-stage rows on the referees
-(`--sets drop only`) say which stage a handheld-trained model objects to. The existing bank has
-no edge reading, so this first table compares the field and the resampling only; the detail
-criterion (`detail_by_band`, `detail_by_edge`, `drop_detail`) is read on the /3 profile after the
-refit.
+On the /3 profile `full` is the new render with its own detail criterion and `render_v2` the old
+render on the same bank and draws. Read, in REFEREES' VERDICT and the per-arm tables: (a)
+`render_v2` against `tabletop` on the phone-only model -- above, the old simulator already helps a
+handheld model read tabletop photos; below, it removes more than the camera difference costs; (b)
+`full` against `render_v2` on every arm -- the new render is the better simulator if the referees'
+AUROC rises and the Canon-only model's rows move toward its `REAL handheld` row (AUROC 0.920,
+sensitivity 0.76 on seed 0) rather than past it. `fill_0` and `prefilter_gauss` take back one option
+each, ranked on a reading of their own chain (read them against `full_cal`); `detail_by_band` and
+`detail_by_edge` are the other criteria; `drop_detail` says whether the detail stage earns its place.
+If (b) holds, train the /3 arm (`CK=ck_phone_sim_v3 ARM_OUT=exp_rr_phonesim_v3
+ARM_CK=ck_rr_phonesim_v3 PART=val bash run_phone_sim.sh 0`, which reuses the fit, then the other
+seeds), and `MODES=mixed_sim PROFILE=ck_phone_sim_v3/profile.json bash run_phone_ceiling.sh 0` for
+the training test. If the referees do no better on the new render, the `drop_*` rows already in this table, and the
+`only_*` rows of a further run with `--sets only`, say which stage a handheld-trained model objects
+to.
+
+The same table on the box's /2 profile needs no fit, but there every render row keeps the band
+criterion, whose blur reacts to what reaches it (a render that arrives sharper or less magnified is
+blurred more): `render_v3` there need not be sharper than `full`, so it cannot decide the refit. On
+such a bank each render row has a `*_no_detail` twin beside `drop_detail`, which read the field and
+the resampling apart from that blur.
+
+The stored-reference test of the /2 render allows another machine's rounding (under 2e-3 anywhere,
+under 2 % of pixels at 1e-4: one photo whose blur is mixed between two rungs answers a rounding
+difference with a few 1e-4 on a few dozen pixels). A failure with every photo off is a real change;
+the stored file is only ever regenerated from commit 45d8b37.
+
+**Checked.** The whole change was reviewed three times and every confirmed finding fixed (the last
+pass: the report's pooled folds, readings that are mostly noise, a blur ladder that rises, a
+half-finished profile left under the final name, `--source-camera` beside an every-camera arm, and
+tests that passed by slack). On the final code the affected test files pass (116 tests, one skipped), a /2 profile renders on the samples exactly what commit 45d8b37 rendered, and 101 mistakes planted one at a time in a copy of the code are each caught by the tests.
