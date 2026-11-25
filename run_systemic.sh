@@ -16,6 +16,13 @@
 # paired image-minus-covariate delta (is there retinal signal beyond age?), and the
 # paired drinit-minus-ctrl delta (does DR pre-training transfer?).
 #
+# FOLDS=5 runs the 5-fold design instead (ctrl_fold<k>_seed<s>; DR_CK is refused there):
+# dataset.fold_split with FOLD_SEED (default 42), the SAME partition probe_systemic.py
+# and run_probe_systemic.sh use, so the CNN and the frozen-RETFound probe are scored
+# on the same patients and summarize_systemic.py pools each out of fold. (Passing
+# --fold through EXTRA does not work: every fold would be named ctrl_seed<s> and
+# the skip-if-exists check would skip folds 1..4.)
+#
 # Gate: inspect_mbrset.py --strict runs first and refuses tasks whose column is
 # missing or single-class as encoded, so a 1/2-coded release fails here, not after
 # an epoch. Idempotent: a run whose JSON exists is skipped.
@@ -39,6 +46,13 @@ Seeds default to 0 1 2. Every knob is an environment variable:
                    myocardial_infarction"); any key of dataset.SYSTEMIC_TASKS
     COVARIATES     columns for the logistic baseline (default "age sex"; add dm_time
                    for the stricter chart-knowledge baseline)
+    PY             python (default .venv/bin/python; in a worktree pass ~/Oculomics/.venv/bin/python)
+    GPU            CUDA_VISIBLE_DEVICES for this invocation (default: unchanged)
+  cross-validation
+    FOLDS          e.g. 5: patient-grouped K-fold, every labelled patient tested once,
+                   pooled out of fold by summarize_systemic.py      (default "": 70/10/20)
+    FOLD_LIST      the folds THIS invocation runs, to share them across GPUs (default: all)
+    FOLD_SEED      seed of the fold partition, fixed across folds and seeds (default 42)
   outputs
     OUT            results JSONs + summary        (default exp_systemic)  -> $OUT/<task>/
     CK             checkpoints                    (default ck_systemic)   -> $CK/<task>/
@@ -52,6 +66,8 @@ Seeds default to 0 1 2. Every knob is an environment variable:
 
 example
     M=/data/mBRSET/1.0 DR_CK=ck_kd_v4_384/kd_seed1.pt TASKS="hypertension nephropathy" bash run_systemic.sh 0 1 2 3 4
+    # 5-fold, one seed, on the probe's folds
+    M=... PY=~/Oculomics/.venv/bin/python GPU=1 FOLDS=5 OUT=exp_systemic_folds CK=ck_systemic_folds bash run_systemic.sh 0
 USAGE
 }
 for a in "$@"; do
@@ -73,12 +89,28 @@ EPOCHS=${EPOCHS:-25}
 WORKERS=${WORKERS:-5}
 AMP=${AMP:-}
 EXTRA=${EXTRA:-}
-PY=.venv/bin/python
+PY=${PY:-.venv/bin/python}
+FOLDS=${FOLDS:-}
+FOLD_SEED=${FOLD_SEED:-42}
+if [ -n "${GPU:-}" ]; then export CUDA_VISIBLE_DEVICES=$GPU; fi
 
-SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(0 1 2)
+SEEDS=("$@")
+if [ ${#SEEDS[@]} -eq 0 ]; then
+  if [ -n "$FOLDS" ]; then SEEDS=(0); else SEEDS=(0 1 2); fi
+fi
+if [ -n "$FOLDS" ]; then
+  FOLD_LIST=${FOLD_LIST:-$(seq 0 $((FOLDS - 1)) | tr '\n' ' ')}
+  for k in $FOLD_LIST; do
+    [ "$k" -ge 0 ] && [ "$k" -lt "$FOLDS" ] || { echo "[fatal] fold $k is outside 0..$((FOLDS - 1))"; exit 1; }
+  done
+  # summarize_systemic.py pools only the control arm of fold runs: a drinit fold arm
+  # would cost twice the GPU time and never be reported
+  [ -z "$DR_CK" ] || { echo "[fatal] DR_CK (the drinit arm) is not pooled in FOLDS mode; unset DR_CK"; exit 1; }
+  echo "[info] $FOLDS-fold design (fold seed $FOLD_SEED): this invocation runs folds $FOLD_LIST"
+fi
 mkdir -p "$OUT" "$CK"
 [ -d "$M" ] || { echo "[fatal] mBRSET root not found: $M"; exit 1; }
-[ -x "$PY" ] || { echo "[fatal] no .venv — see README Quick start"; exit 1; }
+[ -x "$PY" ] || { echo "[fatal] no python at $PY (in a worktree: PY=~/Oculomics/.venv/bin/python)"; exit 1; }
 # M may be a parent of the real directory (PhysioNet: mBRSET/1.0/): resolve it to the
 # dir holding the label CSV, or fail naming the CSVs that were found.
 M=$($PY - "$M" <<'PY'
@@ -118,9 +150,16 @@ run() {  # run <task> <name> <flags...>
 
 for t in $TASKS; do
   for s in "${SEEDS[@]}"; do
-    run "$t" "ctrl_seed$s" --seed "$s"
-    if [ -n "$DR_CK" ]; then
-      run "$t" "drinit_seed$s" --seed "$s" --init-from "$DR_CK"
+    if [ -n "$FOLDS" ]; then
+      for k in $FOLD_LIST; do
+        fold=(--fold "$k" --n-folds "$FOLDS" --fold-seed "$FOLD_SEED")
+        run "$t" "ctrl_fold${k}_seed$s" --seed "$s" "${fold[@]}"
+      done
+    else
+      run "$t" "ctrl_seed$s" --seed "$s"
+      if [ -n "$DR_CK" ]; then
+        run "$t" "drinit_seed$s" --seed "$s" --init-from "$DR_CK"
+      fi
     fi
   done
 done

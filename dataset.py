@@ -268,6 +268,34 @@ for _task, (_col, _desc) in COMORBIDITY_TASKS.items():
     LABEL_REGISTRY[_task] = _flag_spec(_col, _desc)
 
 
+# AI-READI's MEASURED targets (aireadi_dataset.py writes these columns): every
+# participant counts for the continuous ones; the flags are the clinical cut-offs.
+# The public release has no medication list, so ``htn_measured`` is the visit's
+# blood pressure alone (a treated, controlled hypertensive reads 0).
+def _float_spec(col: str, description: str) -> LabelSpec:
+    def fn(r, c=col):
+        v = pd.to_numeric(pd.Series([r[c]]), errors="coerce").iloc[0]
+        return float(v) if np.isfinite(v) else np.nan
+    return LabelSpec(source_cols=(col,), fn=fn, dtype=torch.float32, num_classes=None,
+                     description=description)
+
+
+AIREADI_CONTINUOUS: Dict[str, str] = {
+    "sbp": "Systolic blood pressure, mean of the visit's readings (mmHg).",
+    "log_uacr": "log of urine albumin / creatinine (mg/g).",
+    "moca": "Montreal Cognitive Assessment total score (0-30).",
+}
+AIREADI_FLAGS: Dict[str, str] = {
+    "htn_measured": "Measured hypertension: SBP >= 130 or DBP >= 80 at the visit (no medication data).",
+    "albuminuria": "Urine albumin / creatinine >= 30 mg/g.",
+    "moca_impaired": "MoCA total < 26.",
+}
+for _task, _desc in AIREADI_CONTINUOUS.items():
+    LABEL_REGISTRY[_task] = _float_spec(_task, _desc)
+for _task, _desc in AIREADI_FLAGS.items():
+    LABEL_REGISTRY[_task] = _flag_spec(_task, _desc)
+
+
 # ----------------------------------------------------------------------------- #
 # Transform factory
 # ----------------------------------------------------------------------------- #
@@ -770,6 +798,11 @@ def fold_split(
                   for row in df[list(spec.source_cols)].to_numpy()], dtype=np.float64)
     keep = ~_isnan_vector(y)
     df, y = df.loc[keep].reset_index(drop=True), y[keep]
+    if spec.num_classes is None and not spec.multilabel:
+        # a continuous target: stratify on its quintiles (StratifiedGroupKFold
+        # would treat every distinct value as a class). Binary tasks are untouched.
+        edges = np.unique(np.quantile(y, [0.2, 0.4, 0.6, 0.8]))
+        y = np.searchsorted(edges, y, side="right").astype(np.float64)
     groups = df[group_col].to_numpy()
     folds = list(StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
                  .split(df, y, groups))

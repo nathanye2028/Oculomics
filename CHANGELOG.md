@@ -2,6 +2,46 @@
 
 All notable changes to this project. Dates are ISO; results referenced are in REPORT.md.
 
+## [Unreleased] — 2026-11-19 Systemic oculomics, across the body: frozen-RETFound probe, vessel measurements, measured labels  (branch `disease/systemic-oculomics`)
+
+Frozen foundation model + small classifier (nothing run on real images yet):
+- `retfound.py`: the RETFound-DINOv2 encoder (`YukunZhou/RETFound_dinov2_meh`, ViT-L/14 at 224 px, 1,024-number CLS embedding). Loading follows RETFound's `main_finetune.py` (teacher weights, `backbone.` stripped, `mlp.w12/w3` -> `fc1/fc2`, position embedding resampled) but is checked: a missing transformer weight or a weight with no place in the model is fatal. `collapse_probe` folds scaler -> PCA -> linear model into one linear map; `ProbeTeacher` wraps encoder + probe with a train_mbrset teacher's `forward_with_feat`.
+- `extract_retfound.py`: one embedding per image on disk, through the CNN runs' own evaluation preprocessing (`crop_to_fov`, full-frame resize, ImageNet normalisation); `.npz` with the weights' sha256.
+- `probe_systemic.py`: StandardScaler -> PCA(32) -> L2 logistic regression (balanced), C picked on val, refit on train, on `dataset.fold_split` of the table `train_mbrset.load_table` builds, so fold K holds the CNN's fold K patients. Writes the per-fold JSON + `_test.csv` columns train_mbrset.py writes, so `summarize_systemic.py --control probe` pools it unchanged (incremental delta, matched pairs); `_probe.npz` per fold; optional out-of-domain score (`--external-*`, cm_hypertension -> mBRSET). A continuous target switches to ridge, with the pooled R2 gain over the covariates (`summary_regression_<cond>.md`).
+- `compare_probe_cnn.py`: per task, both arms' pooled delta and matched-pair concordance with a pass rule (delta CI above 0 and concordance CI above 50 %), and the paired probe-minus-CNN AUROC on the identical rows.
+- `train_mbrset.py --teacher <probe.npz>`: distils the probe into the phone student; accepted only for the probe's own partition (task, dataset, root, camera, fold, n_folds, fold_seed). `train_mbrset.load_table` (the table-building code moved out of `main`, unchanged); `--dataset aireadi`.
+- `run_systemic.sh`: `FOLDS` / `FOLD_LIST` / `FOLD_SEED` as in run_brset_cm.sh (`ctrl_fold<k>_seed<s>`, `drinit_fold<k>_seed<s>`), `PY`, `GPU`. Passing `--fold` through `EXTRA` would have named every fold `ctrl_seed<s>` and skipped folds 1-4.
+- `run_probe_systemic.sh`: embeddings, mBRSET probes (hypertension, nephropathy, MI, neuropathy; age + sex), BRSET Canon cm_hypertension (age + sex + diabetes, mBRSET external), pooled summaries, the comparison against the CNN fold runs.
+
+Vessel measurements (nothing trained on the rare label):
+- `automorph_stage.py`: symlinks in AutoMorph's `images/` layout (dot-free names: AutoMorph cuts names at the first dot), `name_map.csv`, `resolution_information.csv` (approximate mm/px from the field-of-view width), and the Docker / non-Docker commands.
+- `vessel_prereg.json`: DRAFT pre-registration, one primary feature per disease with suggested sources to verify; hypothyroidism as the negative control; the age-gap conditions.
+- `vessel_associations.py`: AutoMorph's own quality rule (Prediction 2, or 1 with softmax_bad >= 0.25), eyes averaged per patient, `disease ~ feature (per SD) + covariates` with `brset_comorbidities.logit_or` (beta per SD by least squares for a continuous outcome), Holm across the primaries, every primary feature against the negative control, `--exploratory` BH-corrected and labelled, the cross-fitted bias-corrected age gap on the same forest (`forest.csv` / `forest.png`, `--plot-only` for the Mac). Refuses a draft or uncommitted pre-registration (`--allow-draft` stamps every output DRAFT); records the registration commit.
+- `brset_comorbidities.GROUPS["hypothyroidism"]` -> `cm_hypothyroidism` (the control).
+
+Measured labels:
+- `aireadi_dataset.py`: `inspect` (folder tree, manifest / participants columns, every clinical name that looks like blood pressure, albumin, creatinine or MoCA), `convert` (colour fundus DICOMs -> JPEG, YBR -> RGB, IR / multi-frame skipped, Aurora = handheld; resumable), `targets` (sbp / dbp, `htn_measured` >= 130/80, `uacr` / `log_uacr` / `albuminuria` >= 30 mg/g, `moca` / `moca_impaired` < 26, age, diabetes stage; an ambiguous lab name is refused until pinned). The public release has no sex and no medications: `htn_measured` ignores treatment and the comparator is age + diabetes stage.
+- `brset_dataset.load_any("aireadi")`; `dataset.LABEL_REGISTRY` gains the AI-READI targets; `dataset.fold_split` stratifies a continuous target on its quintiles (binary tasks unchanged).
+- `covariate_baseline.incremental_value_regression` / `r2_block`.
+- `score_external.py`: finished probes and CNN checkpoints scored with no refitting on another dataset (AI-READI's measured hypertension), per image and per patient, by device class and camera, fold ensemble, age alone for context.
+- `requirements.txt`: `pydicom>=2.4`.
+- After an independent review (31 findings, about 20 distinct, all fixed):
+  - `probe_systemic.py` created its output folder after writing the external CSV, so a run with `--external-*` crashed on its first fold. It now refuses an external set from the training dataset and drops shared files. Probe heads record the resolved `label_csv`, and regression pooling reads the fold JSONs.
+  - `compare_probe_cnn.py` judges a task only when both arms have every fold's JSON and rows. Both arms must also share n_folds, fold seed, covariates and camera, put every image in the same fold, and cover the same rows. A half-finished CNN sweep is no longer judged.
+  - The `train_mbrset.py` probe-teacher guard compares resolved label CSVs instead of raw `--root` strings. The teacher falls back to the weights id when the cached path is gone, and refuses weights whose sha256 differs.
+  - `score_external.py` refuses a model scored on its own training dataset or table, or trained for another task.
+  - `vessel_associations.py` refuses a pre-registered covariate the table lacks (stamped DRAFT with `--allow-draft`) and an outcome with no column. It names the covariates actually used, and `_numeric` keeps sparse numeric columns.
+  - `aireadi_dataset.py`:
+    - a '<x' albumin counts as x/2; albumin 0 is albuminuria 0, with a floored log;
+    - `htn_measured` is 0 only when both readings are known;
+    - `dm_pre` / `dm_oral` / `dm_insulin` indicators are the covariates;
+    - `--moca-source` is found in either table, with a concept filter on generic names (`--moca-concept`, `--moca-no-concept-check`);
+    - ids are normalised, and the overlap guard counts only participants with a measured target;
+    - `convert` reads the `cfp` folder, records the field, and skips mosaics / peripheral fields (`--exclude-field`);
+    - value-range checks.
+  - `run_systemic.sh` refuses `DR_CK` with `FOLDS`, because the drinit arm is not pooled. `run_probe_systemic.sh` prints the full CNN commands with matching covariates. RUNBOOK: push `disease/retinal-age` first, refresh the box worktree after the pre-registration commit, AI-READI vessel commands.
+- Tests: `tests/test_probe_systemic.py`, `tests/test_vessel_associations.py`, `tests/test_aireadi.py`.
+
 ## [Unreleased] — 2026-10-17 Systemic oculomics: matched pairs and vessel ablation on the hypertension runs  (branch `disease/systemic-oculomics`)
 
 - `covariate_baseline.matched_pair_concordance`: per patient, how often a score ranks the patient with the condition above one who is within a caliper of age (default 2 years) and identical on every other covariate (sex, diabetes status); every such pair counts once, ties 1/2, patient-bootstrap CI. 50 % = nothing beyond what the pairs share. The board version of "beyond age and sex".

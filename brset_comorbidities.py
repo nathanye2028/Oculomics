@@ -174,6 +174,10 @@ GROUPS: Dict[str, Tuple[str, ...]] = {
                    "autoimmune_other"),
     "antimalarial_use": ("antimalarial_use",),
     "thyroid": ("hypothyroidism", "hyperthyroidism", "thyroid_other"),
+    # the pre-registered NEGATIVE CONTROL of the vessel / age-gap forest plot
+    # (vessel_associations.py): a common chart condition with no expected retinal
+    # vascular signature, so an association there flags confounding, not biology
+    "hypothyroidism": ("hypothyroidism",),
 }
 
 MISSING_TOKENS = {"", "na", "n/a", "nan", "none recorded", "not informed", "-"}

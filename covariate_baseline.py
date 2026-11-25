@@ -261,6 +261,93 @@ def incremental_rows(val_df: pd.DataFrame, val_prob: np.ndarray, test_df: pd.Dat
     return out
 
 
+def incremental_value_regression(val_df: pd.DataFrame, val_pred: np.ndarray, test_df: pd.DataFrame,
+                                 test_pred: np.ndarray, task: str,
+                                 features: Sequence[str] = DEFAULT_FEATURES,
+                                 subsets: Optional[Dict[str, np.ndarray]] = None,
+                                 n_boot: int = 2000, seed: int = 0) -> Dict[str, object]:
+    """:func:`incremental_value` for a continuous target (a measured blood pressure,
+    albumin-to-creatinine ratio, cognitive score): linear regressions on the
+    covariates and on the covariates + the photo's prediction, both fit on the VAL
+    rows and scored on the TEST rows. ``delta`` = R2(combined) - R2(covariates) on
+    the test rows, with a patient-cluster bootstrap CI. On success the per-test-row
+    predictions are returned under ``_p_cov_rows`` / ``_p_comb_rows`` (``test_df``
+    order, NaN where a row was unusable) for the caller to write and remove."""
+    out: Dict[str, object] = {"features": list(features), "reason": None}
+    spec = LABEL_REGISTRY.get(task)
+    if spec is None or spec.num_classes is not None or spec.multilabel:
+        out["reason"] = f"task {task!r} is not a continuous target"
+        return out
+    missing = [f for f in features if f not in val_df.columns or f not in test_df.columns]
+    if missing:
+        out["reason"] = f"covariate column(s) missing: {missing}"
+        return out
+    both = pd.concat([val_df, test_df], axis=0, ignore_index=True)
+    X_all, y_all = _feature_matrix(both, features), _labels(both, task)
+    z_all = np.concatenate([np.asarray(val_pred, float), np.asarray(test_pred, float)])
+    n_v = len(val_df)
+    ok = ~(np.isnan(y_all) | np.isnan(X_all).any(1) | np.isnan(z_all))
+    v, t = ok[:n_v], ok[n_v:]
+    Xv, yv, zv = X_all[:n_v][v], y_all[:n_v][v], z_all[:n_v][v]
+    Xt, yt, zt = X_all[n_v:][t], y_all[n_v:][t], z_all[n_v:][t]
+    out.update(n_val=int(len(yv)), n_test=int(len(yt)))
+    if len(yv) < len(features) + 5 or len(yt) < 10:
+        out["reason"] = "too few complete val or test rows"
+        return out
+    from sklearn.linear_model import LinearRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    fit = lambda X, y: make_pipeline(StandardScaler(), LinearRegression()).fit(X, y)
+    cov, comb = fit(Xv, yv), fit(np.column_stack([Xv, zv]), yv)
+    p_cov, p_comb = cov.predict(Xt), comb.predict(np.column_stack([Xt, zt]))
+    groups = test_df["patient"].astype(str).to_numpy()[t] if "patient" in test_df.columns \
+        else np.arange(len(yt)).astype(str)
+    out["image_coef_std"] = float(comb[-1].coef_.ravel()[-1])
+    out["test"] = r2_block(yt, groups, p_cov, p_comb, zt, np.ones(len(yt), bool), n_boot=n_boot, seed=seed)
+    out["subsets"] = {name: r2_block(yt, groups, p_cov, p_comb, zt, np.asarray(m, bool)[t],
+                                     n_boot=n_boot, seed=seed)
+                      for name, m in (subsets or {}).items()}
+    full_cov, full_comb = np.full(len(test_df), np.nan), np.full(len(test_df), np.nan)
+    full_cov[np.flatnonzero(t)], full_comb[np.flatnonzero(t)] = p_cov, p_comb
+    out["_p_cov_rows"], out["_p_comb_rows"] = full_cov, full_comb
+    return out
+
+
+def r2_block(y: np.ndarray, groups: np.ndarray, p_cov: np.ndarray, p_comb: np.ndarray,
+             z: np.ndarray, mask: np.ndarray, n_boot: int = 2000, seed: int = 0) -> Dict[str, object]:
+    """Out-of-sample R2 of covariates alone and covariates + photo on the ``mask``
+    rows, the gain with a patient-cluster bootstrap 95 % CI and ``p_no_gain``, and
+    the photo prediction's own Pearson r."""
+    y, p_cov, p_comb, z = (np.asarray(a, float) for a in (y, p_cov, p_comb, z))
+    mask = np.asarray(mask, bool) & np.isfinite(y) & np.isfinite(p_cov) & np.isfinite(p_comb) & np.isfinite(z)
+    g = np.asarray(groups).astype(str)[mask]
+    yy, pc, pb, zz = y[mask], p_cov[mask], p_comb[mask], z[mask]
+    res: Dict[str, object] = {"n": int(mask.sum()), "patients": int(len(np.unique(g)))}
+    if res["n"] < 10 or np.var(yy) == 0:
+        res["reason"] = "too few rows or no variance"
+        return res
+
+    def r2(yv, pv):
+        return float(1.0 - ((yv - pv) ** 2).sum() / ((yv - yv.mean()) ** 2).sum())
+    res.update(r2_covariates=r2(yy, pc), r2_combined=r2(yy, pb),
+               r_image=float(np.corrcoef(yy, zz)[0, 1]) if np.std(zz) > 0 else float("nan"),
+               mae_combined=float(np.abs(yy - pb).mean()))
+    res["delta"] = res["r2_combined"] - res["r2_covariates"]
+    rng = np.random.default_rng(seed)
+    uniq, inv = np.unique(g, return_inverse=True)
+    members = [np.flatnonzero(inv == i) for i in range(len(uniq))]
+    deltas = []
+    for _ in range(n_boot):
+        idx = np.concatenate([members[i] for i in rng.integers(0, len(uniq), len(uniq))])
+        if np.var(yy[idx]) == 0:
+            continue
+        deltas.append(r2(yy[idx], pb[idx]) - r2(yy[idx], pc[idx]))
+    if deltas:
+        res["delta_ci"] = [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
+        res["p_no_gain"] = float(np.mean(np.asarray(deltas) <= 0))
+    return res
+
+
 def matched_pair_concordance(y: np.ndarray, score: np.ndarray, groups: np.ndarray,
                              age: np.ndarray, exact: Optional[Dict[str, np.ndarray]] = None,
                              caliper: float = 2.0, n_boot: int = 2000,

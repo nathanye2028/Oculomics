@@ -321,7 +321,7 @@ def add_brset_eye_flags(df: pd.DataFrame, csv_path: str) -> pd.DataFrame:
 # sets adapted in public_fundus.py (ODIR-5K is the retinal-age clock's auxiliary
 # training set; the glaucoma / AMD branch scores on the others).
 from public_fundus import PUBLIC_DATASETS, load_public          # noqa: E402
-DATASETS = ("mbrset", "brset") + PUBLIC_DATASETS
+DATASETS = ("mbrset", "brset", "aireadi") + PUBLIC_DATASETS
 
 
 # Label CSV names per dataset. The name varies by release (PhysioNet 1.0.1 ships
@@ -412,6 +412,15 @@ def load_any(root: str, dataset: str, image_ext: str = ".jpg", **kw) -> Dict[str
     """
     if dataset in PUBLIC_DATASETS:
         return load_public(root, dataset, image_ext=image_ext, **kw)
+    if dataset == "aireadi":
+        # the folder aireadi_dataset.py convert/targets writes (JPEGs + one label table),
+        # not the raw FAIRhub download
+        csv_path = os.path.join(root, "labels_aireadi.csv")
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError(f"{csv_path} not found: run aireadi_dataset.py convert and targets "
+                                    f"on the FAIRhub download first")
+        return {"df": pd.read_csv(csv_path), "images_dir": os.path.join(root, "images"),
+                "csv": csv_path, "source": "aireadi"}
     if dataset == "mbrset":
         root = resolve_root(root, dataset)
         csv_path = next(os.path.join(root, n) for n in LABEL_CSV_NAMES["mbrset"]

@@ -20,10 +20,14 @@ Conventions:
       then Push origin.
 - [ ] Commit and push `disease/systemic-oculomics` in `~/Documents/GitHub/Oculomics`
       (this file included).
+- [ ] For section 7: commit and push `disease/retinal-age`. In GitHub Desktop: File → Add Local Repository →
+      `~/Documents/GitHub/Oculomics-retinal-age` (train_retinal_age.py, run_retinal_age.sh,
+      pool_age_folds.py, tests/test_age_folds.py, CHANGELOG.md), then Push origin.
 - [ ] Write the dated one-page analysis plan and commit it **before step 4**. It names:
   - the targets: sensitivity > 85 % and specificity > 82.5 %, per patient;
-  - the Messidor-2 primary result as `PROTOCOL:METHOD:RULE` (e.g. `calibrated:em:dr_or_edema`)
-    and the calibration (`full` or `shallow`);
+  - the Messidor-2 primary result as `PROTOCOL:METHOD:RULE` (e.g. `calibrated:em2:dr_referable`;
+    methods: `shipped`, `em`, `em2`, `rate`, `anchor`) and the calibration (`full` or `shallow`),
+    chosen from the ladder, not after the look;
   - the systemic primary: hypertension against age + sex + diabetes, in all eyes and
     in normal-looking eyes;
   - what counts as success.
@@ -149,11 +153,30 @@ cd ~/Oculomics && .venv/bin/python referral_outcomes.py --dir exp_rr_canon
 cd ~/Oculomics && .venv/bin/python dr_proxy_check.py --dir exp_rr_canon
 ```
 
-- [ ] Camera ladder at matched prevalence, plus shallow recalibration. This runs on
-      the GPU and takes minutes per checkpoint, so run it inside tmux:
+- [ ] Camera ladder at matched prevalence, shallow recalibration, the label-free
+      prevalence-matched pool (experiment D) and every threshold method (`em`,
+      `em2`, `rate`, `anchor`) on every base. GPU, tens of minutes per checkpoint
+      (experiment C draws 60 calibration sets per camera), so run it inside tmux:
 
 ```bash
 cd ~/Oculomics && CUDA_VISIBLE_DEVICES=0 .venv/bin/python redesign_calibration.py --ckpt ck_rr_canon/seed*.pt --out exp_rr_canon/redesign
+```
+
+  The ladder at its end prints sensitivity AND specificity per camera and
+  setting: the phone row needs both at 0.85 / 0.825 to meet the IDx-DR targets.
+
+- [ ] Cross-fitted systemic probes: every handheld patient tested once, so the
+      four UNDERPOWERED targets get 46-98 positive patients. Minutes per
+      checkpoint on the GPU, one call per seed (the loop below does all five):
+
+```bash
+cd ~/Oculomics && for s in 0 1 2 3 4; do CUDA_VISIBLE_DEVICES=0 .venv/bin/python probe_folds.py --ckpt ck_rr_canon/seed$s.pt --target-root /data/users4/nshaik3/Datasets/mBRSET --folds 5 --out exp_rr_canon/seed$s; done
+```
+
+  Then re-run the multi-seed summary; the new rows carry protocol `calibrated_oof5`:
+
+```bash
+cd ~/Oculomics && .venv/bin/python summarize_retinareach.py --dir exp_rr_canon
 ```
 
 - [ ] Systemic, pooled out of fold: the photo's gain over age + sex + diabetes,
@@ -167,6 +190,7 @@ cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python summarize_systemic.py --
   - `exp_rr_canon/summary.md`;
   - the referral table;
   - `exp_rr_canon/redesign/redesign_summary.txt` (the ladder is at its end);
+  - the `calibrated_oof5` rows of the re-run `exp_rr_canon/summary.md`;
   - `exp_cm_folds/summary.md`.
 
 - [ ] Copy the results to the Mac. Run these on the Mac, not on the box:
@@ -219,8 +243,172 @@ mkdir -p ~/Documents/GitHub/Oculomics-retinareach/external_test/messidor2 && scp
   gitignored, which is why the outputs go to `external_test/`. The commit date is
   part of the record.
 
+## 7. Reach 2, across the body: probe, vessels, measured labels
+
+Three tracks, in this order of cost. Box folders: `~/oculomics-systemic` (this branch) and
+`~/oculomics-age` (`disease/retinal-age`, for the cross-fitted clock). Paste the lines marked **Paste**.
+
+### 7.0 One-time setup
+
+- [ ] On huggingface.co, sign in and request access to `YukunZhou/RETFound_dinov2_meh` (gated, CC BY-NC 4.0).
+- [ ] On the box, the two new packages and the HuggingFace login (it asks for a token from your HF settings):
+
+```bash
+~/Oculomics/.venv/bin/pip install "pydicom>=2.4" huggingface_hub
+```
+
+```bash
+~/Oculomics/.venv/bin/python -c "from huggingface_hub import login; login()"
+```
+
+- [ ] A worktree for the age clock, detached like the systemic one:
+
+```bash
+cd ~/Oculomics && git fetch origin && git worktree add --detach ~/oculomics-age origin/disease/retinal-age
+```
+
+### 7.1 Frozen RETFound + small classifier (Recommendation 1)
+
+- [ ] The mBRSET CNNs on the SAME 5 folds (GPU, hours; skip a task you do not need):
+
+```bash
+tmux new -s sys_folds
+```
+
+```bash
+cd ~/oculomics-systemic && PY=~/Oculomics/.venv/bin/python GPU=1 FOLDS=5 M=/data/users4/nshaik3/Datasets/mBRSET OUT=exp_systemic_folds CK=ck_systemic_folds bash run_systemic.sh 0 2>&1 | tee -a exp_systemic_folds.log
+```
+
+- [ ] The probes (embeddings take minutes on the GPU, the probes seconds on the CPU). It also compares
+      against `exp_systemic_folds` and the step-4 `exp_cm_folds` once they exist; rerun it then:
+
+```bash
+cd ~/oculomics-systemic && PY=~/Oculomics/.venv/bin/python GPU=0 B=/data/users4/nshaik3/Datasets/BRSET M=/data/users4/nshaik3/Datasets/mBRSET bash run_probe_systemic.sh 2>&1 | tee -a exp_probe.log
+```
+
+  **Paste** `exp_probe/mbrset/summary.md`, `exp_probe/brset_canon/summary.md` and the
+  "PROBE ... vs CNN" blocks. Read the matched-pair concordance and the incremental delta.
+
+- [ ] Only if a task's probe PASSES and its CNN does not: distil fold K's probe into fold K's
+      phone student (one run per fold; same folds, same covariates). Example, mBRSET nephropathy fold 0:
+
+```bash
+cd ~/oculomics-systemic && CUDA_VISIBLE_DEVICES=1 ~/Oculomics/.venv/bin/python train_mbrset.py --dataset mbrset --root /data/users4/nshaik3/Datasets/mBRSET --task nephropathy --fold 0 --n-folds 5 --fold-seed 42 --backbone timm:mobilenetv4_conv_small.e2400_r224_in1k --no-gcg --image-size 384 --epochs 25 --covariate-baseline --covariate-features age sex --teacher exp_probe/mbrset/nephropathy/probe_fold0_seed0_probe.npz --ckpt-dir ck_distil/nephropathy --run-name kd_fold0_seed0 --results-json exp_distil/nephropathy/kd_fold0_seed0.json
+```
+
+### 7.2 Vessel measurements (Recommendation 2)
+
+- [ ] **Before any AutoMorph output or cross-fitted prediction is opened:** fill in `vessel_prereg.json`
+      (verify every suggested source, set `status` to `final` and `dated`), commit and push it.
+      `vessel_associations.py` refuses a draft or uncommitted file. Then bring it to the box:
+
+```bash
+cd ~/oculomics-systemic && git fetch origin && git checkout --detach origin/disease/systemic-oculomics && git log --oneline -1 -- vessel_prereg.json
+```
+- [ ] Stage the photos (symlinks, no copies) and print the AutoMorph command:
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python automorph_stage.py --dataset brset --root /data/users4/nshaik3/Datasets/BRSET --camera "Canon CR" --out ~/automorph/brset_canon
+```
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python automorph_stage.py --dataset mbrset --root /data/users4/nshaik3/Datasets/mBRSET --out ~/automorph/mbrset
+```
+
+- [ ] Run AutoMorph with the printed command (Docker if the box allows it; otherwise its conda setup,
+      LOCAL.md in github.com/rmaphoh/AutoMorph). A rerun wipes `Results/`.
+- [ ] The cross-fitted, bias-corrected age clock (the v5 recipe, 5 folds, one seed; two GPUs):
+
+```bash
+cd ~/oculomics-age && PY=~/Oculomics/.venv/bin/python GPU=0 FOLDS=5 FOLD_LIST="0 1 2" B=/data/users4/nshaik3/Datasets/BRSET M=/data/users4/nshaik3/Datasets/mBRSET MIX=1 MEDIUM=1 SKIP_STUDENT=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_cf CK=ck_retinal_age_cf bash run_retinal_age.sh 0 2>&1 | tee -a exp_retinal_age_cf_gpu0.log
+```
+
+```bash
+cd ~/oculomics-age && PY=~/Oculomics/.venv/bin/python GPU=1 FOLDS=5 FOLD_LIST="3 4" B=/data/users4/nshaik3/Datasets/BRSET M=/data/users4/nshaik3/Datasets/mBRSET MIX=1 MEDIUM=1 SKIP_STUDENT=1 SIZE=512 HEAD=ldl TTA=1 AGE_BALANCE=1 EXTRA="--ema-decay 0.999" OUT=exp_retinal_age_cf CK=ck_retinal_age_cf bash run_retinal_age.sh 0 2>&1 | tee -a exp_retinal_age_cf_gpu1.log
+```
+
+  Whichever finishes last pools the folds (`pool_age_folds.py`). **Paste** its "bias check" lines:
+  the healthy slope of gap on age should be near 0 after correction.
+
+- [ ] The pre-registered tests and the forest plot (BRSET; then mBRSET without `--age-gap`):
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python vessel_associations.py --automorph ~/automorph/brset_canon --dataset brset --root /data/users4/nshaik3/Datasets/BRSET --prereg vessel_prereg.json --age-gap ~/oculomics-age/exp_retinal_age_cf/predictions_oof_medium_mix.csv --out exp_vessels/brset
+```
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python vessel_associations.py --automorph ~/automorph/mbrset --dataset mbrset --root /data/users4/nshaik3/Datasets/mBRSET --prereg vessel_prereg.json --out exp_vessels/mbrset
+```
+
+  **Paste** both `summary.md`. Redraw the forest on the Mac: `scp` the `forest.csv`, then
+  `python3 vessel_associations.py --plot-only forest.csv`.
+
+### 7.3 Measured labels from AI-READI (Recommendation 3)
+
+- [ ] Register on fairhub.io and request the dataset (verified-ID login, type 2 diabetes research
+      only, licence acceptance; your name, email and stated purpose become public on the project site).
+- [ ] Download to the box (Azure SAS link from FAIRhub), then look before trusting any name:
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python aireadi_dataset.py inspect --root <AI-READI download>
+```
+
+  **Paste** it. If `targets` later says a name is ambiguous, pin it with `--albumin-source "<name>"` etc.
+
+- [ ] Convert the colour photographs (Aurora = handheld, the rest tabletop) and build the targets:
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python aireadi_dataset.py convert --root <AI-READI download> --out ~/aireadi --workers 8
+```
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python aireadi_dataset.py targets --root <AI-READI download> --out ~/aireadi
+```
+
+- [ ] Embeddings, then the same probe on the measured targets (continuous: R2 gain; flags: AUROC delta),
+      comparator age + diabetes stage as three indicators (no sex in the public release):
+
+```bash
+cd ~/oculomics-systemic && CUDA_VISIBLE_DEVICES=0 ~/Oculomics/.venv/bin/python extract_retfound.py --dataset aireadi --root ~/aireadi --out features/aireadi_retfound.npz
+```
+
+```bash
+cd ~/oculomics-systemic && for t in sbp log_uacr moca htn_measured albuminuria moca_impaired; do ~/Oculomics/.venv/bin/python probe_systemic.py --dataset aireadi --root ~/aireadi --task $t --features features/aireadi_retfound.npz --covariate-features age dm_pre dm_oral dm_insulin --out exp_probe/aireadi; done
+```
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python summarize_systemic.py --dir exp_probe/aireadi --tasks htn_measured albuminuria moca_impaired --control probe
+```
+
+  **Paste** `exp_probe/aireadi/summary.md` and the three `exp_probe/aireadi/*/summary_regression_probe.md`.
+
+- [ ] Vessels on the measured targets, one device per run (`convert` printed the camera strings and fields).
+      Set the `aireadi` camera in `vessel_prereg.json` (a dated amendment if it is already final), commit, push,
+      refresh `~/oculomics-systemic` as in 7.2, then per device (a tabletop one, then the Optomed Aurora):
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python automorph_stage.py --dataset aireadi --root ~/aireadi --camera "<device string>" --out ~/automorph/aireadi_<device>
+```
+
+  Run AutoMorph with the printed command, then:
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python vessel_associations.py --automorph ~/automorph/aireadi_<device> --dataset aireadi --root ~/aireadi --camera "<device string>" --prereg vessel_prereg.json --out exp_vessels/aireadi_<device>
+```
+
+  **Paste** each `summary.md`.
+
+- [ ] The outside check: the BRSET hypertension models against AI-READI's measured blood pressure,
+      handheld and tabletop separately:
+
+```bash
+cd ~/oculomics-systemic && ~/Oculomics/.venv/bin/python score_external.py --task cm_hypertension --dataset aireadi --root ~/aireadi --probes "exp_probe/brset_canon/cm_hypertension/probe_fold*_seed0_probe.npz" --features features/aireadi_retfound.npz --checkpoints "ck_cm_folds/cm_hypertension/ctrl_fold*_seed0.pt" --out exp_external/aireadi_htn
+```
+
+  **Paste** `exp_external/aireadi_htn/summary.md`. Keep every AI-READI file on the box (licence).
+
 ## Not scripted yet
 
 - DR heatmaps of the same lesion type on the tabletop and the phone (mechanism panel).
 - Sensitivity by sex, age, education and insurance, with confidence intervals.
-- The cross-fitted retinal age clock (December, `disease/retinal-age`).
+- Vessel ablation through AutoMorph's vessel masks instead of the line detector.

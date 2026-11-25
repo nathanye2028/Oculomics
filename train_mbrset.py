@@ -224,6 +224,38 @@ def load_teacher(path: str, device: torch.device, num_classes: int, task: str,
     return t, bk, a, ck.get("val", {})
 
 
+def load_probe_as_teacher(args, device: torch.device, num_classes: int):
+    """A probe_systemic.py ``*_probe.npz`` (frozen RETFound + linear probe) as the
+    teacher. The probe saw its fold's train patients only, so it is accepted only
+    for the SAME partition: same task, dataset, root, camera, fold, fold count and
+    fold seed. Any other student split could hold patients the probe trained on,
+    and its soft labels would carry their test labels into the student."""
+    from retfound import load_probe_teacher
+    if num_classes != 2:
+        raise SystemExit("[fatal] a probe teacher is binary; the student task is not")
+    teacher, meta = load_probe_teacher(args.teacher, device, weights=args.teacher_weights)
+    want = {"task": args.task, "dataset": args.dataset, "camera": args.camera or None,
+            "fold": args.fold, "n_folds": args.n_folds if args.fold is not None else None,
+            "fold_seed": args.fold_seed if args.fold is not None else None}
+    bad = {k: (meta.get(k), v) for k, v in want.items() if meta.get(k) != v}
+    # the same table however its root was spelt (a parent dir and the resolved dir
+    # load the same CSV): compare the resolved label CSVs, not the raw --root strings
+    from brset_dataset import load_any
+    mine = os.path.realpath(load_any(args.root, args.dataset, image_ext=args.image_ext)["csv"])
+    theirs = meta.get("label_csv")
+    if theirs is None and meta.get("root"):                     # probe files written before label_csv
+        theirs = os.path.realpath(load_any(meta["root"], args.dataset, image_ext=args.image_ext)["csv"])
+    if theirs is not None and os.path.realpath(theirs) != mine:
+        bad["label table"] = (theirs, mine)
+    if bad:
+        raise SystemExit(f"[fatal] probe teacher {args.teacher} was fit on a different partition "
+                         f"(probe vs student: {bad}); its soft labels could leak test patients. "
+                         f"Distil fold K's probe into fold K's student with the same --fold-seed.")
+    print(f"[info] probe teacher: RETFound + linear probe, fold {meta['fold']} "
+          f"(probe val AUROC {meta.get('val_auroc', float('nan')):.4f})")
+    return teacher, "retfound_probe", {"seed": args.seed, **meta}, {"auroc": meta.get("val_auroc", float("nan"))}
+
+
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float) -> torch.Tensor:
     """Hinton et al. (2015) logit distillation: ``T^2 * KL(teacher || student)``
     at temperature ``T``, averaged over the batch.
@@ -413,6 +445,31 @@ def rows_for(ds, df: pd.DataFrame) -> pd.DataFrame:
     return t.loc[list(ds.files)].reset_index()
 
 
+def load_table(root: str, dataset: str, task: str, camera: Optional[str] = None,
+               image_ext: str = ".jpg") -> dict:
+    """The run's label table, exactly as the trainer builds it before splitting
+    (``brset_dataset.load_any`` plus, for BRSET, the eye flags, the extra clinical
+    columns and the parsed comorbidities; then the camera filter). Shared with
+    probe_systemic.py: ``dataset.fold_split`` depends on the table's rows and their
+    order, so the probe's folds equal the CNN's only if both build it here."""
+    from brset_dataset import add_brset_eye_flags, add_brset_extras, filter_camera, load_any
+    from dataset import COMORBIDITY_TASKS
+    src = load_any(root, dataset, image_ext=image_ext)
+    if dataset == "brset":
+        # the eye findings (flag_*, only ever used for the before-lesions subsets),
+        # diabetes / nationality (covariates, the no-DM subset) and, for a cm_* task,
+        # the parsed free-text comorbidity labels.
+        src["df"] = add_brset_eye_flags(src["df"], src["csv"])
+        src["df"] = add_brset_extras(src["df"], src["csv"], comorbidities=task in COMORBIDITY_TASKS)
+    elif task in COMORBIDITY_TASKS:
+        raise SystemExit(f"[fatal] {task} is a BRSET free-text target; train it with --dataset brset")
+    if camera:
+        n0 = len(src["df"])
+        src["df"] = filter_camera(src["df"], camera)
+        print(f"[info] camera : {camera!r} -- {len(src['df'])} of {n0} rows kept")
+    return src
+
+
 def nodm_dr0_mask(rows: pd.DataFrame) -> Optional[np.ndarray]:
     """Rows of non-diabetic patients whose worst eye is DR grade 0 (both eyes of a
     patient share a split), or None when the table cannot say. The image cannot
@@ -479,8 +536,9 @@ def main() -> int:
     p.add_argument("--root", required=True,
                    help="Training dataset dir. mBRSET: images/ + labels_mbrset.csv. "
                         "BRSET: fundus_photos/ + labels.csv (pass --dataset brset).")
-    p.add_argument("--dataset", default="mbrset", choices=["mbrset", "brset"],
-                   help="Schema of --root. Default 'mbrset' keeps every prior run identical.")
+    p.add_argument("--dataset", default="mbrset", choices=["mbrset", "brset", "aireadi"],
+                   help="Schema of --root. Default 'mbrset' keeps every prior run identical. "
+                        "'aireadi' = the folder aireadi_dataset.py writes (binary flags only here).")
     p.add_argument("--external-test-root", default=None,
                    help="Optional SECOND dataset, evaluated once with the best checkpoint. "
                         "This is the out-of-domain number in a transfer experiment; it never "
@@ -534,8 +592,14 @@ def main() -> int:
                         "this same script, then named via --teacher on the student run.")
     p.add_argument("--teacher", default=None,
                    help="Checkpoint of a teacher trained by this script (same --task, same "
-                        "--seed so the patient split matches). Enables distillation: "
+                        "--seed so the patient split matches), or a probe_systemic.py "
+                        "*_probe.npz (frozen RETFound + probe; same --fold/--n-folds/--fold-seed). "
+                        "Enables distillation: "
                         "loss = (1-a)*CE + a*T^2*KL(teacher||student) [+ feature term].")
+    p.add_argument("--teacher-weights", default=None,
+                   help="With a probe teacher (--teacher <probe_systemic *_probe.npz>): the RETFound "
+                        "weights to rebuild the encoder from (default: the path recorded when the "
+                        "features were extracted).")
     p.add_argument("--kd-alpha", type=float, default=0.7, help="Weight on the KD term.")
     p.add_argument("--kd-temp", type=float, default=4.0, help="Distillation temperature.")
     p.add_argument("--distill-feat-weight", type=float, default=0.0,
@@ -617,24 +681,10 @@ def main() -> int:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt = os.path.join(args.ckpt_dir, f"{run_name}.pt")
 
-    from brset_dataset import (add_brset_eye_flags, add_brset_extras,  # noqa: E402
-                               filter_camera, load_any)
+    from brset_dataset import load_any                                  # noqa: E402
     from dataset import COMORBIDITY_TASKS                                # noqa: E402
-    src = load_any(args.root, args.dataset, image_ext=args.image_ext)
+    src = load_table(args.root, args.dataset, args.task, camera=args.camera, image_ext=args.image_ext)
     img_dir = src["images_dir"]
-    if args.dataset == "brset":
-        # the eye findings (flag_*, only ever used for the before-lesions subsets),
-        # diabetes / nationality (covariates, the no-DM subset) and, for a cm_* task,
-        # the parsed free-text comorbidity labels.
-        src["df"] = add_brset_eye_flags(src["df"], src["csv"])
-        src["df"] = add_brset_extras(src["df"], src["csv"],
-                                     comorbidities=args.task in COMORBIDITY_TASKS)
-    elif args.task in COMORBIDITY_TASKS:
-        raise SystemExit(f"[fatal] {args.task} is a BRSET free-text target; train it with --dataset brset")
-    if args.camera:
-        n0 = len(src["df"])
-        src["df"] = filter_camera(src["df"], args.camera)
-        print(f"[info] camera : {args.camera!r} -- {len(src['df'])} of {n0} rows kept")
 
     # Patient-grouped, label-stratified 70/10/20 split (no patient leakage) --
     # or a fixed partition from --split-file, e.g. RetinaReach's split_handheld.csv,
@@ -743,10 +793,13 @@ def main() -> int:
         # ctrl-vs-kd contrast would carry an init/dropout difference that is
         # not distillation.
         with torch.random.fork_rng(devices=[]):
-            teacher, t_backbone, t_args, t_val = load_teacher(
-                args.teacher, device, C, args.task,
-                dataset=args.dataset, external_root=args.external_test_root)
-        if int(t_args.get("seed", args.seed)) != args.seed:
+            if args.teacher.endswith(".npz"):
+                teacher, t_backbone, t_args, t_val = load_probe_as_teacher(args, device, C)
+            else:
+                teacher, t_backbone, t_args, t_val = load_teacher(
+                    args.teacher, device, C, args.task,
+                    dataset=args.dataset, external_root=args.external_test_root)
+        if not args.teacher.endswith(".npz") and int(t_args.get("seed", args.seed)) != args.seed:
             print(f"[warn] teacher seed {t_args.get('seed')} != student seed {args.seed}: "
                   "the patient splits differ, so the teacher may have trained on images in "
                   "this run's in-domain test split. Use matching seeds for a clean number.")
