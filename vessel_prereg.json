@@ -1,0 +1,88 @@
+{
+  "_read_me": [
+    "Pre-registration of the vessel-measurement and retinal-age-gap tests (vessel_associations.py).",
+    "Fill it in, set status to 'final' and the date, and COMMIT it before any AutoMorph result or",
+    "cross-fitted age prediction is opened. vessel_associations.py refuses a draft or an uncommitted",
+    "copy, and stamps every output with this file's commit hash and date.",
+    "One primary feature per disease, chosen from a published study (cite it in 'source'). Every",
+    "other feature x disease pair is exploratory: printed only with --exploratory, BH-corrected,",
+    "and never the headline. 76 metrics tested at p < 0.05 would give ~4 false hits.",
+    "The entries below are SUGGESTIONS to check against the papers, not decisions: verify each",
+    "citation, change what you disagree with, and delete this note.",
+    "Column names follow AutoMorph's csv_merge.py (zone B / zone C merged with suffixes _zone_b /",
+    "_zone_c; whole-image metrics unsuffixed). If AutoMorph spells a column differently, fixing",
+    "only the spelling is allowed: record it under 'amendments' with the date and recommit."
+  ],
+  "status": "draft",
+  "dated": "YYYY-MM-DD",
+  "author": "",
+  "amendments": [],
+  "quality": "AutoMorph M1 rule: reject = Prediction 2, or Prediction 1 with softmax_bad >= 0.25; rejected images dropped, then the patient's eyes averaged",
+  "effect": "odds ratio per standard deviation of the exposure (standardised within dataset and camera), from logistic regression with the covariates below",
+  "alpha": 0.05,
+  "datasets": {
+    "brset": {
+      "camera": "Canon CR",
+      "covariates": ["age", "sex", "diabetes"],
+      "negative_control": "cm_hypothyroidism",
+      "diseases": {
+        "cm_hypertension": {
+          "feature": "CRAE_Knudtson_zone_b",
+          "direction": "lower",
+          "source": "arteriolar narrowing with blood pressure; e.g. Ikram et al., Hypertension 2006 (Rotterdam); Wong & Mitchell, Lancet 2007 review -- VERIFY"
+        },
+        "cm_neurodegenerative": {
+          "feature": "Fractal_dimension",
+          "direction": "lower",
+          "source": "reduced vascular fractal dimension in Alzheimer's disease; Cheung et al., Alzheimer's & Dementia 2014 -- VERIFY"
+        },
+        "cm_heart_disease": {
+          "feature": "CRVE_Knudtson_zone_b",
+          "direction": "higher",
+          "source": "wider venules (and narrower arterioles) with coronary heart disease; McGeechan et al., Ann Intern Med 2009 meta-analysis -- VERIFY"
+        }
+      },
+      "age_gap": {
+        "exposure": "gap_corrected",
+        "direction": "higher",
+        "conditions": ["cm_hypertension", "cm_dyslipidemia", "cm_heart_disease", "cm_myocardial_infarction",
+                       "cm_stroke", "cm_cardiovascular_event", "cm_kidney", "cm_neurodegenerative",
+                       "cm_alzheimer", "cm_brain_any", "cm_autoimmune"]
+      }
+    },
+    "mbrset": {
+      "camera": null,
+      "covariates": ["age", "sex"],
+      "negative_control": null,
+      "diseases": {
+        "hypertension": {
+          "feature": "CRAE_Knudtson_zone_b",
+          "direction": "lower",
+          "source": "as BRSET hypertension -- VERIFY"
+        },
+        "nephropathy": {
+          "feature": "Fractal_dimension",
+          "direction": "lower",
+          "source": "suboptimal fractal dimension with chronic kidney disease; Sng et al., Nephrol Dial Transplant 2010 -- VERIFY"
+        },
+        "myocardial_infarction": {
+          "feature": "CRVE_Knudtson_zone_b",
+          "direction": "higher",
+          "source": "McGeechan et al., Ann Intern Med 2009 -- VERIFY"
+        },
+        "neuropathy": null
+      }
+    },
+    "aireadi": {
+      "_note": "Measured labels. One device per run (--camera, exact string from `aireadi_dataset.py convert`): the caliber scale differs between cameras. Continuous outcomes give beta per SD; the flags give OR per SD. No sex in the public release; diabetes stage enters as three indicators (none = reference).",
+      "camera": "FILL IN: one tabletop device, then rerun with --camera for the Optomed Aurora",
+      "covariates": ["age", "dm_pre", "dm_oral", "dm_insulin"],
+      "negative_control": null,
+      "diseases": {
+        "sbp": {"feature": "CRAE_Knudtson_zone_b", "direction": "lower", "source": "as BRSET hypertension -- VERIFY"},
+        "log_uacr": {"feature": "Fractal_dimension", "direction": "lower", "source": "as mBRSET nephropathy -- VERIFY"},
+        "moca": {"feature": "Fractal_dimension", "direction": "higher", "source": "lower fractal dimension with cognitive impairment; Cheung et al. 2014 -- VERIFY"}
+      }
+    }
+  }
+}

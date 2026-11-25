@@ -46,5 +46,9 @@ coremltools==9.0; sys_platform == "darwin"
 # newest 3.9-wheel release (1.13.1) leaves 3.13 with a source build.
 scipy>=1.13
 
+# AI-READI DICOM fundus photographs -> JPEG/PNG (aireadi_dataset.py convert).
+# huggingface_hub (pulled in by timm) fetches the gated RETFound weights (retfound.py).
+pydicom>=2.4
+
 # Optional: TensorBoard logging (metrics.get_tb_writer); CSV logging works without it.
 # tensorboard
